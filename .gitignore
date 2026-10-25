@@ -1,0 +1,10 @@
+disc/
+build/
+out/
+generated/
+third_party/
+*.iso
+*.elf
+*.BIN
+.DS_Store
+.venv/

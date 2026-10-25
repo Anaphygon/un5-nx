@@ -1,0 +1,438 @@
+<!doctype html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Komik un5-nx</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bangers&family=Comic+Neue:wght@400;700&family=Kalam:wght@400;700&display=swap">
+<style>
+/* Layout: halaman manga satu kolom; setiap bab adalah strip panel dalam grid
+   yang menumpuk jadi satu kolom di layar sempit. Satu tampilan (kertas), tidak
+   ikut tema gelap, karena tinta di atas kertas adalah gayanya. */
+:root {
+  --paper: #fbf8f1;
+  --ink: #141414;
+  --ink-soft: #3d3d3d;
+  --orange: #f2711c;
+  --orange-deep: #c4520a;
+  --tone: #d9d4c7;
+  --good: #2f8f4e;
+  --bad: #c62f22;
+  --warn: #b47a00;
+  --display: "Bangers", "Impact", "Arial Black", sans-serif;
+  --body: "Comic Neue", "Trebuchet MS", "Segoe UI", sans-serif;
+  --hand: "Kalam", "Comic Neue", "Segoe Print", cursive;
+  --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  color-scheme: light;
+}
+* { box-sizing: border-box; }
+html { background: #e9e4d8; }
+body {
+  margin: 0; color: var(--ink); background: #e9e4d8;
+  font: 17px/1.55 var(--body);
+}
+.book {
+  max-width: 1080px; margin: 0 auto;
+  padding-block: 28px 64px;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+  display: grid; gap: 34px;
+}
+.page {
+  background: var(--paper); border: 3px solid var(--ink);
+  box-shadow: 8px 8px 0 var(--ink);
+  padding: 22px; display: grid; gap: 16px;
+}
+.chapter-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 14px; border-bottom: 3px solid var(--ink); padding-bottom: 8px; }
+.chapter-head .no { font: 26px/1 var(--display); color: var(--paper); background: var(--ink); padding: 6px 10px 3px; letter-spacing: .04em; }
+.chapter-head h2 { margin: 0; font: 34px/1.05 var(--display); letter-spacing: .03em; text-wrap: balance; }
+.chapter-head .sub { font: 700 15px var(--hand); color: var(--ink-soft); }
+
+.strip { display: grid; gap: 12px; grid-template-columns: repeat(6, minmax(0, 1fr)); }
+.panel {
+  position: relative; border: 3px solid var(--ink); background: var(--paper);
+  padding: 16px; min-width: 0; display: grid; gap: 10px; align-content: start;
+}
+.w2 { grid-column: span 2; } .w3 { grid-column: span 3; } .w4 { grid-column: span 4; } .w6 { grid-column: span 6; }
+.panel.tone { background-color: var(--paper); background-image: radial-gradient(var(--tone) 1.2px, transparent 1.3px); background-size: 7px 7px; }
+.panel.dark { background: var(--ink); color: var(--paper); }
+.panel.dark .caption { background: var(--orange); color: var(--ink); border-color: var(--paper); }
+.panel.speed { background-image: repeating-linear-gradient(115deg, transparent 0 14px, rgba(20,20,20,.07) 14px 16px); }
+.panel h3 { margin: 0; font: 22px/1.1 var(--display); letter-spacing: .03em; }
+.panel p { margin: 0; }
+.caption {
+  justify-self: start; background: #fff3a8; border: 2px solid var(--ink);
+  font: 700 14px/1.35 var(--hand); padding: 4px 10px; max-width: 100%;
+}
+.bubble {
+  position: relative; background: #fff; border: 3px solid var(--ink); border-radius: 22px;
+  padding: 12px 16px; font: 700 16px/1.45 var(--hand); max-width: 62ch;
+}
+.bubble::after {
+  content: ""; position: absolute; bottom: -16px; left: 34px;
+  border-width: 16px 12px 0 0; border-style: solid; border-color: var(--ink) transparent transparent transparent;
+}
+.bubble::before {
+  content: ""; position: absolute; bottom: -10px; left: 37px; z-index: 1;
+  border-width: 11px 8px 0 0; border-style: solid; border-color: #fff transparent transparent transparent;
+}
+.bubble.right::after { left: auto; right: 34px; border-width: 16px 0 0 12px; }
+.bubble.right::before { left: auto; right: 37px; border-width: 11px 0 0 8px; }
+.speaker { font: 15px/1 var(--display); letter-spacing: .06em; margin-top: 8px; color: var(--ink-soft); }
+.speaker.right { text-align: right; }
+.sfx {
+  font: clamp(38px, 6.5vw, 64px)/0.9 var(--display); color: var(--orange);
+  -webkit-text-stroke: 2px var(--ink); paint-order: stroke fill;
+  text-shadow: 4px 4px 0 var(--ink); transform: rotate(-6deg); letter-spacing: .02em;
+  justify-self: center; text-align: center;
+}
+.sfx.small { font-size: clamp(28px, 4.5vw, 42px); transform: rotate(4deg); }
+.big-num { font: clamp(40px, 7vw, 64px)/0.95 var(--display); letter-spacing: .02em; }
+.big-num.strike { text-decoration: line-through 5px var(--bad); color: var(--ink-soft); }
+.big-num.win { color: var(--good); }
+.stamp {
+  justify-self: start; font: 20px/1 var(--display); letter-spacing: .08em; padding: 6px 12px 3px;
+  border: 3px solid currentColor; transform: rotate(-4deg);
+}
+.stamp.done { color: var(--good); } .stamp.next { color: var(--orange-deep); } .stamp.todo { color: var(--ink-soft); }
+code { font-family: var(--mono); font-size: .86em; background: rgba(20,20,20,.08); padding: 1px 4px; border-radius: 3px; }
+.panel.dark code { background: rgba(255,255,255,.14); }
+.scroll { overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; font-size: 15px; }
+th, td { border: 2px solid var(--ink); padding: 6px 9px; text-align: left; vertical-align: top; }
+th { background: var(--ink); color: var(--paper); font: 16px/1.2 var(--display); letter-spacing: .05em; }
+td.n { font-family: var(--mono); font-variant-numeric: tabular-nums; white-space: nowrap; }
+ul.list, ol.list { margin: 0; padding-left: 22px; display: grid; gap: 5px; }
+.lv { display: inline-block; font: 13px/1 var(--display); letter-spacing: .06em; padding: 4px 7px 2px; border: 2px solid var(--ink); white-space: nowrap; }
+.lv.lo { background: #cfeedd; } .lv.mid { background: #ffe7a3; } .lv.hi { background: #ffc9c2; } .lv.q { background: #eee; }
+
+/* Cover */
+.cover { position: relative; overflow: hidden; background: var(--orange); border: 3px solid var(--ink); box-shadow: 8px 8px 0 var(--ink); padding: 34px 26px 26px; display: grid; gap: 14px; }
+.cover::before { content: ""; position: absolute; inset: -40%; background: repeating-conic-gradient(from 0deg at 70% 45%, rgba(255,255,255,.18) 0 6deg, transparent 6deg 14deg); pointer-events: none; }
+.cover > * { position: relative; }
+.cover .issue { font: 18px/1 var(--display); letter-spacing: .1em; background: var(--ink); color: var(--paper); justify-self: start; padding: 6px 10px 3px; }
+.cover h1 { margin: 0; font: clamp(56px, 12vw, 120px)/0.85 var(--display); letter-spacing: .02em; color: var(--paper); -webkit-text-stroke: 3px var(--ink); paint-order: stroke fill; text-shadow: 6px 6px 0 var(--ink); }
+.cover .tag { font: 700 clamp(18px, 2.6vw, 24px)/1.3 var(--hand); max-width: 34ch; background: var(--paper); border: 3px solid var(--ink); padding: 8px 12px; justify-self: start; }
+.cover .row { display: flex; flex-wrap: wrap; gap: 10px; }
+.cover .chip { font: 18px/1 var(--display); letter-spacing: .06em; background: var(--paper); border: 3px solid var(--ink); padding: 8px 12px 5px; }
+.cover .stamp { background: var(--paper); }
+
+/* Peta memori dan roadmap */
+.mem { display: grid; gap: 7px; font: 13px var(--mono); }
+.mem .r { display: grid; grid-template-columns: 92px minmax(0, 1fr); gap: 8px; align-items: center; }
+.mem .bar { position: relative; height: 24px; border: 2px solid var(--ink); background: var(--paper); }
+.mem .bar span { position: absolute; top: 0; bottom: 0; }
+.mem .bar em { position: absolute; top: 2px; font: 700 12px var(--body); font-style: normal; white-space: nowrap; }
+.road { display: grid; gap: 10px; grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.road .panel { gap: 6px; }
+.road .panel b { font: 22px/1 var(--display); letter-spacing: .03em; }
+.road .num { font: 40px/0.9 var(--display); color: var(--orange); -webkit-text-stroke: 1.5px var(--ink); }
+.toc { display: flex; flex-wrap: wrap; gap: 8px; }
+.toc a { font: 16px/1 var(--display); letter-spacing: .05em; color: var(--ink); text-decoration: none; border: 2px solid var(--ink); background: var(--paper); padding: 7px 9px 4px; }
+.toc a:hover, .toc a:focus-visible { background: var(--ink); color: var(--paper); outline: none; }
+.end { text-align: center; font: clamp(34px, 6vw, 56px)/1 var(--display); letter-spacing: .05em; }
+.foot { font-size: 14px; color: var(--ink-soft); text-align: center; }
+
+@media (max-width: 760px) {
+  .strip { grid-template-columns: minmax(0, 1fr); }
+  .w2, .w3, .w4, .w6 { grid-column: auto; }
+  .road { grid-template-columns: minmax(0, 1fr); }
+  .page { padding: 14px; box-shadow: 5px 5px 0 var(--ink); }
+  .chapter-head h2 { font-size: 28px; }
+}
+@media (prefers-reduced-motion: no-preference) {
+  html { scroll-behavior: smooth; }
+  .sfx { transition: transform .2s; }
+  .panel:hover .sfx { transform: rotate(-2deg) scale(1.04); }
+}
+</style>
+</head>
+<body>
+<div class="book">
+
+  <!-- SAMPUL -->
+  <header class="cover">
+    <span class="issue">JILID 1 · FASE 0–1</span>
+    <h1>UN5-NX</h1>
+    <p class="tag">Naruto Shippuden: Ultimate Ninja 5 keluar dari PS2, jalan native di Switch, Mac dan Windows.</p>
+    <div class="row">
+      <span class="chip">SLES-55605</span><span class="chip">PS2Recomp</span><span class="chip">3 SISTEM</span>
+      <span class="stamp done">FASE 1 SELESAI</span>
+    </div>
+    <nav class="toc" aria-label="Daftar bab">
+      <a href="#bab1">1 · Misi</a><a href="#bab2">2 · Kenapa</a><a href="#bab3">3 · Disk</a><a href="#bab4">4 · Gulungan MWo3</a>
+      <a href="#bab5">5 · VU1</a><a href="#bab6">6 · Musuh</a><a href="#bab7">7 · Pertarungan Fase 1</a><a href="#bab8">8 · Sekutu</a>
+      <a href="#peta">Peta jalan</a><a href="#risiko">Risiko</a><a href="#aturan">Aturan</a>
+    </nav>
+  </header>
+
+  <!-- BAB 1 -->
+  <section class="page" id="bab1" aria-labelledby="t1">
+    <div class="chapter-head"><span class="no">BAB 1</span><h2 id="t1">Misi: tiga sistem, satu kode</h2></div>
+    <div class="strip">
+      <div class="panel tone w6">
+        <span class="caption">Markas, tengah malam.</span>
+        <div class="bubble">Game PS2 ini kita terjemahkan sekali jadi C++, lalu kita kompilasi untuk tiga sistem sekaligus. Bukan emulator!</div>
+        <div class="speaker">SENSEI</div>
+      </div>
+      <div class="panel w2"><h3>Nintendo Switch</h3><p><code>un5.nro</code></p><p>Atmosphère, AArch64 (Cortex-A57), OpenGL lewat Mesa.</p></div>
+      <div class="panel w2"><h3>macOS</h3><p><code>UN5.app</code></p><p>Apple Silicon, OpenGL 4.1. Sekaligus tempat kerja.</p></div>
+      <div class="panel w2"><h3>Windows</h3><p><code>un5.exe</code></p><p>x86-64, OpenGL 4.x. Build otomatis di GitHub Actions.</p></div>
+      <div class="panel w6">
+        <div class="bubble right">Jadi yang beda cuma lapisan tipis <code>platform/</code>: jendela, controller, suara, lokasi file?</div>
+        <div class="speaker right">MURID</div>
+        <div class="bubble">Betul. Kode game dan runtime-nya sama persis di ketiganya. Mac itu ARM seperti Switch, jadi masalah khas ARM ketemu duluan di Mac.</div>
+        <div class="speaker">SENSEI</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- BAB 2 -->
+  <section class="page" id="bab2" aria-labelledby="t2">
+    <div class="chapter-head"><span class="no">BAB 2</span><h2 id="t2">Kenapa bukan emulator?</h2></div>
+    <div class="strip">
+      <div class="panel speed w3">
+        <span class="caption">Di NetherSX2, Switch...</span>
+        <div class="sfx">7 FPS!!</div>
+        <p>Tersendat saat bertarung, anjlok ke 7 FPS waktu save dan cutscene.</p>
+      </div>
+      <div class="panel w3">
+        <h3>Emulator</h3>
+        <p>Menerjemahkan setiap instruksi MIPS saat game jalan, meniru GS dan VU siklus demi siklus.</p>
+        <h3>Recompile</h3>
+        <p>Kodenya sudah jadi AArch64 biasa sebelum game dijalankan. GS digambar langsung dengan GPU.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- BAB 3 -->
+  <section class="page" id="bab3" aria-labelledby="t3">
+    <div class="chapter-head"><span class="no">BAB 3</span><h2 id="t3">Membongkar disk</h2><span class="sub">ISO milikmu sendiri, 1.9 GB</span></div>
+    <div class="strip">
+      <div class="panel w6 scroll">
+        <table>
+          <thead><tr><th>File</th><th>Ukuran</th><th>Isinya</th></tr></thead>
+          <tbody>
+            <tr><td><code>SLES_556.05</code></td><td class="n">5.3 MB</td><td>Program utama, MIPS R5900, <b>tanpa tabel simbol</b>. Microcode VU1 tertanam</td></tr>
+            <tr><td><code>PRG/BTL.BIN</code></td><td class="n">2.3 MB</td><td>Kode pertarungan, overlay <code>MWo3</code></td></tr>
+            <tr><td><code>PRG/ADV.BIN</code></td><td class="n">2.0 MB</td><td>Kode mode petualangan, overlay di alamat yang sama</td></tr>
+            <tr><td><code>PRG/ETC.BIN</code>, <code>TEXT*.BIN</code></td><td class="n">~1.2 MB</td><td>Overlay kecil, teks lima bahasa</td></tr>
+            <tr><td><code>MODULES/</code></td><td class="n">~0.7 MB</td><td><code>cri_adxi.irx</code>, <code>sndbase.irx</code>, modul Sony</td></tr>
+            <tr><td><code>DATA/</code></td><td class="n">1.1 GB</td><td>Kontainer CRI: <code>data.cvm</code>, <code>*.AFS</code></td></tr>
+            <tr><td><code>PSS/</code></td><td class="n">680 MB</td><td>Video cutscene MPEG-2</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="panel tone w6">
+        <div class="bubble right">Sensei, kata <code>file</code> ELF-nya "not stripped". Nama fungsinya ada?</div>
+        <div class="speaker right">MURID</div>
+        <div class="bubble">Tertipu! Cuma section header yang tersisa. Tabel simbolnya kosong, 0 simbol. Batas fungsi harus kita cari sendiri.</div>
+        <div class="speaker">SENSEI</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- BAB 4 -->
+  <section class="page" id="bab4" aria-labelledby="t4">
+    <div class="chapter-head"><span class="no">BAB 4</span><h2 id="t4">Gulungan rahasia MWo3</h2><span class="sub">overlay yang tidak pernah pindah alamat</span></div>
+    <div class="strip">
+      <div class="panel dark w2">
+        <span class="caption">Header 0x40 byte</span>
+        <p><code>"MWo3"</code> · ID · alamat muat · ukuran kode · data · BSS · tabel constructor · nama.</p>
+        <p>Format overlay compiler Metrowerks CodeWarrior.</p>
+      </div>
+      <div class="panel w4 scroll">
+        <table>
+          <thead><tr><th>Overlay</th><th>ID</th><th>Alamat</th><th>Kode</th><th>Data</th><th>BSS</th></tr></thead>
+          <tbody>
+            <tr><td>BTL</td><td class="n">1</td><td class="n">0x6c6d00</td><td class="n">0x1e5b40</td><td class="n">0x40600</td><td class="n">0x6e80</td></tr>
+            <tr><td>ADV</td><td class="n">2</td><td class="n">0x6c6d00</td><td class="n">0x157540</td><td class="n">0x9d180</td><td class="n">0x400</td></tr>
+            <tr><td>ETC</td><td class="n">3</td><td class="n">0x6c6d00</td><td class="n">0x262c0</td><td class="n">0x3c00</td><td class="n">0</td></tr>
+            <tr><td>TEXT ×5</td><td class="n">4</td><td class="n">0x8f3d00</td><td colspan="3">hanya data</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="panel w2"><span class="caption">Langkah 1</span><p><code>func_1FA5D0(id)</code> mengecek overlay yang aktif. Kalau beda, panggil pemuat.</p></div>
+      <div class="panel w2"><span class="caption">Langkah 2</span><p><code>func_1C3150</code> membaca <code>cdrom0:\PRG\nama</code> utuh ke alamat tetap. Kode mulai di <code>+0x40</code>.</p></div>
+      <div class="panel w2"><span class="caption">Langkah 3</span><p><code>func_100270</code>: FlushCache, kosongkan BSS, jalankan constructor.</p></div>
+      <div class="panel tone w6">
+        <div class="sfx small">KETEMU!</div>
+        <div class="bubble">Cukup ganti <code>func_100270</code> dengan versi kita, baca ID di <code>0x6c6d04</code>, lalu aktifkan tabel fungsi overlay itu. Kode game tidak disentuh sama sekali.</div>
+        <div class="speaker">SENSEI</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- BAB 5 -->
+  <section class="page" id="bab5" aria-labelledby="t5">
+    <div class="chapter-head"><span class="no">BAB 5</span><h2 id="t5">Jurus VU1 tersembunyi</h2></div>
+    <div class="strip">
+      <div class="panel w4">
+        <span class="caption">Peta RAM PS2, skala 0x100000–0x928900 (8.2 MB dari 32 MB)</span>
+        <div class="mem" aria-label="Peta memori">
+          <div class="r"><span>0x100000</span><div class="bar"><span style="left:0;width:70.6%;background:#ffd9bf"></span><em style="left:6px">program utama, data, BSS</em></div></div>
+          <div class="r"><span>0x3D57B8</span><div class="bar"><span style="left:34.7%;width:0.9%;background:var(--orange)"></span><em style="left:37%">microcode VU1 ~72 KB</em></div></div>
+          <div class="r"><span>0x6c6d00</span><div class="bar"><span style="left:70.6%;width:27.2%;background:#cfeedd"></span><em style="left:72%">BTL/ADV/ETC</em></div></div>
+          <div class="r"><span>0x8f3d00</span><div class="bar"><span style="left:97.8%;width:2.2%;background:var(--warn)"></span><em style="left:62%">TEXT ~200 KB →</em></div></div>
+        </div>
+      </div>
+      <div class="panel tone w2">
+        <p>Dicari lewat pasangan NOP khas VU (<code>0x8000033C</code>/<code>0x000002FF</code>) dan 87 penanda akhir program.</p>
+        <p><b>5 blok, ~9.000 pasang instruksi.</b> Overlay tidak membawa microcode sendiri.</p>
+      </div>
+      <div class="panel w6">
+        <div class="bubble right">Berarti semua program VU1 bisa diterjemahkan lebih dulu, seperti di God of War?</div>
+        <div class="speaker right">MURID</div>
+        <div class="bubble">Ya. Dan area ini harus dikeluarkan dari terjemahan kode MIPS. Kalau tidak, recompiler mengira microcode itu instruksi MIPS.</div>
+        <div class="speaker">SENSEI</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- BAB 6 -->
+  <section class="page" id="bab6" aria-labelledby="t6">
+    <div class="chapter-head"><span class="no">BAB 6</span><h2 id="t6">Musuh yang menunggu</h2></div>
+    <div class="strip">
+      <div class="panel dark w3">
+        <h3>Audio</h3>
+        <p><code>cri_adxi.irx</code> (CRI ADX) dan <code>sndbase.irx</code> butuh libsd di sisi IOP dan mixer SPU2. PS2Recomp upstream belum punya.</p>
+        <span class="caption">Rencana: jalan tanpa suara dulu.</span>
+      </div>
+      <div class="panel dark w3">
+        <h3>Kecepatan GS dan VU1</h3>
+        <p>Pengembang PS2Recomp sendiri menyebutnya "very bad". CPU Switch cuma 4 core ARM ~1–2 GHz.</p>
+        <span class="caption">Baru bisa diukur setelah boot di Mac.</span>
+      </div>
+      <div class="panel w6 scroll">
+        <table>
+          <thead><tr><th>Bagian runtime</th><th>Status</th><th>Catatan</th></tr></thead>
+          <tbody>
+            <tr><td>CD, file, controller, memory card, SIF, DMA, kernel</td><td><span class="lv lo">ADA</span></td><td></td></tr>
+            <tr><td>FMV (sceMpeg, IPU)</td><td><span class="lv lo">ADA</span></td><td>ffmpeg, 2.573 baris</td></tr>
+            <tr><td>IOP</td><td><span class="lv lo">ADA</span></td><td>Emulator IOP menjalankan IRX asli</td></tr>
+            <tr><td>Audio</td><td><span class="lv hi">KURANG</span></td><td>libsd IOP + mixer SPU2 belum ada (upstream)</td></tr>
+            <tr><td>GS / VU1</td><td><span class="lv mid">LAMBAT</span></td><td>Lihat Bab 8 untuk jalan keluarnya</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <!-- BAB 7 -->
+  <section class="page" id="bab7" aria-labelledby="t7">
+    <div class="chapter-head"><span class="no">BAB 7</span><h2 id="t7">Pertarungan fase 1</h2><span class="sub">recompile dan build di Mac</span></div>
+    <div class="strip">
+      <div class="panel tone w3">
+        <span class="caption">Percobaan pertama, heuristik JAL</span>
+        <div class="big-num strike">51.127 ERROR</div>
+        <p>Semua dari 8 fungsi yang batasnya kebablasan ke string, tabel konstanta dan microcode.</p>
+      </div>
+      <div class="panel w3">
+        <span class="caption">Ghidra + modul Emotion Engine</span>
+        <div class="sfx">KRAAAK!</div>
+        <div class="big-num win">0 ERROR</div>
+      </div>
+
+      <div class="panel w2"><span class="caption">Senjata 1</span><h3>Ghidra tanpa GUI</h3><p>Ekstensi <code>ghidra-emotionengine-reloaded</code> v2.1.38 supaya instruksi 128-bit dan MMI terbaca. Analisis 46 detik.</p></div>
+      <div class="panel w2"><span class="caption">Senjata 2</span><h3>Tiga rentang kode</h3><p><code>0x100000–0x3D57B8</code> kode utama, <code>0x40F848–0x410CE8</code> patch kernel, <code>0x5E3B50–0x5E6158</code> constructor. Sisanya data.</p></div>
+      <div class="panel w2"><span class="caption">Senjata 3</span><h3>Fungsi saja</h3><p>54.923 label dibuang. File hasil generate turun dari <b>63.639</b> ke <b>8.762</b>, persis seperti peta God of War.</p></div>
+
+      <div class="panel w6 scroll">
+        <table>
+          <thead><tr><th></th><th>Fase 0 (heuristik)</th><th>Fase 1 (Ghidra)</th></tr></thead>
+          <tbody>
+            <tr><td>Fungsi</td><td class="n">6.266</td><td class="n">8.709</td></tr>
+            <tr><td>Error terjemahan</td><td class="n">51.127</td><td class="n">0</td></tr>
+            <tr><td>File C++</td><td class="n">6.293 (335 MB)</td><td class="n">8.762 (163 MB)</td></tr>
+            <tr><td>Build Mac</td><td class="n">belum</td><td class="n">96 MB, 8 m 44 d, 5 core</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="panel speed w4">
+        <span class="caption">Percobaan jalan, 25 detik</span>
+        <p>Jendela OpenGL 4.1 terbuka di Apple M5. ELF termuat. Eksekusi mulai di <code>0x100008</code>. Game memanggil <code>SetupHeap</code>…</p>
+        <div class="sfx small">...SUNYI.</div>
+      </div>
+      <div class="panel dark w2">
+        <span class="caption">Petunjuk</span>
+        <p><code>size=0xffffffff</code> artinya "sisa RAM", tapi runtime membuat heap kosong (<code>runtimeEnd = base</code>).</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- BAB 8 -->
+  <section class="page" id="bab8" aria-labelledby="t8">
+    <div class="chapter-head"><span class="no">BAB 8</span><h2 id="t8">Sekutu dari desa sebelah</h2><span class="sub">port God of War yang sudah bisa dimainkan</span></div>
+    <div class="strip">
+      <div class="panel w2"><h3>Waffle565</h3><p>Runtime native: GS di GPU, VU1 dikompilasi, IRX dikompilasi ke C++, mesin suara dari panggilan LIBSD, file disk di sektor aslinya.</p><span class="lv hi">TANPA LISENSI</span><p>Boleh dipelajari, tidak boleh disalin.</p></div>
+      <div class="panel w2"><h3>KIexster</h3><p>Dibangun di atas runtime Waffle. Paling aktif: 188 bintang, tes CI, di-push hari ini.</p><span class="lv lo">GPL-3.0</span></div>
+      <div class="panel w2"><h3>Tobiichi-Port</h3><p>Membawa fork PS2Recomp dengan 58 file runtime lebih banyak dari upstream.</p><span class="lv lo">GPL-3.0</span></div>
+      <div class="panel tone w6">
+        <div class="bubble right">Itu persis musuh di Bab 6! Audio dan GS lambat sudah mereka kalahkan?</div>
+        <div class="speaker right">MURID</div>
+        <div class="bubble">Bagian yang generik, ya: renderer GS OpenGL, VU1 native, sumber disk, perangkat audio, interpreter rujukan PCSX2. File <code>gow_*</code> khusus God of War kita tinggal. PS2Recomp sendiri GPL-3.0, jadi lisensinya sejalan.</div>
+        <div class="speaker">SENSEI</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- PETA JALAN -->
+  <section class="page" id="peta" aria-labelledby="tp">
+    <div class="chapter-head"><span class="no">PETA</span><h2 id="tp">Jalan ninja: fase 0 sampai 8</h2><span class="sub">setiap fase berakhir dengan keputusan lanjut atau berhenti</span></div>
+    <div class="road">
+      <div class="panel"><span class="num">0</span><b>Studi kelayakan</b><p>Laporan <code>FEASIBILITY.md</code>.</p><span class="stamp done">SELESAI</span></div>
+      <div class="panel"><span class="num">1</span><b>Recompile di Mac</b><p>0 error, ter-link di macOS arm64.</p><span class="stamp done">SELESAI</span></div>
+      <div class="panel tone"><span class="num">2</span><b>Boot di Mac</b><p>Sampai layar judul. Ukur biaya GS/VU1. Coba runtime fork Tobiichi.</p><span class="stamp next">BERIKUTNYA</span></div>
+      <div class="panel"><span class="num">3</span><b>Overlay</b><p>Masuk pertarungan dan mode petualangan. ~1 minggu.</p><span class="stamp todo">BELUM</span></div>
+      <div class="panel"><span class="num">4</span><b>Build Switch</b><p>NRO yang sama sampai layar judul. 1–2 minggu.</p><span class="stamp todo">BELUM</span></div>
+      <div class="panel"><span class="num">5</span><b>Build Windows</b><p>Masuk pertarungan di x64. Kerja kecil.</p><span class="stamp todo">BELUM</span></div>
+      <div class="panel"><span class="num">6</span><b>Performa</b><p>Pertarungan full speed di Switch, sys-clk kalau perlu.</p><span class="stamp todo">BELUM</span></div>
+      <div class="panel"><span class="num">7</span><b>Audio, FMV, save</b><p>ADX, cutscene, memory card di ketiga sistem.</p><span class="stamp todo">BELUM</span></div>
+      <div class="panel"><span class="num">8</span><b>Installer &amp; rilis</b><p>ISO jadi game di komputer pengguna. CI build ketiganya.</p><span class="stamp todo">BELUM</span></div>
+    </div>
+  </section>
+
+  <!-- RISIKO -->
+  <section class="page" id="risiko" aria-labelledby="tr">
+    <div class="chapter-head"><span class="no">DATA</span><h2 id="tr">Kekuatan musuh, sebelum dan sesudah</h2></div>
+    <div class="panel scroll">
+      <table>
+        <thead><tr><th>Risiko</th><th>Awal</th><th>Sekarang</th><th>Penanganan</th></tr></thead>
+        <tbody>
+          <tr><td>Overlay tidak didukung</td><td><span class="lv hi">TINGGI</span></td><td><span class="lv lo">RENDAH</span></td><td>Alamat tetap, satu titik kait</td></tr>
+          <tr><td>Tidak ada simbol</td><td><span class="lv q">?</span></td><td><span class="lv lo">RENDAH</span></td><td>Ghidra: 8.709 fungsi, 0 error</td></tr>
+          <tr><td>Microcode VU1</td><td><span class="lv q">?</span></td><td><span class="lv lo">RENDAH</span></td><td>Satu area, lima blok</td></tr>
+          <tr><td>Kecepatan GS/VU1 di Switch</td><td><span class="lv hi">TINGGI</span></td><td><span class="lv mid">SEDANG–TINGGI</span></td><td>Runtime native Waffle/Tobiichi; ukur di fase 2</td></tr>
+          <tr><td>Audio (CRI ADX, sndbase)</td><td><span class="lv mid">SEDANG</span></td><td><span class="lv mid">SEDANG</span></td><td>Mesin suara LIBSD dari fork Tobiichi; jalan tanpa suara dulu</td></tr>
+          <tr><td>FMV</td><td><span class="lv mid">SEDANG</span></td><td><span class="lv lo">RENDAH</span></td><td>Runtime sudah mendekode MPEG PS2</td></tr>
+          <tr><td>Memori Switch mode applet</td><td><span class="lv mid">SEDANG</span></td><td><span class="lv mid">SEDANG</span></td><td>Jalankan lewat game (tahan R), dapat ~3 GB</td></tr>
+          <tr><td>194 ribu titik masuk cadangan</td><td><span class="lv q">–</span></td><td><span class="lv q">?</span></td><td>Baru: cek dampaknya ke performa di fase 2</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- ATURAN -->
+  <section class="page" id="aturan" aria-labelledby="ta">
+    <div class="chapter-head"><span class="no">SUMPAH</span><h2 id="ta">Aturan main</h2></div>
+    <div class="strip">
+      <div class="panel tone w6">
+        <ul class="list">
+          <li>Tidak ada file game, kode hasil terjemahan, atau kunci di repository.</li>
+          <li>Yang dirilis cuma alat dan runtime. Setiap pengguna membangun game dari ISO miliknya sendiri.</li>
+          <li>Build lokal maksimal setengah core Mac supaya tidak panas.</li>
+          <li>Kode Waffle565 hanya dipelajari, tidak disalin. Kode GPL-3.0 dipakai dengan lisensi yang sama.</li>
+          <li>Port Naruto Senki (<code>ns-nx</code>) tetap ditunda.</li>
+        </ul>
+      </div>
+    </div>
+    <p class="end">BERSAMBUNG DI FASE 2…</p>
+    <p class="foot">Sumber: <code>docs/PLAN.md</code>, <code>docs/FEASIBILITY.md</code>, <code>docs/PHASE1.md</code> di <code>SwitchDev/un5-nx</code>.</p>
+  </section>
+
+</div>
+</body>
+</html>
