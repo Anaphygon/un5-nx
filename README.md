@@ -72,6 +72,13 @@ Builds use half the CPU cores by default (`JOBS=` to change it).
 | `tools/fixmap.py` | Cleans the Ghidra map: code ranges only, functions only |
 | `tools/build_mac.sh` | Copies the recompiled output into the runtime and builds it |
 
+## Contributors
+
+| Who | Role |
+|---|---|
+| **[Lisvindanu](https://github.com/Lisvindanu)** | Project manager and product owner: sets direction, priorities and the go/no-go at each phase gate |
+| **Claude** (Anthropic) | Executor: research, reverse engineering, tooling, builds and documentation |
+
 ## Credits
 
 This project stands on other people's work:
