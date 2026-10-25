@@ -20,13 +20,27 @@ JOBS=${JOBS:-$(( $(sysctl -n hw.ncpu) / 2 ))}
 
 [ -d "$GEN" ] || { echo "no $GEN; run ps2_recomp first" >&2; exit 1; }
 
+# Our changes to the pinned PS2Recomp, kept as patches in this repository.
+for p in "$ROOT"/patches/ps2recomp/*.patch; do
+    if git -C "$REC" apply --check "$p" 2>/dev/null; then
+        git -C "$REC" apply "$p" && echo "applied $(basename "$p")"
+    fi
+done
+
 mkdir -p "$RUNNER"
 changed=0
 copy() { if ! cmp -s "$1" "$2"; then cp "$1" "$2"; changed=$((changed + 1)); fi; }
 for f in "$GEN"/*.cpp; do copy "$f" "$RUNNER/$(basename "$f")"; done
 # The generated sources include these with <...>, so they go on the
 # runtime's include path rather than next to the sources.
+before=$changed
 for f in "$GEN"/*.h; do copy "$f" "$REC/ps2xRuntime/include/$(basename "$f")"; done
+# Those headers are in the runner's precompiled header, and ninja does not
+# rebuild the PCH when they change ("modified since the precompiled header
+# was built"), so drop it and let it be rebuilt.
+if [ "$changed" -gt "$before" ]; then
+    rm -f "$BUILD"/ps2xRuntime/CMakeFiles/ps2EntryRunner.dir/cmake_pch.hxx.pch
+fi
 rm -f "$RUNNER"/ps2_recompiled_*.h
 # Drop runner files the recompiler no longer produces (a function that was
 # split or removed would otherwise still be compiled and registered).

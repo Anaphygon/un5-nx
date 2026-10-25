@@ -1,0 +1,32 @@
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 45cb9d2..288379c 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -450,6 +450,27 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
+     s_lastWidth = width;
+     s_lastHeight = height;
+ 
++    // un5-nx: UN5_FRAME_DUMP=<dir> writes every 30th presented frame as a PPM,
++    // so a run can be inspected without a screen capture.
++    if (const char *dumpDir = std::getenv("UN5_FRAME_DUMP"); dumpDir && !s_scratch.empty() && width && height)
++    {
++        static uint32_t s_dumpCount = 0u;
++        if (s_dumpCount++ % 30u == 0u)
++        {
++            char name[64];
++            std::snprintf(name, sizeof name, "/frame_%05u.ppm", s_dumpCount - 1u);
++            if (FILE *f = std::fopen((std::string(dumpDir) + name).c_str(), "wb"))
++            {
++                std::fprintf(f, "P6\n%u %u\n255\n", width, height);
++                for (size_t i = 0; i + 3 < s_scratch.size() && i / 4 < static_cast<size_t>(width) * height; i += 4)
++                {
++                    std::fwrite(&s_scratch[i], 1, 3, f);
++                }
++                std::fclose(f);
++            }
++        }
++    }
++
+     std::fill(s_uploadBuffer.begin(), s_uploadBuffer.end(), 0u);
+     if (!s_scratch.empty() && width != 0u && height != 0u)
+     {
