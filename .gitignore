@@ -8,3 +8,5 @@ third_party/
 *.BIN
 .DS_Store
 .venv/
+__pycache__/
+*.pyc
