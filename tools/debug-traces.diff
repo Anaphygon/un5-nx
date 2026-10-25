@@ -1,0 +1,125 @@
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/CD.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/CD.cpp
+index a81dbe1..48ee163 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/CD.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/CD.cpp
+@@ -214,7 +214,7 @@ namespace ps2_stubs
+         {
+             static uint32_t s_readCount = 0u;
+             ++s_readCount;
+-            if (s_readCount <= 64u || (s_readCount % 256u) == 0u)
++            if (s_readCount <= 1024u || (s_readCount % 256u) == 0u)
+             {
+                 std::cerr << "[sceCdRead] #" << s_readCount << std::hex << " lbn=0x" << a0
+                           << " sectors=0x" << a1 << " buf=0x" << a2
+diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+index f0ad507..9b2d849 100644
+--- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+@@ -548,6 +548,24 @@ void GSCpuBackend::Submit(const GSPrimitiveBatch &batch)
+     std::lock_guard<std::mutex> lock(m_mutex);
+     if (!m_vram || batch.vertexCount == 0u)
+         return;
++    {   // un5-nx trace (temporary): primitives per type and target, every 4096
++        static std::atomic<uint32_t> s_n{0};
++        static std::atomic<uint32_t> s_byType[8]{};
++        static std::atomic<uint32_t> s_nonPresent{0};
++        s_byType[static_cast<uint32_t>(batch.state.prim.type) & 7u]++;
++        if (batch.state.context.frame.fbp != 112u)
++        {
++            if (++s_nonPresent <= 20u)
++                std::fprintf(stderr, "[gs:prim] type=%d fbp=%u tme=%d tbp=%u rgba=%u,%u,%u,%u xy=(%g,%g)\n",
++                             static_cast<int>(batch.state.prim.type), batch.state.context.frame.fbp, batch.state.prim.tme,
++                             batch.state.context.tex0.tbp0, batch.vertices[0].r, batch.vertices[0].g, batch.vertices[0].b,
++                             batch.vertices[0].a, batch.vertices[0].x, batch.vertices[0].y);
++        }
++        if ((++s_n % 4096u) == 0u)
++            std::fprintf(stderr, "[gs:prims] n=%u types=%u,%u,%u,%u,%u,%u,%u nonPresent=%u\n", s_n.load(),
++                         s_byType[0].load(), s_byType[1].load(), s_byType[2].load(), s_byType[3].load(),
++                         s_byType[4].load(), s_byType[5].load(), s_byType[6].load(), s_nonPresent.load());
++    }
+     DrawPrimitive(batch);
+ }
+ 
+@@ -1165,6 +1183,17 @@ void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch)
+     const GSVertex &v0 = batch.vertices[0];
+     const GSVertex &v1 = batch.vertices[1];
+     const auto &ctx = state.context;
++    {   // un5-nx trace (temporary)
++        static std::atomic<uint32_t> s_n{0};
++        const uint32_t n = ++s_n;
++        if (n <= 40u || (n % 5000u) == 0u)
++            std::fprintf(stderr, "[gs:sprite] #%u fbp=%u fbw=%u fpsm=%u fbmsk=%x tme=%d abe=%d tbp=%u tpsm=%u tw=%u th=%u tfx=%u alpha=%llx test=%llx xy=(%g,%g)-(%g,%g) of=(%d,%d) rgba=%u,%u,%u,%u uv=(%u,%u)-(%u,%u) sc=%d,%d,%d,%d\n",
++                         n, ctx.frame.fbp, ctx.frame.fbw, ctx.frame.psm, ctx.frame.fbmsk, state.prim.tme, state.prim.abe,
++                         ctx.tex0.tbp0, ctx.tex0.psm, ctx.tex0.tw, ctx.tex0.th, ctx.tex0.tfx,
++                         (unsigned long long)ctx.alpha, (unsigned long long)ctx.test, v0.x, v0.y, v1.x, v1.y,
++                         ctx.xyoffset.ofx >> 4, ctx.xyoffset.ofy >> 4, v1.r, v1.g, v1.b, v1.a, v0.u, v0.v, v1.u, v1.v,
++                         ctx.scissor.x0, ctx.scissor.y0, ctx.scissor.x1, ctx.scissor.y1);
++    }
+ 
+     int ofx = ctx.xyoffset.ofx >> 4;
+     int ofy = ctx.xyoffset.ofy >> 4;
+diff --git a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
+index ab41423..20dbfe4 100644
+--- a/ps2xRuntime/src/lib/ps2_memory.cpp
++++ b/ps2xRuntime/src/lib/ps2_memory.cpp
+@@ -1525,6 +1525,12 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+                             break;
+                     }
+ 
++                    {   // un5-nx trace (temporary)
++                        static uint32_t s_chains = 0u;
++                        if (channelBase == 0x10009000u && (++s_chains <= 6u || (s_chains % 600u) == 0u))
++                            std::fprintf(stderr, "[dma:vif1-chain] #%u tags=%d bytes=%zu nextTag=0x%x asp=%u chcr=0x%x tie=%d\n",
++                                         s_chains, tagsProcessed, chainBuf.size(), tagAddr, asp, chcr, tieEnabled ? 1 : 0);
++                    }
+                     m_ioRegisters[channelBase + 0x30] = tagAddr;
+                     m_ioRegisters[channelBase + 0x40] = asr0;
+                     m_ioRegisters[channelBase + 0x50] = asr1;
+diff --git a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
+index 3cf54eb..7f1dffd 100644
+--- a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
++++ b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
+@@ -353,6 +353,17 @@ void PS2Memory::deliverVif1Path2(const uint8_t *data, uint32_t qwCount, bool dir
+ 
+ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+ {
++    {   // un5-nx trace (temporary): dump one large transfer
++        static int s_dumped = 0;
++        if (sizeBytes > 800000u && s_dumped < 3 && ++s_dumped == 3)
++        {
++            if (FILE *f = std::fopen("/private/tmp/claude-501/-Users-lisvindanu-SwitchDev/33bc04b7-d408-45cc-ad0e-33a0c53bf913/scratchpad/vif1_big.bin", "wb"))
++            {
++                std::fwrite(data, 1, sizeBytes, f);
++                std::fclose(f);
++            }
++        }
++    }
+     if (sizeBytes == 0u)
+         return;
+ 
+@@ -398,6 +409,25 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+         pos += 4;
+ 
+         uint8_t opcode = (cmd >> 24) & 0x7F;
++        {   // un5-nx trace (temporary): VIF1 opcodes seen, every 8192
++            static uint32_t s_ops[128]{};
++            static uint32_t s_total = 0u;
++            ++s_ops[opcode];
++            static uint32_t s_seq = 0u;
++            if (s_total >= 20000u && s_seq < 120u)
++            {
++                ++s_seq;
++                std::fprintf(stderr, "[vif1:seq] pos=%u/%u cmd=%08x\n", pos, sizeBytes, cmd);
++            }
++            if ((++s_total % 8192u) == 0u)
++            {
++                std::fprintf(stderr, "[vif1:ops] total=%u", s_total);
++                for (uint32_t i = 0u; i < 128u; ++i)
++                    if (s_ops[i] != 0u)
++                        std::fprintf(stderr, " %02x:%u", i, s_ops[i]);
++                std::fprintf(stderr, "\n");
++            }
++        }
+         uint16_t imm = cmd & 0xFFFF;
+         uint8_t num = (cmd >> 16) & 0xFF;
+         const bool irq = (cmd & 0x80000000u) != 0u;

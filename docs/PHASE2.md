@@ -22,12 +22,20 @@ On upstream PS2Recomp (`e563698`) plus three local patches, the game:
 8. **streams graphics work to VU1**: in 45 s, 2,461 DMA transfers and 4,918
    VIF writes.
 
-9. runs its loader thread every frame and uploads textures to the GS.
+9. runs its loader thread every frame, loads the sound bank, and reaches
+   its **first screen**: a five-item menu at `0x3D0C60` (up/down moves, a
+   confirm button picks an entry from the table at `0x5BA4C0`; on a PAL disc
+   most likely the language select). Its textures are uploaded every frame.
 
-Frames are still black because nothing has been drawn yet: the frame
-buffers in GS memory stay empty, only textures land there, and the game has
-not issued a VU1 program (`MSCAL`) since the VIF1 stream was fixed. It has
-not entered a scene; what it waits for is the next thing to find.
+Frames are still black because the menu's sprites never reach the GS. Each
+frame's VIF1 chain holds the present blit (frame buffer 0 copied to the
+displayed buffer 112), the menu's texture uploads and, per sprite object,
+its 9-qword state packet, but not the `FLUSH` + `DIRECT` packet with the
+sprite geometry. `FUN_001d1180` adds that packet only when the object holds
+at least one sprite, so `FUN_001d14d0`, which turns the draw call into
+sprites, ends up with none. The packet pool is not empty, so the cause is
+inside `FUN_001d14d0`: its screen-space clip (`0x7000`-`0x9000`) after the
+projection in `FUN_0010f1b0`, or an early exit.
 
 ## What it took
 
@@ -43,6 +51,7 @@ not entered a scene; what it waits for is the next thing to find.
 | Main thread ends with `ra = 0`, loader never kicked again | Async callback stacks (16 KB each, carved down from the top of RAM) landed on `SetupThread`'s automatic main stack from the third one on, overwriting its saved return address while it slept | Patch `0007`: callback stacks start below the main stack |
 | Bogus `MSCAL 0x829D`, VU1 runs empty code | VIF1 swallowed the `DIRECTHL` VIFcode that carried the rest of a GIF IMAGE as image data; the stream slipped 8 bytes and texture data was parsed as commands | Patch `0009`: the image is fed from following DIRECT payloads |
 | Loader thread never runs | `ResumeThread` and the other thread calls returned `KE_OK`; the EE kernel returns the thread ID, and the game wakes its loader only if `ResumeThread(id) == id` (confirmed against the Play! HLE kernel) | Patch `0010` |
+| `CD READ Fail...(COMM_HD)`, no sound driver | The IOP's `sceCdRead` refused destinations no allocation had touched; SNDBASE reads its sound bank header to a fixed buffer at `0x1BA400` | Patch `0012`: only the bounds are checked |
 | The game crawls | `PS2X_ENABLE_AGRESSIVE_LOGS` also flushed a log line per guest call (194 MB a minute) | Patch `0011`: separate, off by default |
 | Precompiled header errors on rebuild | The generated headers are in the runner's PCH and ninja does not rebuild it | `tools/build_mac.sh` drops the PCH when they change |
 
@@ -55,8 +64,8 @@ function address in code, and `J`/`JAL` targets outside their own function.
 
 Kept as a commit series on branch `un5-nx` of `third_party/PS2Recomp`,
 exported with `git format-patch` to `patches/ps2recomp/` and applied by
-`tools/setup_ps2recomp.sh`. Each fix has a test; the full suite (451 tests)
-passes, and the new tests fail without their fix.
+`tools/setup_ps2recomp.sh`. Each fix has a test; the full suite (451 runtime
+tests, plus the IOP suites) passes, and the new tests fail without their fix.
 
 | Patch | What |
 |---|---|
@@ -71,19 +80,23 @@ passes, and the new tests fail without their fix.
 | `0009` fix(runtime) | VIF1 keeps DIRECT commands when a GIF image spans them |
 | `0010` fix(runtime) | Thread calls return the thread ID on success |
 | `0011` tools | Function log tracker off by default; display circuits and VRAM use logged |
+| `0012` fix(iop) | IOP `sceCdRead` may fill RAM the module never allocated |
 
 With the analyzer and runtime fixed, `tools/fixmap.py` no longer filters
 the analyzer's patches or binds `sceCdLayerSearchFile` itself; the
 recompiled output is identical apart from that call now using its own name.
 
-`0001`, `0002`, `0003`, `0007`, `0009` and `0010` are meant for upstream
+`0001`, `0002`, `0003`, `0007`, `0009`, `0010` and `0012` are meant for upstream
 (the Sinan-Karakaya fork used by DQ8-Recompiled has none of them either); the GitHub account is flagged at
 the moment, so they wait here.
 
 ## Next
 
-1. Find what the game waits for before its first scene: the loader runs,
-   CVFS reads the `DATA.CVM` directory, but no file data is read yet.
+1. Find why `FUN_001d14d0` emits no sprite for the menu: check the
+   projected coordinates from `FUN_0010f1b0` against its clip window.
+   `tools/debug-traces.diff` holds the temporary traces used to get here
+   (GS primitives per target, VIF1 opcodes, a dump of one VIF1 chain, DMA
+   chain ends); `git apply` it in `third_party/PS2Recomp`.
 2. Look at [z3xox/BT3-Recomp](https://github.com/z3xox/BT3-Recomp)'s native
    `cri_adxi` (same IOP module, GPL-3.0) and
    [ico-pc](https://github.com/nathanialf/ico-pc)'s software SPU2 (MIT) for
