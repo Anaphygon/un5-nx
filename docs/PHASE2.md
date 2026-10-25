@@ -29,11 +29,11 @@ the runtime, so "no reads" cannot be told from the log alone.)
 |---|---|---|
 | `missing-target 0x5e3a00` from `func_11A0B0` | Static constructors are only reached through the table at `0x5E7210`; the code range there was set too small (`0x5E3B50`) | Range is `0x5E3A00`-`0x5E7210`; the constructor table is read and seeded |
 | `J 0x1a1bc0`, `JALR 0x1a1da0`, `JALR 0x122b60` | Tail calls and callbacks into code Ghidra left as labels, which phase 1 dropped | Ghidra's 53,000 labels plus 344 pointer/jump seeds go back in as **entry points**: inside a known function each becomes a cheap resume entry, outside one a bounded function. 10,285 files, 0 errors |
-| Loop on "Libcdvd bind err CdSearchFile" | `0x1733C0` is `sceCdLayerSearchFile`; the runtime only has `sceCdSearchFile`, so the game's own libcdvd ran and waited for cdvdfsv's RPC server `0x80000597` | Bound to the `sceCdSearchFile` handler (one-layer disc, same arguments) in `tools/fixmap.py` |
-| All EE threads asleep, nobody wakes them | The analyzer saw one ELF section spanning code and data and **replaced 32 stores with NOPs as "potential self-modifying code"**; they write globals. One held the idle thread's priority, so its value stayed 0 and the idle busy loop starved every other thread | `tools/fixmap.py` keeps such a patch only if the store's target is inside a real code range: all 32 dropped |
-| Game-logic thread never started; main thread "restored" to priority 0 | `ChangeThreadPriority` returned `KE_OK` (0); the EE kernel returns the old priority, which the game saves and restores around a critical section | `0005-change-priority-returns-old.patch` |
-| CRI ADX waits on SPU2 transfers forever | No libsd for IRX modules: `sceSdBlockTrans` never completes, the transfer interrupt never fires | `0004-iop-libsd.patch`: transfers drain at 48 kHz stereo rate, the handler from `sceSdSetTransIntrHandler` fires per half buffer |
-| `CreateThread` refused with -403 | The runtime rejects priority 0 (`< 1`), the IOP's rule; the EE takes 0-127 and runs its own main thread at 0 | `patches/ps2recomp/0003-ee-priority-zero.patch` |
+| Loop on "Libcdvd bind err CdSearchFile" | `0x1733C0` is `sceCdLayerSearchFile`; the runtime only has `sceCdSearchFile`, so the game's own libcdvd ran and waited for cdvdfsv's RPC server `0x80000597` | Runtime handler, patch `0003` |
+| All EE threads asleep, nobody wakes them | The analyzer saw one ELF section spanning code and data and **replaced 32 stores with NOPs as "potential self-modifying code"**; they write globals. One held the idle thread's priority, so its value stayed 0 and the idle busy loop starved every other thread | Analyzer fix, patch `0002` |
+| Game-logic thread never started; main thread "restored" to priority 0 | `ChangeThreadPriority` returned `KE_OK` (0); the EE kernel returns the old priority, which the game saves and restores around a critical section | Patch `0001` |
+| CRI ADX waits on SPU2 transfers forever | No libsd for IRX modules: `sceSdBlockTrans` never completes, the transfer interrupt never fires | Patch `0004`: transfers drain at 48 kHz stereo rate, the handler from `sceSdSetTransIntrHandler` fires per half buffer |
+| `CreateThread` refused with -403 | The runtime rejects priority 0 (`< 1`), the IOP's rule; the EE takes 0-127 and runs its own main thread at 0 | Patch `0001` |
 | Precompiled header errors on rebuild | The generated headers are in the runner's PCH and ninja does not rebuild it | `tools/build_mac.sh` drops the PCH when they change |
 
 Seeds come from: the constructor table, data words that point at a function
@@ -41,22 +41,28 @@ start (a stack prologue, or right after a `jr $ra`/`j` and padding), slots
 next to known function pointers (vtables), `lui`/`addiu` pairs that build a
 function address in code, and `J`/`JAL` targets outside their own function.
 
-## Tools added
+## Changes to PS2Recomp
 
-Runtime patches in `patches/ps2recomp/`, applied in order by
-`tools/build_mac.sh`:
+Kept as a commit series on branch `un5-nx` of `third_party/PS2Recomp`,
+exported with `git format-patch` to `patches/ps2recomp/` and applied by
+`tools/setup_ps2recomp.sh`. Each fix has a test; the full suite (448 tests)
+passes, and the new tests fail without their fix.
 
 | Patch | What |
 |---|---|
-| `0001-frame-dump.patch` | `UN5_FRAME_DUMP=<absolute dir>` writes every 30th presented frame as a PPM |
-| `0002-thread-diagnostics.patch` | Each `run:tick` also logs every EE thread's status, wait reason and PC, semaphores with waiters, and `UN5_WATCH=0xADDR,...` guest words; refused `CreateThread` calls are logged |
-| `0003-ee-priority-zero.patch` | EE thread priority 0 is valid |
-| `0004-iop-libsd.patch` | libsd for IRX modules: no sound, but the SPU2 transfer clock and interrupts |
-| `0005-change-priority-returns-old.patch` | `ChangeThreadPriority` returns the old priority |
+| `0001` fix(runtime) | EE thread priority 0 is valid; `ChangeThreadPriority` returns the old priority |
+| `0002` fix(analyzer) | A "self-modifying" store must write into the function its jump enters; before, 32 ordinary stores to globals became NOPs |
+| `0003` feat(runtime) | `sceCdLayerSearchFile` handler (forwards to `sceCdSearchFile`) |
+| `0004` feat(iop) | Minimal libsd for IRX modules: no sound, but the SPU2 transfer clock and interrupts |
+| `0005` tools | `UN5_FRAME_DUMP=<absolute dir>` writes every 30th presented frame as a PPM |
+| `0006` tools | Thread, semaphore and `UN5_WATCH=0xADDR,...` memory diagnostics on each run tick |
 
-Three findings are worth reporting upstream: the analyzer's self-modifying
-code patches on single-section ELFs, the EE priority range, and
-`ChangeThreadPriority`'s return value.
+With the analyzer and runtime fixed, `tools/fixmap.py` no longer filters
+the analyzer's patches or binds `sceCdLayerSearchFile` itself; the
+recompiled output is identical apart from that call now using its own name.
+
+The first three are meant for upstream; the GitHub account is flagged at
+the moment, so they wait here.
 
 ## Next
 

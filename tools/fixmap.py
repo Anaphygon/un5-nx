@@ -35,17 +35,6 @@ CODE_RANGES = [
     (0x005E3A00, 0x005E7210, "static initialisers"),
 ]
 
-# SDK functions the analyzer names but the runtime has no handler for under
-# that name, bound to a runtime handler with the same arguments. Without
-# these the game's own library code runs and waits on IOP servers that do
-# not exist.
-GAME_STUBS = [
-    # sceCdLayerSearchFile(file, name, layer): this disc has one layer, so it
-    # is sceCdSearchFile. Unbound, it loops on "Libcdvd bind err CdSearchFile"
-    # waiting for cdvdfsv's RPC server 0x80000597.
-    "sceCdSearchFile@0x001733C0",
-]
-
 # The table of static constructors the game's func_11A0B0 calls at boot
 # (a0..a1 at that call). Ghidra finds no caller for these, so they are
 # seeded explicitly: a missing one stalls the game before its first frame.
@@ -173,51 +162,8 @@ def clean(rows):
     return kept, dropped, clipped
 
 
-def store_target(image, base, addr):
-    """Where the store at addr writes, from the lui that set its base
-    register (searched back up to 64 instructions), or None."""
-    w = struct.unpack_from("<I", image, addr - base)[0]
-    rs, imm = (w >> 21) & 31, w & 0xFFFF
-    low = imm - 0x10000 if imm & 0x8000 else imm
-    for a in range(addr - 4, max(base, addr - 256), -4):
-        p = struct.unpack_from("<I", image, a - base)[0]
-        if p >> 26 == 0x0F and (p >> 16) & 31 == rs:               # lui rs
-            return ((p & 0xFFFF) << 16) + low & 0xFFFFFFFF
-        if p >> 26 in (0x09, 0x0D, 0x19) and (p >> 16) & 31 == rs:  # rs rewritten by addiu/ori: trace it
-            rs, extra = (p >> 21) & 31, p & 0xFFFF
-            low += (extra - 0x10000 if extra & 0x8000 and p >> 26 != 0x0D else extra)
-    return None
-
-
-def drop_false_smc(text, image, base):
-    """The analyzer sees one section spanning code and data, so every store
-    into the ELF image looks like self-modifying code, and it replaces each
-    with a NOP. Those stores write globals (one is the idle thread's
-    priority, which left a priority-0 busy loop starving the game). Keep a
-    patch only if the store's target is inside a real code range."""
-    kept = dropped = 0
-    def keep(m):
-        nonlocal kept, dropped
-        t = store_target(image, base, int(m.group(1), 16))
-        if t is not None and range_of(t):
-            kept += 1
-            return m.group(0)
-        dropped += 1
-        return ""
-    text = re.sub(r'^\s*\{ address = "(0x[0-9a-fA-F]+)", value = "0x0" \},\s*# Potential self-modifying code\n',
-                  keep, text, flags=re.M)
-    print(f"self-modifying-code patches: kept {kept}, dropped {dropped} that write data")
-    return text
-
-
-def write_toml(src, dst, elf, out_dir, csv_path, entries=(), image=None, base=0):
+def write_toml(src, dst, elf, out_dir, csv_path, entries=()):
     text = open(src).read()
-    if image is not None:
-        text = drop_false_smc(text, image, base)
-    extra_stubs = "".join(f'  "{s}",\n' for s in GAME_STUBS)
-    text, n = re.subn(r"^(stubs\s*=\s*\[\n)", lambda m: m.group(1) + extra_stubs, text, count=1, flags=re.M)
-    if n != 1:
-        sys.exit(f"{src}: no 'stubs = [' list")
     if entries:
         # Ghidra's labels go back in as entry points: an entry inside a known
         # function becomes a cheap resume entry of that function rather than
@@ -278,8 +224,7 @@ def main(csv_in, toml_in, out):
                  if r["Name"].startswith("entry_") and range_of(int(r["Start"], 16))}
     entries = (labels_in | seeds) - known
     write_toml(toml_in, os.path.join(out, "un5.toml"), os.path.join(root, "disc", "SLES_556.05"),
-               os.path.join(os.path.abspath(out), "output"), os.path.abspath(csv_out), entries,
-               image, base)
+               os.path.join(os.path.abspath(out), "output"), os.path.abspath(csv_out), entries)
     print(f"{len(entries)} entry points ({len(seeds)} from pointers and jumps, "
           f"{len(labels_in - known)} Ghidra labels)")
     labels = sum(1 for r in rows if LABEL.match(r["Name"]))

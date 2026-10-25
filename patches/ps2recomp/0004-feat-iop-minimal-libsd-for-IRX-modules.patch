@@ -1,3 +1,24 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 26 Oct 2026 02:12:26 +0700
+Subject: [PATCH 4/6] feat(iop): minimal libsd for IRX modules
+
+Drivers that import libsd (CRI ADX's cri_adxi.irx, sndbase.irx) stream
+through sceSdBlockTrans and wait for the transfer interrupt. There is no
+sound yet: transfers drain at the SPU2's 48 kHz stereo rate and the
+handler set with sceSdSetTransIntrHandler fires at each half buffer (loop
+mode) or at the end (one-shot), so the drivers keep running.
+
+Co-Authored-By: Lisvindanu <lisvindanu015@gmail.com>
+---
+ ps2xIOP/CMakeLists.txt                     |   1 +
+ ps2xIOP/src/emulator/imports/iop_libsd.cpp | 169 +++++++++++++++++++++
+ ps2xIOP/src/emulator/imports/iop_libsd.h   |  45 ++++++
+ ps2xIOP/src/emulator/iop_emulator.cpp      |   7 +
+ 4 files changed, 222 insertions(+)
+ create mode 100644 ps2xIOP/src/emulator/imports/iop_libsd.cpp
+ create mode 100644 ps2xIOP/src/emulator/imports/iop_libsd.h
+
 diff --git a/ps2xIOP/CMakeLists.txt b/ps2xIOP/CMakeLists.txt
 index f8d3e44..55c42fe 100644
 --- a/ps2xIOP/CMakeLists.txt
@@ -289,3 +310,6 @@ index e5f63a9..cae2fe6 100644
          IopIoman ioman;
          IopCpuCore cpuCore;
          IopImportRegistry imports;
+-- 
+2.54.0 (Apple Git-157)
+

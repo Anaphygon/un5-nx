@@ -1,8 +1,23 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 26 Oct 2026 02:12:26 +0700
+Subject: [PATCH 6/6] tools(runtime): thread, semaphore and memory diagnostics
+
+Each run tick also logs every EE thread's status, wait reason and PC, the
+semaphores with waiters, and the guest words named in
+UN5_WATCH=0xADDR,...; refused CreateThread calls are logged.
+
+Co-Authored-By: Lisvindanu <lisvindanu015@gmail.com>
+---
+ .../src/lib/Kernel/Syscalls/Thread.cpp        | 12 +++++-
+ ps2xRuntime/src/lib/ps2_runtime.cpp           | 39 +++++++++++++++++++
+ 2 files changed, 50 insertions(+), 1 deletion(-)
+
 diff --git a/ps2xRuntime/src/lib/Kernel/Syscalls/Thread.cpp b/ps2xRuntime/src/lib/Kernel/Syscalls/Thread.cpp
-index 5110ee2..1edd422 100644
+index d099e05..bfb95ed 100644
 --- a/ps2xRuntime/src/lib/Kernel/Syscalls/Thread.cpp
 +++ b/ps2xRuntime/src/lib/Kernel/Syscalls/Thread.cpp
-@@ -230,7 +230,16 @@ namespace ps2_syscalls
+@@ -232,7 +232,16 @@ namespace ps2_syscalls
              param->initial_priority,
              param->option,
          };
@@ -20,7 +35,7 @@ index 5110ee2..1edd422 100644
      }
  
      void DeleteThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
-@@ -252,6 +261,7 @@ namespace ps2_syscalls
+@@ -254,6 +263,7 @@ namespace ps2_syscalls
  
      void StartThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
      {
@@ -78,3 +93,6 @@ index 288379c..949aefd 100644
  
              }
          });
+-- 
+2.54.0 (Apple Git-157)
+

@@ -46,12 +46,8 @@ installed, and your own disc.
 
 ```sh
 # 1. your disc: the ELF in disc/, the whole disc in build/game/
-# 2. PS2Recomp, pinned
-git clone https://github.com/ran-j/PS2Recomp third_party/PS2Recomp
-git -C third_party/PS2Recomp checkout e563698
-cmake -S third_party/PS2Recomp -B third_party/PS2Recomp/build -G Ninja \
-      -DCMAKE_BUILD_TYPE=Release -DPS2X_BUILD_RUNTIME=OFF -DPS2X_BUILD_TEST=OFF -DPS2X_BUILD_STUDIO=OFF
-ninja -C third_party/PS2Recomp/build
+# 2. PS2Recomp at the pinned commit with this project's patches, built
+tools/setup_ps2recomp.sh
 # 3. function map, recompile, build
 third_party/PS2Recomp/build/ps2xAnalyzer/ps2_analyzer disc/SLES_556.05 build/analysis/quick.toml
 tools/ghidra_export.sh
@@ -70,7 +66,19 @@ Builds use half the CPU cores by default (`JOBS=` to change it).
 | `tools/xref.py` | R5900-aware address cross-references and disassembly (rabbitizer) |
 | `tools/ghidra_export.sh` | Ghidra headless analysis and PS2Recomp function export |
 | `tools/fixmap.py` | Cleans the Ghidra map: code ranges only, functions only |
+| `tools/setup_ps2recomp.sh` | Clones PS2Recomp at the pinned commit, applies `patches/ps2recomp` with `git am`, builds the recompiler and analyzer |
 | `tools/build_mac.sh` | Copies the recompiled output into the runtime and builds it |
+
+## Fixes to PS2Recomp
+
+Bugs found while porting this game, fixed with tests in
+`patches/ps2recomp/` (all 448 PS2Recomp tests pass), ready to send upstream:
+
+- The analyzer replaced ordinary "store a global, then call" code with NOPs
+  as self-modifying code whenever one ELF section holds code and data.
+- The EE kernel's thread priority 0 was rejected, and `ChangeThreadPriority`
+  did not return the old priority.
+- `sceCdLayerSearchFile` had no runtime handler.
 
 ## Contributors
 

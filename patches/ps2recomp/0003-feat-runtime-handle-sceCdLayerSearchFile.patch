@@ -1,0 +1,79 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 26 Oct 2026 02:12:26 +0700
+Subject: [PATCH 3/6] feat(runtime): handle sceCdLayerSearchFile
+
+The dual-layer DVD variant of sceCdSearchFile. Files are found by path on
+the host, so the layer argument changes nothing. Unhandled, the game's
+own libcdvd runs and loops binding cdvdfsv's SearchFile RPC server
+(0x80000597), which the runtime does not serve.
+
+Co-Authored-By: Lisvindanu <lisvindanu015@gmail.com>
+---
+ ps2xRuntime/include/ps2_call_list.h     |  1 +
+ ps2xRuntime/src/lib/Kernel/Stubs/CD.cpp | 10 ++++++++++
+ ps2xRuntime/src/lib/Kernel/Stubs/CD.h   |  1 +
+ ps2xTest/src/elf_analyzer_tests.cpp     |  2 ++
+ 4 files changed, 14 insertions(+)
+
+diff --git a/ps2xRuntime/include/ps2_call_list.h b/ps2xRuntime/include/ps2_call_list.h
+index 94a6fa1..979e4ff 100644
+--- a/ps2xRuntime/include/ps2_call_list.h
++++ b/ps2xRuntime/include/ps2_call_list.h
+@@ -306,6 +306,7 @@
+     X(sceCdReadChain)                         \
+     X(sceCdReadClock)                         \
+     X(sceCdReadIOPm)                          \
++    X(sceCdLayerSearchFile)                   \
+     X(sceCdSearchFile)                        \
+     X(sceCdSeek)                              \
+     X(sceCdStInit)                            \
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/CD.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/CD.cpp
+index 56a978e..3c72d56 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/CD.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/CD.cpp
+@@ -542,6 +542,16 @@ namespace ps2_stubs
+         sceCdRead(rdram, ctx, runtime);
+     }
+ 
++    // sceCdLayerSearchFile(file, name, layer): the dual-layer DVD variant.
++    // Files are looked up by path on the host, which already spans the whole
++    // disc, so the layer argument ($a2) changes nothing here. Left unhandled,
++    // a game's own libcdvd runs instead and loops binding cdvdfsv's
++    // SearchFile RPC server (0x80000597), which the runtime does not serve.
++    void sceCdLayerSearchFile(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        sceCdSearchFile(rdram, ctx, runtime);
++    }
++
+     void sceCdSearchFile(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
+         uint32_t fileAddr = getRegU32(ctx, 4);
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/CD.h b/ps2xRuntime/src/lib/Kernel/Stubs/CD.h
+index dd5bae9..8cacb4e 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/CD.h
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/CD.h
+@@ -65,6 +65,7 @@ namespace ps2_stubs
+     void sceCdReadClock(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+     void sceCdReadIOPm(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+     void sceCdSearchFile(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
++    void sceCdLayerSearchFile(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+     void sceCdSeek(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+     void sceCdStandby(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+     void sceCdStatus(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+diff --git a/ps2xTest/src/elf_analyzer_tests.cpp b/ps2xTest/src/elf_analyzer_tests.cpp
+index 082e7e7..cbf92be 100644
+--- a/ps2xTest/src/elf_analyzer_tests.cpp
++++ b/ps2xTest/src/elf_analyzer_tests.cpp
+@@ -58,6 +58,8 @@ void register_elf_analyzer_tests()
+                               {
+             t.IsTrue(FunctionClassifier::hasRuntimeHandler("sceCdRead"),
+                      "sceCdRead should resolve to a known runtime stub handler");
++            t.IsTrue(FunctionClassifier::hasRuntimeHandler("sceCdLayerSearchFile"),
++                     "the dual-layer search must be stubbed, or the game's libcdvd waits on cdvdfsv's RPC");
+             t.IsTrue(FunctionClassifier::hasRuntimeHandler("_printf"),
+                      "runtime handler resolution should accept leading underscore aliases");
+             t.IsTrue(FunctionClassifier::hasRuntimeHandler("__ieee754_rem_pio2f"),
+-- 
+2.54.0 (Apple Git-157)
+

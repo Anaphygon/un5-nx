@@ -20,12 +20,8 @@ JOBS=${JOBS:-$(( $(sysctl -n hw.ncpu) / 2 ))}
 
 [ -d "$GEN" ] || { echo "no $GEN; run ps2_recomp first" >&2; exit 1; }
 
-# Our changes to the pinned PS2Recomp, kept as patches in this repository.
-for p in "$ROOT"/patches/ps2recomp/*.patch; do
-    if git -C "$REC" apply --check "$p" 2>/dev/null; then
-        git -C "$REC" apply "$p" && echo "applied $(basename "$p")"
-    fi
-done
+[ "$(git -C "$REC" rev-parse --abbrev-ref HEAD)" = un5-nx ] ||
+    { echo "PS2Recomp is not on branch un5-nx; run tools/setup_ps2recomp.sh" >&2; exit 1; }
 
 mkdir -p "$RUNNER"
 changed=0
