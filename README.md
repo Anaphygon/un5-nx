@@ -12,9 +12,10 @@ talked to is replaced by native code instead of being emulated.
 > of the game. Everything derived from your disc is built on your own
 > computer and stays there.
 
-**Status: experimental, phase 1 of 8.** The game recompiles with no errors
-and links into a macOS arm64 executable. It starts executing but does not
-reach the title screen yet. It is not playable.
+**Status: experimental, phase 2 of 8.** The game recompiles with no errors,
+links into a macOS arm64 executable, boots its threads and IOP modules,
+reads its data and streams work to VU1, but nothing is drawn on screen yet.
+It is not playable.
 
 ## Read the plan
 
@@ -72,13 +73,15 @@ Builds use half the CPU cores by default (`JOBS=` to change it).
 ## Fixes to PS2Recomp
 
 Bugs found while porting this game, fixed with tests in
-`patches/ps2recomp/` (all 448 PS2Recomp tests pass), ready to send upstream:
+`patches/ps2recomp/` (all 449 PS2Recomp tests pass), ready to send upstream:
 
 - The analyzer replaced ordinary "store a global, then call" code with NOPs
   as self-modifying code whenever one ELF section holds code and data.
 - The EE kernel's thread priority 0 was rejected, and `ChangeThreadPriority`
   did not return the old priority.
 - `sceCdLayerSearchFile` had no runtime handler.
+- Async callback stacks were carved over the automatic main stack and
+  overwrote its saved return addresses.
 
 ## Contributors
 

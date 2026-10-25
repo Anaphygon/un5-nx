@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Mon, 26 Oct 2026 02:12:26 +0700
-Subject: [PATCH 1/6] fix(runtime): EE thread priority 0 and
+Subject: [PATCH 1/8] fix(runtime): EE thread priority 0 and
  ChangeThreadPriority's return value
 
 The EE kernel takes thread priorities 0-127 and runs the main thread at

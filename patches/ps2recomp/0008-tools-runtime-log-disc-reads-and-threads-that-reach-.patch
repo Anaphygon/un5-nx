@@ -1,0 +1,98 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 26 Oct 2026 03:14:25 +0700
+Subject: [PATCH 8/8] tools(runtime): log disc reads and threads that reach pc
+ 0
+
+sceCdRead is otherwise silent, which hides whether the game is loading:
+the first 64 reads and every 256th are logged. A thread whose pc becomes
+0 (its entry returned, or a call through a null pointer) is logged with
+its ra, sp and the recent dispatch history (PS2Runtime::dispatchHistory).
+
+Co-Authored-By: Lisvindanu <lisvindanu015@gmail.com>
+---
+ ps2xRuntime/include/ps2_runtime.h          |  2 ++
+ ps2xRuntime/src/lib/Kernel/EeScheduler.cpp | 13 +++++++++++++
+ ps2xRuntime/src/lib/Kernel/Stubs/CD.cpp    | 12 ++++++++++++
+ ps2xRuntime/src/lib/ps2_runtime.cpp        |  5 +++++
+ 4 files changed, 32 insertions(+)
+
+diff --git a/ps2xRuntime/include/ps2_runtime.h b/ps2xRuntime/include/ps2_runtime.h
+index 4c2053e..5f90971 100644
+--- a/ps2xRuntime/include/ps2_runtime.h
++++ b/ps2xRuntime/include/ps2_runtime.h
+@@ -345,6 +345,8 @@ public:
+                              uint32_t fallthroughPc,
+                              GuestBranchKind kind,
+                              const char *debugName);
++    // un5-nx: the last guest PCs dispatched, oldest first, for diagnostics.
++    static std::string dispatchHistory();
+     void reportMissingFunction(uint8_t *rdram,
+                                R5900Context *ctx,
+                                uint32_t targetPc,
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+index 7479f39..452c03a 100644
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -246,6 +246,19 @@ void EeScheduler::run()
+                 }
+                 continue;
+             }
++            // un5-nx: a thread reaching pc 0 is a returned entry function or a
++            // call through a null pointer; say which, it is otherwise silent.
++            std::cerr << "[thread:pc0] id=" << running->id << std::hex
++                      << " entry=0x" << running->entry
++                      << " ra=0x" << getRegU32(&context, 31)
++                      << " sp=0x" << getRegU32(&context, 29)
++                      << " v0=0x" << getRegU32(&context, 2)
++                      << " a0=0x" << getRegU32(&context, 4) << std::dec;
++            if (running->id > 0)
++            {
++                std::cerr << " trace=" << PS2Runtime::dispatchHistory();
++            }
++            std::cerr << std::endl;
+             makeDormant(*running);
+             m_currentThreadId = 0;
+             copyMainContextToRuntime();
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/CD.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/CD.cpp
+index 3c72d56..a81dbe1 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/CD.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/CD.cpp
+@@ -210,6 +210,18 @@ namespace ps2_stubs
+         const uint32_t a1 = getRegU32(ctx, 5); // usually sector count
+         const uint32_t a2 = getRegU32(ctx, 6); // usually destination buffer
+ 
++        // un5-nx: disc reads are otherwise silent, which hides "is it loading?".
++        {
++            static uint32_t s_readCount = 0u;
++            ++s_readCount;
++            if (s_readCount <= 64u || (s_readCount % 256u) == 0u)
++            {
++                std::cerr << "[sceCdRead] #" << s_readCount << std::hex << " lbn=0x" << a0
++                          << " sectors=0x" << a1 << " buf=0x" << a2
++                          << " ra=0x" << getRegU32(ctx, 31) << std::dec << std::endl;
++            }
++        }
++
+         struct CdReadArgs
+         {
+             uint32_t lbn = 0;
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 9f8c199..e1721b4 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -1155,6 +1155,11 @@ const char *describeGuestBranchKind(PS2Runtime::GuestBranchKind kind)
+     }
+ }
+ 
++std::string PS2Runtime::dispatchHistory()
++{
++    return formatDispatchHistory();
++}
++
+ PS2Runtime::RecompiledFunction PS2Runtime::lookupFunction(uint32_t address)
+ {
+     pushDispatchPc(address);
+-- 
+2.54.0 (Apple Git-157)
+

@@ -17,11 +17,14 @@ On upstream PS2Recomp (`e563698`) plus three local patches, the game:
    game-logic thread (`0x12E9E8`, priority 122) starts;
 6. issues its first GS draws (textured sprites).
 
-Frames are still black. The IOP side no longer has unhandled imports: a
-minimal libsd keeps CRI ADX's block transfers draining and its transfer
-interrupt firing (no sound yet). The game-logic thread now waits at
-`0x12EADC`; that is the next stop to trace. (`sceCdRead` is not logged by
-the runtime, so "no reads" cannot be told from the log alone.)
+7. keeps its main thread alive and **loads data**: dozens of `sceCdRead`
+   calls walk `DATA.CVM`; nine EE threads run, including CRI's;
+8. **streams graphics work to VU1**: in 45 s, 2,461 DMA transfers and 4,918
+   VIF writes.
+
+Frames are still black: nothing reaches the GS (0 GIF transfers). VIF1
+delivers packets but no VU1 program kicks output to the GIF, so the VU1
+path (microcode upload, `MSCAL`, `XGKICK`) is the next thing to trace.
 
 ## What it took
 
@@ -34,6 +37,7 @@ the runtime, so "no reads" cannot be told from the log alone.)
 | Game-logic thread never started; main thread "restored" to priority 0 | `ChangeThreadPriority` returned `KE_OK` (0); the EE kernel returns the old priority, which the game saves and restores around a critical section | Patch `0001` |
 | CRI ADX waits on SPU2 transfers forever | No libsd for IRX modules: `sceSdBlockTrans` never completes, the transfer interrupt never fires | Patch `0004`: transfers drain at 48 kHz stereo rate, the handler from `sceSdSetTransIntrHandler` fires per half buffer |
 | `CreateThread` refused with -403 | The runtime rejects priority 0 (`< 1`), the IOP's rule; the EE takes 0-127 and runs its own main thread at 0 | Patch `0001` |
+| Main thread ends with `ra = 0`, loader never kicked again | Async callback stacks (16 KB each, carved down from the top of RAM) landed on `SetupThread`'s automatic main stack from the third one on, overwriting its saved return address while it slept | Patch `0007`: callback stacks start below the main stack |
 | Precompiled header errors on rebuild | The generated headers are in the runner's PCH and ninja does not rebuild it | `tools/build_mac.sh` drops the PCH when they change |
 
 Seeds come from: the constructor table, data words that point at a function
@@ -45,7 +49,7 @@ function address in code, and `J`/`JAL` targets outside their own function.
 
 Kept as a commit series on branch `un5-nx` of `third_party/PS2Recomp`,
 exported with `git format-patch` to `patches/ps2recomp/` and applied by
-`tools/setup_ps2recomp.sh`. Each fix has a test; the full suite (448 tests)
+`tools/setup_ps2recomp.sh`. Each fix has a test; the full suite (449 tests)
 passes, and the new tests fail without their fix.
 
 | Patch | What |
@@ -56,17 +60,20 @@ passes, and the new tests fail without their fix.
 | `0004` feat(iop) | Minimal libsd for IRX modules: no sound, but the SPU2 transfer clock and interrupts |
 | `0005` tools | `UN5_FRAME_DUMP=<absolute dir>` writes every 30th presented frame as a PPM |
 | `0006` tools | Thread, semaphore and `UN5_WATCH=0xADDR,...` memory diagnostics on each run tick |
+| `0007` fix(runtime) | Async callback stacks no longer overlap the automatic main stack |
+| `0008` tools | Disc reads, and threads reaching pc 0 (with dispatch history), are logged |
 
 With the analyzer and runtime fixed, `tools/fixmap.py` no longer filters
 the analyzer's patches or binds `sceCdLayerSearchFile` itself; the
 recompiled output is identical apart from that call now using its own name.
 
-The first three are meant for upstream; the GitHub account is flagged at
+`0001`, `0002`, `0003` and `0007` are meant for upstream; the GitHub account is flagged at
 the moment, so they wait here.
 
 ## Next
 
-1. Trace the game-logic thread's wait at `0x12EADC`.
+1. Trace the VU1 path: is the microcode uploaded (`MPG`), started
+   (`MSCAL`), and does it `XGKICK` to the GIF?
 2. Look at [z3xox/BT3-Recomp](https://github.com/z3xox/BT3-Recomp)'s native
    `cri_adxi` (same IOP module, GPL-3.0) and
    [ico-pc](https://github.com/nathanialf/ico-pc)'s software SPU2 (MIT) for
