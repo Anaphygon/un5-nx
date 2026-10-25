@@ -22,9 +22,12 @@ On upstream PS2Recomp (`e563698`) plus three local patches, the game:
 8. **streams graphics work to VU1**: in 45 s, 2,461 DMA transfers and 4,918
    VIF writes.
 
-Frames are still black: nothing reaches the GS (0 GIF transfers). VIF1
-delivers packets but no VU1 program kicks output to the GIF, so the VU1
-path (microcode upload, `MSCAL`, `XGKICK`) is the next thing to trace.
+9. runs its loader thread every frame and uploads textures to the GS.
+
+Frames are still black because nothing has been drawn yet: the frame
+buffers in GS memory stay empty, only textures land there, and the game has
+not issued a VU1 program (`MSCAL`) since the VIF1 stream was fixed. It has
+not entered a scene; what it waits for is the next thing to find.
 
 ## What it took
 
@@ -38,6 +41,9 @@ path (microcode upload, `MSCAL`, `XGKICK`) is the next thing to trace.
 | CRI ADX waits on SPU2 transfers forever | No libsd for IRX modules: `sceSdBlockTrans` never completes, the transfer interrupt never fires | Patch `0004`: transfers drain at 48 kHz stereo rate, the handler from `sceSdSetTransIntrHandler` fires per half buffer |
 | `CreateThread` refused with -403 | The runtime rejects priority 0 (`< 1`), the IOP's rule; the EE takes 0-127 and runs its own main thread at 0 | Patch `0001` |
 | Main thread ends with `ra = 0`, loader never kicked again | Async callback stacks (16 KB each, carved down from the top of RAM) landed on `SetupThread`'s automatic main stack from the third one on, overwriting its saved return address while it slept | Patch `0007`: callback stacks start below the main stack |
+| Bogus `MSCAL 0x829D`, VU1 runs empty code | VIF1 swallowed the `DIRECTHL` VIFcode that carried the rest of a GIF IMAGE as image data; the stream slipped 8 bytes and texture data was parsed as commands | Patch `0009`: the image is fed from following DIRECT payloads |
+| Loader thread never runs | `ResumeThread` and the other thread calls returned `KE_OK`; the EE kernel returns the thread ID, and the game wakes its loader only if `ResumeThread(id) == id` (confirmed against the Play! HLE kernel) | Patch `0010` |
+| The game crawls | `PS2X_ENABLE_AGRESSIVE_LOGS` also flushed a log line per guest call (194 MB a minute) | Patch `0011`: separate, off by default |
 | Precompiled header errors on rebuild | The generated headers are in the runner's PCH and ninja does not rebuild it | `tools/build_mac.sh` drops the PCH when they change |
 
 Seeds come from: the constructor table, data words that point at a function
@@ -49,7 +55,7 @@ function address in code, and `J`/`JAL` targets outside their own function.
 
 Kept as a commit series on branch `un5-nx` of `third_party/PS2Recomp`,
 exported with `git format-patch` to `patches/ps2recomp/` and applied by
-`tools/setup_ps2recomp.sh`. Each fix has a test; the full suite (449 tests)
+`tools/setup_ps2recomp.sh`. Each fix has a test; the full suite (451 tests)
 passes, and the new tests fail without their fix.
 
 | Patch | What |
@@ -62,18 +68,22 @@ passes, and the new tests fail without their fix.
 | `0006` tools | Thread, semaphore and `UN5_WATCH=0xADDR,...` memory diagnostics on each run tick |
 | `0007` fix(runtime) | Async callback stacks no longer overlap the automatic main stack |
 | `0008` tools | Disc reads, and threads reaching pc 0 (with dispatch history), are logged |
+| `0009` fix(runtime) | VIF1 keeps DIRECT commands when a GIF image spans them |
+| `0010` fix(runtime) | Thread calls return the thread ID on success |
+| `0011` tools | Function log tracker off by default; display circuits and VRAM use logged |
 
 With the analyzer and runtime fixed, `tools/fixmap.py` no longer filters
 the analyzer's patches or binds `sceCdLayerSearchFile` itself; the
 recompiled output is identical apart from that call now using its own name.
 
-`0001`, `0002`, `0003` and `0007` are meant for upstream; the GitHub account is flagged at
+`0001`, `0002`, `0003`, `0007`, `0009` and `0010` are meant for upstream
+(the Sinan-Karakaya fork used by DQ8-Recompiled has none of them either); the GitHub account is flagged at
 the moment, so they wait here.
 
 ## Next
 
-1. Trace the VU1 path: is the microcode uploaded (`MPG`), started
-   (`MSCAL`), and does it `XGKICK` to the GIF?
+1. Find what the game waits for before its first scene: the loader runs,
+   CVFS reads the `DATA.CVM` directory, but no file data is read yet.
 2. Look at [z3xox/BT3-Recomp](https://github.com/z3xox/BT3-Recomp)'s native
    `cri_adxi` (same IOP module, GPL-3.0) and
    [ico-pc](https://github.com/nathanialf/ico-pc)'s software SPU2 (MIT) for

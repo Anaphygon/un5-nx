@@ -1,8 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Mon, 26 Oct 2026 02:12:26 +0700
-Subject: [PATCH 5/8] tools(runtime): UN5_FRAME_DUMP writes presented frames as
- PPM
+Subject: [PATCH 05/11] tools(runtime): UN5_FRAME_DUMP writes presented frames
+ as PPM
 
 Every 30th presented frame goes to <dir>/frame_NNNNN.ppm, so a run can be
 inspected without a screen capture. The path must be absolute.

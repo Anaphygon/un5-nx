@@ -1,0 +1,162 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 26 Oct 2026 05:10:00 +0700
+Subject: [PATCH 10/11] fix(runtime): EE thread calls return the thread ID on
+ success
+
+StartThread, DeleteThread, TerminateThread, SuspendThread,
+ResumeThread, WakeupThread and ReleaseWaitThread (and their interrupt
+forms) returned KE_OK. The EE kernel returns the thread's ID, as the
+Play! HLE kernel does, and games test it: SLES-55605 wakes its loader
+thread only if ResumeThread(id) == id, so the loader never ran.
+
+Co-Authored-By: Lisvindanu <lisvindanu015@gmail.com>
+---
+ .../src/lib/Kernel/Syscalls/Thread.cpp        | 37 +++++++++++++------
+ ps2xTest/src/ps2_runtime_kernel_tests.cpp     | 33 +++++++++++++++++
+ 2 files changed, 58 insertions(+), 12 deletions(-)
+
+diff --git a/ps2xRuntime/src/lib/Kernel/Syscalls/Thread.cpp b/ps2xRuntime/src/lib/Kernel/Syscalls/Thread.cpp
+index bfb95ed..4ed53af 100644
+--- a/ps2xRuntime/src/lib/Kernel/Syscalls/Thread.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Syscalls/Thread.cpp
+@@ -129,14 +129,23 @@ namespace ps2_syscalls
+             ee.transferIfRequested(interruptSafe);
+         }
+ 
++        // The EE kernel's thread calls return the thread's ID on success
++        // (ChangeThreadPriority returns the old priority instead), and games
++        // test it: SLES-55605 wakes its loader only if ResumeThread(id) == id.
++        int idOnSuccess(int result, int id)
++        {
++            return result == KE_OK ? id : result;
++        }
++
+         void wakeupThreadImpl(uint8_t *rdram,
+                               R5900Context *ctx,
+                               PS2Runtime *runtime,
+                               bool interruptSafe)
+         {
+             EeScheduler &ee = scheduler(rdram, ctx, runtime);
+-            const int result = ee.wakeupThread(static_cast<int>(getRegU32(ctx, 4)), interruptSafe);
+-            setReturnS32(ctx, result);
++            const int id = static_cast<int>(getRegU32(ctx, 4));
++            const int result = ee.wakeupThread(id, interruptSafe);
++            setReturnS32(ctx, idOnSuccess(result, id));
+             ee.transferIfRequested(interruptSafe);
+         }
+ 
+@@ -146,8 +155,9 @@ namespace ps2_syscalls
+                              bool interruptSafe)
+         {
+             EeScheduler &ee = scheduler(rdram, ctx, runtime);
+-            const int result = ee.releaseWait(static_cast<int>(getRegU32(ctx, 4)), interruptSafe);
+-            setReturnS32(ctx, result);
++            const int id = static_cast<int>(getRegU32(ctx, 4));
++            const int result = ee.releaseWait(id, interruptSafe);
++            setReturnS32(ctx, idOnSuccess(result, id));
+             ee.transferIfRequested(interruptSafe);
+         }
+     }
+@@ -258,7 +268,7 @@ namespace ps2_syscalls
+         {
+             runtime->guestFree(ownedStack);
+         }
+-        setReturnS32(ctx, result);
++        setReturnS32(ctx, idOnSuccess(result, id));
+     }
+ 
+     void StartThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+@@ -294,7 +304,7 @@ namespace ps2_syscalls
+             target->ownsStack = true;
+         }
+         const int result = ee.startThread(id, arg, *ctx, false);
+-        setReturnS32(ctx, result);
++        setReturnS32(ctx, idOnSuccess(result, id));
+         ee.transferIfRequested(false);
+     }
+ 
+@@ -314,27 +324,30 @@ namespace ps2_syscalls
+     {
+         EeScheduler &ee = scheduler(rdram, ctx, runtime);
+         uint32_t ownedStack = 0;
+-        const int result = ee.terminateThread(static_cast<int>(getRegU32(ctx, 4)), ownedStack, false);
++        const int id = static_cast<int>(getRegU32(ctx, 4));
++        const int result = ee.terminateThread(id, ownedStack, false);
+         if (ownedStack != 0u)
+         {
+             runtime->guestFree(ownedStack);
+         }
+-        setReturnS32(ctx, result);
++        setReturnS32(ctx, idOnSuccess(result, id));
+     }
+ 
+     void SuspendThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
+         EeScheduler &ee = scheduler(rdram, ctx, runtime);
+-        const int result = ee.suspendThread(static_cast<int>(getRegU32(ctx, 4)), false);
+-        setReturnS32(ctx, result);
++        const int id = static_cast<int>(getRegU32(ctx, 4));
++        const int result = ee.suspendThread(id, false);
++        setReturnS32(ctx, idOnSuccess(result, id));
+         ee.transferIfRequested(false);
+     }
+ 
+     void ResumeThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
+         EeScheduler &ee = scheduler(rdram, ctx, runtime);
+-        const int result = ee.resumeThread(static_cast<int>(getRegU32(ctx, 4)), false);
+-        setReturnS32(ctx, result);
++        const int id = static_cast<int>(getRegU32(ctx, 4));
++        const int result = ee.resumeThread(id, false);
++        setReturnS32(ctx, idOnSuccess(result, id));
+         ee.transferIfRequested(false);
+     }
+ 
+diff --git a/ps2xTest/src/ps2_runtime_kernel_tests.cpp b/ps2xTest/src/ps2_runtime_kernel_tests.cpp
+index 582f8c4..063a915 100644
+--- a/ps2xTest/src/ps2_runtime_kernel_tests.cpp
++++ b/ps2xTest/src/ps2_runtime_kernel_tests.cpp
+@@ -572,6 +572,39 @@ void register_ps2_runtime_kernel_tests()
+                      "SET_GPR_U32 must preserve the upper 64 bits of the 128-bit GPR");
+         });
+ 
++        tc.Run("EE thread calls return the thread ID on success", [](TestCase &t)
++        {
++            TestEnv env;
++            env.runtime.registerFunction(K_SCHED_HIGH, [](uint8_t *, R5900Context *, PS2Runtime *) {});
++            EeThreadCreateAbi threadParam{};
++            threadParam.func = K_SCHED_HIGH;
++            threadParam.stack = 0x00018000u;
++            threadParam.stack_size = 0x1000;
++            threadParam.initial_priority = 100;   // below the caller, so starting it does not preempt
++            std::memcpy(env.rdram.data() + K_PARAM_ADDR, &threadParam, sizeof(threadParam));
++            setRegU32(env.ctx, 4, K_PARAM_ADDR);
++            CreateThread(env.rdram.data(), &env.ctx, &env.runtime);
++            const int id = getRegS32(env.ctx, 2);
++            t.IsTrue(id >= 2, "CreateThread should create a thread");
++
++            // As the EE kernel (and the Play! HLE kernel) do: games compare the
++            // result with the ID, e.g. "if (ResumeThread(id) == id) WakeupThread(id)".
++            auto call = [&](void (*fn)(uint8_t *, R5900Context *, PS2Runtime *), uint32_t a1)
++            {
++                setRegU32(env.ctx, 4, static_cast<uint32_t>(id));
++                setRegU32(env.ctx, 5, a1);
++                fn(env.rdram.data(), &env.ctx, &env.runtime);
++                return getRegS32(env.ctx, 2);
++            };
++            t.Equals(call(StartThread, 0u), id, "StartThread returns the thread ID");
++            t.Equals(call(SuspendThread, 0u), id, "SuspendThread returns the thread ID");
++            t.Equals(call(ResumeThread, 0u), id, "ResumeThread returns the thread ID");
++            t.Equals(call(WakeupThread, 0u), id, "WakeupThread returns the thread ID");
++            t.Equals(call(TerminateThread, 0u), id, "TerminateThread returns the thread ID");
++            t.Equals(call(DeleteThread, 0u), id, "DeleteThread returns the thread ID");
++            t.IsTrue(call(ResumeThread, 0u) < 0, "a call on a deleted thread still fails");
++        });
++
+         tc.Run("EE thread priority 0 is valid and ChangeThreadPriority returns the old priority", [](TestCase &t)
+         {
+             TestEnv env;
+-- 
+2.54.0 (Apple Git-157)
+

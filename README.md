@@ -73,7 +73,7 @@ Builds use half the CPU cores by default (`JOBS=` to change it).
 ## Fixes to PS2Recomp
 
 Bugs found while porting this game, fixed with tests in
-`patches/ps2recomp/` (all 449 PS2Recomp tests pass), ready to send upstream:
+`patches/ps2recomp/` (all 451 PS2Recomp tests pass), ready to send upstream:
 
 - The analyzer replaced ordinary "store a global, then call" code with NOPs
   as self-modifying code whenever one ELF section holds code and data.
@@ -82,6 +82,9 @@ Bugs found while porting this game, fixed with tests in
 - `sceCdLayerSearchFile` had no runtime handler.
 - Async callback stacks were carved over the automatic main stack and
   overwrote its saved return addresses.
+- VIF1 swallowed a DIRECT command that carried the rest of a GS image, and
+  lost sync with the command stream.
+- Thread calls returned 0 instead of the thread ID.
 
 ## Contributors
 
