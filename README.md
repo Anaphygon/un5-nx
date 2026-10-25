@@ -74,10 +74,27 @@ Builds use half the CPU cores by default (`JOBS=` to change it).
 
 ## Contributors
 
-| Who | Role |
-|---|---|
-| **[Lisvindanu](https://github.com/Lisvindanu)** | Project manager and product owner: sets direction, priorities and the go/no-go at each phase gate |
-| **Claude** (Anthropic) | Executor: research, reverse engineering, tooling, builds and documentation |
+<table>
+  <tr>
+    <td align="center"><a href="https://github.com/Lisvindanu"><img src="https://github.com/Lisvindanu.png?size=100" width="100" alt="Lisvindanu"/><br/><b>Lisvindanu</b></a><br/>Project manager and product owner: direction, priorities, and the go/no-go at each phase gate</td>
+    <td align="center"><a href="https://github.com/claude"><img src="https://github.com/claude.png?size=100" width="100" alt="claude"/><br/><b>Claude (Anthropic)</b></a><br/>Executor: research, reverse engineering, tooling, builds and documentation</td>
+  </tr>
+</table>
+
+### Built on the work of
+
+<table>
+  <tr>
+    <td align="center"><a href="https://github.com/ran-j"><img src="https://github.com/ran-j.png?size=100" width="100" alt="ran-j"/><br/><b>ran-j</b></a><br/><a href="https://github.com/ran-j/PS2Recomp">PS2Recomp</a>: the static recompiler, analyzer, runtime and Ghidra export everything here is built with</td>
+    <td align="center"><a href="https://github.com/YYOzcan"><img src="https://github.com/YYOzcan.png?size=100" width="100" alt="YYOzcan"/><br/><b>YYOzcan</b></a><br/><a href="https://github.com/YYOzcan/Tobiichi-Port">Tobiichi-Port</a>: the God of War port that showed the way, its installer model and runtime fork</td>
+    <td align="center"><a href="https://github.com/Waffle565"><img src="https://github.com/Waffle565.png?size=100" width="100" alt="Waffle565"/><br/><b>Waffle565</b></a><br/><a href="https://github.com/Waffle565/God-Of-War-Native-Port">God-Of-War-Native-Port</a>: the native GS, VU1, IOP and sound runtime (studied, not copied)</td>
+  </tr>
+  <tr>
+    <td align="center"><a href="https://github.com/KIexster"><img src="https://github.com/KIexster.png?size=100" width="100" alt="KIexster"/><br/><b>KIexster</b></a><br/><a href="https://github.com/KIexster/god-of-war-recomp">god-of-war-recomp</a>: God of War recompilation on Waffle565's runtime, with CI tests</td>
+    <td align="center"><a href="https://github.com/chaoticgd"><img src="https://github.com/chaoticgd.png?size=100" width="100" alt="chaoticgd"/><br/><b>chaoticgd</b></a><br/><a href="https://github.com/chaoticgd/ghidra-emotionengine-reloaded">ghidra-emotionengine-reloaded</a>: the Emotion Engine processor module for Ghidra</td>
+    <td align="center"><a href="https://github.com/Decompollaborate"><img src="https://github.com/Decompollaborate.png?size=100" width="100" alt="Decompollaborate"/><br/><b>Decompollaborate</b></a><br/><a href="https://github.com/Decompollaborate/rabbitizer">rabbitizer</a>: the R5900-aware disassembler behind tools/xref.py</td>
+  </tr>
+</table>
 
 ## Credits
 
