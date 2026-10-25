@@ -13,14 +13,15 @@ On upstream PS2Recomp (`e563698`) plus three local patches, the game:
    Ver.9.69");
 4. **finds every file on the disc** through `sceCdSearchFile`;
 5. creates its eight threads with the right priorities, and **its main loop
-   runs**: the VSync callback wakes the frame thread every frame;
+   runs**: the VSync callback wakes the frame thread every frame, and the
+   game-logic thread (`0x12E9E8`, priority 122) starts;
 6. issues its first GS draws (textured sprites).
 
-Frames are still black and no disc data has been read yet (no `sceCdRead`):
-the game appears to wait on CRI ADX, whose IOP module calls `libsd`
-functions the runtime does not implement (4 `sceSdInit`, 5
-`sceSdSetParam`, 18 `sceSdBlockTrans`, 26, 28). That is the next thing to
-solve, most likely with the Tobiichi-Port runtime fork's sound engine.
+Frames are still black. The IOP side no longer has unhandled imports: a
+minimal libsd keeps CRI ADX's block transfers draining and its transfer
+interrupt firing (no sound yet). The game-logic thread now waits at
+`0x12EADC`; that is the next stop to trace. (`sceCdRead` is not logged by
+the runtime, so "no reads" cannot be told from the log alone.)
 
 ## What it took
 
@@ -30,6 +31,8 @@ solve, most likely with the Tobiichi-Port runtime fork's sound engine.
 | `J 0x1a1bc0`, `JALR 0x1a1da0`, `JALR 0x122b60` | Tail calls and callbacks into code Ghidra left as labels, which phase 1 dropped | Ghidra's 53,000 labels plus 344 pointer/jump seeds go back in as **entry points**: inside a known function each becomes a cheap resume entry, outside one a bounded function. 10,285 files, 0 errors |
 | Loop on "Libcdvd bind err CdSearchFile" | `0x1733C0` is `sceCdLayerSearchFile`; the runtime only has `sceCdSearchFile`, so the game's own libcdvd ran and waited for cdvdfsv's RPC server `0x80000597` | Bound to the `sceCdSearchFile` handler (one-layer disc, same arguments) in `tools/fixmap.py` |
 | All EE threads asleep, nobody wakes them | The analyzer saw one ELF section spanning code and data and **replaced 32 stores with NOPs as "potential self-modifying code"**; they write globals. One held the idle thread's priority, so its value stayed 0 and the idle busy loop starved every other thread | `tools/fixmap.py` keeps such a patch only if the store's target is inside a real code range: all 32 dropped |
+| Game-logic thread never started; main thread "restored" to priority 0 | `ChangeThreadPriority` returned `KE_OK` (0); the EE kernel returns the old priority, which the game saves and restores around a critical section | `0005-change-priority-returns-old.patch` |
+| CRI ADX waits on SPU2 transfers forever | No libsd for IRX modules: `sceSdBlockTrans` never completes, the transfer interrupt never fires | `0004-iop-libsd.patch`: transfers drain at 48 kHz stereo rate, the handler from `sceSdSetTransIntrHandler` fires per half buffer |
 | `CreateThread` refused with -403 | The runtime rejects priority 0 (`< 1`), the IOP's rule; the EE takes 0-127 and runs its own main thread at 0 | `patches/ps2recomp/0003-ee-priority-zero.patch` |
 | Precompiled header errors on rebuild | The generated headers are in the runner's PCH and ninja does not rebuild it | `tools/build_mac.sh` drops the PCH when they change |
 
@@ -48,13 +51,17 @@ Runtime patches in `patches/ps2recomp/`, applied in order by
 | `0001-frame-dump.patch` | `UN5_FRAME_DUMP=<absolute dir>` writes every 30th presented frame as a PPM |
 | `0002-thread-diagnostics.patch` | Each `run:tick` also logs every EE thread's status, wait reason and PC, semaphores with waiters, and `UN5_WATCH=0xADDR,...` guest words; refused `CreateThread` calls are logged |
 | `0003-ee-priority-zero.patch` | EE thread priority 0 is valid |
+| `0004-iop-libsd.patch` | libsd for IRX modules: no sound, but the SPU2 transfer clock and interrupts |
+| `0005-change-priority-returns-old.patch` | `ChangeThreadPriority` returns the old priority |
 
-Two findings are worth reporting upstream: the analyzer's self-modifying
-code patches on single-section ELFs, and the EE priority range.
+Three findings are worth reporting upstream: the analyzer's self-modifying
+code patches on single-section ELFs, the EE priority range, and
+`ChangeThreadPriority`'s return value.
 
 ## Next
 
-1. Build against the Tobiichi-Port runtime fork, whose `libsd`-driven sound
-   engine is aimed at exactly this gap, and compare.
-2. Otherwise implement the five `libsd` imports CRI ADX calls, enough for it
-   to report its transfers complete.
+1. Trace the game-logic thread's wait at `0x12EADC`.
+2. Look at [z3xox/BT3-Recomp](https://github.com/z3xox/BT3-Recomp)'s native
+   `cri_adxi` (same IOP module, GPL-3.0) and
+   [ico-pc](https://github.com/nathanialf/ico-pc)'s software SPU2 (MIT) for
+   real sound. More leads in [`REFERENCES.md`](REFERENCES.md).
