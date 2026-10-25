@@ -1,0 +1,11 @@
+# un5-nx contributors
+
+Lisvindanu <https://github.com/Lisvindanu>
+    Project manager and product owner: direction, priorities, and the
+    go/no-go decision at every phase gate.
+
+Claude (Anthropic) <https://github.com/claude>
+    Executor: research, reverse engineering, tooling, builds and
+    documentation.
+
+The projects this port builds on are credited in README.md.
