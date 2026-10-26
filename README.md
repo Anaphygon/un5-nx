@@ -121,6 +121,7 @@ Bugs found while porting this game, fixed with tests in
     <td align="center"><a href="https://github.com/KIexster"><img src="https://github.com/KIexster.png?size=100" width="100" alt="KIexster"/><br/><b>KIexster</b></a><br/><a href="https://github.com/KIexster/god-of-war-recomp">god-of-war-recomp</a>: God of War recompilation on Waffle565's runtime, with CI tests</td>
     <td align="center"><a href="https://github.com/chaoticgd"><img src="https://github.com/chaoticgd.png?size=100" width="100" alt="chaoticgd"/><br/><b>chaoticgd</b></a><br/><a href="https://github.com/chaoticgd/ghidra-emotionengine-reloaded">ghidra-emotionengine-reloaded</a>: the Emotion Engine processor module for Ghidra</td>
     <td align="center"><a href="https://github.com/Decompollaborate"><img src="https://github.com/Decompollaborate.png?size=100" width="100" alt="Decompollaborate"/><br/><b>Decompollaborate</b></a><br/><a href="https://github.com/Decompollaborate/rabbitizer">rabbitizer</a>: the R5900-aware disassembler behind tools/xref.py</td>
+    <td align="center"><a href="https://github.com/Sinan-Karakaya"><img src="https://github.com/Sinan-Karakaya.png?size=100" width="100" alt="Sinan-Karakaya"/><br/><b>Sinan Karakaya</b></a><br/><a href="https://github.com/Sinan-Karakaya/PS2Recomp">PS2Recomp fork</a> and <a href="https://github.com/Sinan-Karakaya/DQ8-Recompiled">DQ8-Recompiled</a>: the fiber scheduler ported here (patch 0020)</td>
   </tr>
 </table>
 
@@ -145,6 +146,11 @@ This project stands on other people's work:
 - **[ghidra-emotionengine-reloaded](https://github.com/chaoticgd/ghidra-emotionengine-reloaded)**
   by **chaoticgd**: the Emotion Engine processor module that makes Ghidra
   read R5900 code.
+- **[PS2Recomp fork](https://github.com/Sinan-Karakaya/PS2Recomp)** by
+  **Sinan Karakaya**, used by
+  [DQ8-Recompiled](https://github.com/Sinan-Karakaya/DQ8-Recompiled): its
+  fiber-based EE scheduler (`EeFiber` and tests, GPL-3.0) is ported in
+  patch `0020`; its notes on movie playback pointed at the same bottleneck.
 - **[rabbitizer](https://github.com/Decompollaborate/rabbitizer)** by
   **Decompollaborate**: the R5900-aware disassembler behind `tools/xref.py`.
 - **[Ghidra](https://github.com/NationalSecurityAgency/ghidra)** by the NSA.
