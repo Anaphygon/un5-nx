@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Mon, 26 Oct 2026 02:12:26 +0700
-Subject: [PATCH 06/16] tools(runtime): thread, semaphore and memory
+Subject: [PATCH 06/17] tools(runtime): thread, semaphore and memory
  diagnostics
 
 Each run tick also logs every EE thread's status, wait reason and PC, the

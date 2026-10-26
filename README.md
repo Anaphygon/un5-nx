@@ -15,8 +15,8 @@ talked to is replaced by native code instead of being emulated.
 **Status: experimental, phase 2 of 8.** The game recompiles with no errors,
 links into a macOS arm64 executable, boots its threads and IOP modules,
 loads its data and sound bank, draws the language select and takes
-keyboard or gamepad input there, then starts its intro movies, where it
-currently stops on the CRIWARE logo. It is not playable.
+keyboard or gamepad input there, then plays the start of its intro movies;
+the picture goes black after the CRIWARE logo. It is not playable.
 
 ## Read the plan
 
@@ -94,6 +94,8 @@ Bugs found while porting this game, fixed with tests in
   erasing the frame while it was presented.
 - The pad never reported pressure mode (ID `0x79`), so the game kept
   restarting its pad setup and ignored every button.
+- The game's `malloc` took the whole heap, leaving the runtime unable to
+  pass movie audio to the game, so the intro movie never started.
 
 ## Contributors
 

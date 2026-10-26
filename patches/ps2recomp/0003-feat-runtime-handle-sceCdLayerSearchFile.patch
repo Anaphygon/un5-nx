@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Mon, 26 Oct 2026 02:12:26 +0700
-Subject: [PATCH 03/16] feat(runtime): handle sceCdLayerSearchFile
+Subject: [PATCH 03/17] feat(runtime): handle sceCdLayerSearchFile
 
 The dual-layer DVD variant of sceCdSearchFile. Files are found by path on
 the host, so the layer argument changes nothing. Unhandled, the game's

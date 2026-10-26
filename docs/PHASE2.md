@@ -61,6 +61,7 @@ erasing the draw buffer while copying it.
 | Menu drawn to nowhere: every sprite projected to (0, 0) | New thread contexts had `VF0` = 0; the screen matrix is built from it | Patch `0013` |
 | Only two strips of the menu | The GS renderer ignored `TEST.ZTE = 0` and wrote depth into the buffer being presented | Patch `0014` |
 | Pad never answers: the language menu ignores every button | `scePadRead` reported ID `0x73` after `scePadEnterPressMode`; a DualShock 2 in pressure mode reports `0x79`, and the game restarts its pad setup until it does | Patch `0015` |
+| Movie stops on the CRIWARE logo | The game's `malloc` took the whole guest heap, so the runtime could not allocate libmpeg callback data and dropped every audio packet; the player waits for audio before it shows video | Patch `0017`: the game's allocations leave a reserve |
 | The game crawls | `PS2X_ENABLE_AGRESSIVE_LOGS` also flushed a log line per guest call (194 MB a minute) | Patch `0011`: separate, off by default |
 | Precompiled header errors on rebuild | The generated headers are in the runner's PCH and ninja does not rebuild it | `tools/build_mac.sh` drops the PCH when they change |
 
@@ -74,7 +75,7 @@ function address in code, and `J`/`JAL` targets outside their own function.
 Kept as a commit series on branch `un5-nx` of `third_party/PS2Recomp`,
 exported with `git format-patch` to `patches/ps2recomp/` and applied by
 `tools/setup_ps2recomp.sh`. Each fix has a test; the full suite (451 runtime
-tests, now 454, plus the IOP suites) passes, and the new tests fail without their fix.
+tests, now 455, plus the IOP suites) passes, and the new tests fail without their fix.
 
 | Patch | What |
 |---|---|
@@ -93,25 +94,25 @@ tests, now 454, plus the IOP suites) passes, and the new tests fail without thei
 | `0013` fix(runtime) | Every `R5900Context` starts with `VF0` = (0, 0, 0, 1) |
 | `0014` fix(gs) | `TEST.ZTE = 0` turns the Z buffer off (no depth test, no depth write) |
 | `0015` fix(pad) | Pressure mode reports the DualShock 2 ID `0x79` |
+| `0017` fix(runtime) | The game's `malloc` leaves a heap reserve for the runtime's own allocations |
 | `0016` tools | `UN5_PAD_SCRIPT="tick:button[+button]:frames,..."` presses buttons on port 0 for scripted runs |
 
 With the analyzer and runtime fixed, `tools/fixmap.py` no longer filters
 the analyzer's patches or binds `sceCdLayerSearchFile` itself; the
 recompiled output is identical apart from that call now using its own name.
 
-`0001`, `0002`, `0003`, `0007`, `0009`, `0010`, `0012`, `0013`, `0014` and `0015` are meant for upstream
+`0001`, `0002`, `0003`, `0007`, `0009`, `0010`, `0012`, `0013`, `0014`, `0015` and `0017` are meant for upstream
 (the Sinan-Karakaya fork used by DQ8-Recompiled has none of them either); the GitHub account is flagged at
 the moment, so they wait here.
 
 ## Next
 
-1. The menu now takes keyboard and gamepad input. Confirming a language
-   plays `PSS/LOGO_C.PSS` and opens `PSS/NARUTO10.PSS`, which stops on the
-   CRIWARE logo: the player's frame output (`FUN_001052e0`, called every
-   frame from `FUN_00107a20`) stays off because the flag at `gp-0x3B0` is
-   never set; `FUN_001044a0` sets it after a `sceGsSyncV` field wait.
-   Next: why that function is not reached. Repeat with
-   `UN5_PAD_SCRIPT="600:cross:8"`.
+1. Confirming the language plays `PSS/LOGO_C.PSS` and starts
+   `PSS/NARUTO10.PSS` (the CRIWARE logo) with its audio. About 1,000 frames
+   in, the picture goes black and no new frame reaches the window: GIF
+   transfers stop at 1,131 while the EE keeps running and the window loop
+   idles normally. Next: find what stops frame output after the movie.
+   Repeat with `UN5_PAD_SCRIPT="600:cross:8"`.
    `tools/debug-traces.diff` keeps temporary traces (GS primitives, VIF1
    chain dump); `tools/decompile.sh out.c <hex addr>...` decompiles functions
    from the phase 1 Ghidra project.
