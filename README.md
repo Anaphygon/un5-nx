@@ -14,8 +14,9 @@ talked to is replaced by native code instead of being emulated.
 
 **Status: experimental, phase 2 of 8.** The game recompiles with no errors,
 links into a macOS arm64 executable, boots its threads and IOP modules,
-reads its data and streams work to VU1, but nothing is drawn on screen yet.
-It is not playable.
+loads its data and sound bank, and draws the first pixels of its first menu
+(two strips of the logo and artwork; the rest is still black). It is not
+playable.
 
 ## Read the plan
 
@@ -87,6 +88,8 @@ Bugs found while porting this game, fixed with tests in
 - Thread calls returned 0 instead of the thread ID.
 - The IOP refused disc reads into buffers no allocation had touched, so the
   sound driver never loaded.
+- Every EE thread started with VU0's VF0 zeroed instead of (0, 0, 0, 1), so
+  the screen matrix was empty and nothing was drawn.
 
 ## Contributors
 
