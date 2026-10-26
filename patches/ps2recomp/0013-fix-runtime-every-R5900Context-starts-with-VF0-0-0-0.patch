@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Mon, 26 Oct 2026 17:22:28 +0700
-Subject: [PATCH 13/13] fix(runtime): every R5900Context starts with VF0 = (0,
+Subject: [PATCH 13/14] fix(runtime): every R5900Context starts with VF0 = (0,
  0, 0, 1)
 
 The constructor zeroed the whole context, VF0 included, and only the

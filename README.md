@@ -14,8 +14,8 @@ talked to is replaced by native code instead of being emulated.
 
 **Status: experimental, phase 2 of 8.** The game recompiles with no errors,
 links into a macOS arm64 executable, boots its threads and IOP modules,
-loads its data and sound bank, and draws the first pixels of its first menu
-(two strips of the logo and artwork; the rest is still black). It is not
+loads its data and sound bank, and draws its first screen, the language
+select, in full. Input, movies and the title screen are next. It is not
 playable.
 
 ## Read the plan
@@ -90,6 +90,8 @@ Bugs found while porting this game, fixed with tests in
   sound driver never loaded.
 - Every EE thread started with VU0's VF0 zeroed instead of (0, 0, 0, 1), so
   the screen matrix was empty and nothing was drawn.
+- The GS renderer wrote depth with the Z buffer switched off (`ZTE = 0`),
+  erasing the frame while it was presented.
 
 ## Contributors
 
