@@ -97,6 +97,8 @@ the moment, so they wait here.
    `tools/debug-traces.diff` holds the temporary traces used to get here
    (GS primitives per target, VIF1 opcodes, a dump of one VIF1 chain, DMA
    chain ends); `git apply` it in `third_party/PS2Recomp`.
+   `tools/decompile.sh out.c <hex addr>...` decompiles functions from the
+   phase 1 Ghidra project.
 2. Look at [z3xox/BT3-Recomp](https://github.com/z3xox/BT3-Recomp)'s native
    `cri_adxi` (same IOP module, GPL-3.0) and
    [ico-pc](https://github.com/nathanialf/ico-pc)'s software SPU2 (MIT) for
