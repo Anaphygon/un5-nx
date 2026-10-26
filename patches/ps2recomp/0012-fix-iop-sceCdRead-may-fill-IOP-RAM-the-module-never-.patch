@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Mon, 26 Oct 2026 05:50:36 +0700
-Subject: [PATCH 12/14] fix(iop): sceCdRead may fill IOP RAM the module never
+Subject: [PATCH 12/16] fix(iop): sceCdRead may fill IOP RAM the module never
  allocated
 
 readSectors refused any destination ownsRamRange did not know about,

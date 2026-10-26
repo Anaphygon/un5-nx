@@ -14,9 +14,9 @@ talked to is replaced by native code instead of being emulated.
 
 **Status: experimental, phase 2 of 8.** The game recompiles with no errors,
 links into a macOS arm64 executable, boots its threads and IOP modules,
-loads its data and sound bank, and draws its first screen, the language
-select, in full. Input, movies and the title screen are next. It is not
-playable.
+loads its data and sound bank, draws the language select and takes
+keyboard or gamepad input there, then starts its intro movies, where it
+currently stops on the CRIWARE logo. It is not playable.
 
 ## Read the plan
 
@@ -92,6 +92,8 @@ Bugs found while porting this game, fixed with tests in
   the screen matrix was empty and nothing was drawn.
 - The GS renderer wrote depth with the Z buffer switched off (`ZTE = 0`),
   erasing the frame while it was presented.
+- The pad never reported pressure mode (ID `0x79`), so the game kept
+  restarting its pad setup and ignored every button.
 
 ## Contributors
 
