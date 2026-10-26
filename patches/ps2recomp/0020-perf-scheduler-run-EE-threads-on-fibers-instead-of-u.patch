@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Mon, 26 Oct 2026 21:52:48 +0700
-Subject: [PATCH 20/20] perf(scheduler): run EE threads on fibers instead of
+Subject: [PATCH 20/23] perf(scheduler): run EE threads on fibers instead of
  unwinding to switch
 
 Ported from Sinan Karakaya's PS2Recomp fork (GPL-3.0), commits 8b83b2b,

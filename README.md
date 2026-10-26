@@ -15,7 +15,8 @@ talked to is replaced by native code instead of being emulated.
 **Status: experimental, phase 2 of 8.** The game recompiles with no errors,
 links into a macOS arm64 executable, boots its threads and IOP modules,
 loads its data and sound bank, draws the language select and takes
-keyboard or gamepad input there, then plays all of its intro movies. It is not playable.
+keyboard or gamepad input there, then plays all of its intro movies and reaches the title screen
+(its background is not drawn yet). It is not playable.
 
 ## Read the plan
 

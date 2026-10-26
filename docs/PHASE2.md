@@ -76,7 +76,7 @@ function address in code, and `J`/`JAL` targets outside their own function.
 Kept as a commit series on branch `un5-nx` of `third_party/PS2Recomp`,
 exported with `git format-patch` to `patches/ps2recomp/` and applied by
 `tools/setup_ps2recomp.sh`. Each fix has a test; the full suite (451 runtime
-tests, now 459, plus the IOP suites) passes, and the new tests fail without their fix.
+tests, now 461, plus the IOP suites) passes, and the new tests fail without their fix.
 
 | Patch | What |
 |---|---|
@@ -99,6 +99,9 @@ tests, now 459, plus the IOP suites) passes, and the new tests fail without thei
 | `0018` fix(dma) | A VIF chain leaves `MADR` just past the last data it moved |
 | `0019` perf(scheduler) | `RotateThreadReadyQueue` alone at its priority does not switch threads |
 | `0020` perf(scheduler) | EE threads run on fibers: a thread switch swaps stacks instead of throwing through the guest call chain (ported from Sinan Karakaya's fork) |
+| `0021` fix(mpeg) | A movie ends at its sequence end once drained (no disc EOF comes), and the end is published where games' inline `sceMpegIsEnd` reads it |
+| `0022` perf(scheduler) | A switch to another thread costs the kernel's 512 cycles (Sinan Karakaya's fork) |
+| `0023` tools | `UN5_PAD_SCRIPT` reports how many presses it parsed |
 | `0016` tools | `UN5_PAD_SCRIPT="tick:button[+button]:frames,..."` presses buttons on port 0 for scripted runs |
 
 With the analyzer and runtime fixed, `tools/fixmap.py` no longer filters
@@ -111,22 +114,22 @@ the moment, so they wait here.
 
 ## Next
 
-1. Confirming the language plays all three intro movies to the end:
-   `LOGO_C.PSS`, `NARUTO10.PSS` (CRIWARE, then the "10" anniversary logo)
-   and `OPENING.PSS`, then loops back to `NARUTO10.PSS`.
+1. Confirming the language plays the three intro movies (they cannot be
+   skipped in this game) and then reaches the **title screen**: its object
+   is created, its four assets load and it waits for Start for 475 frames
+   before returning to the intro loop, as on hardware.
 
-   ![Opening movie](opening-movie.png)
+   ![Title logo](title-logo.png)
 
-   They used to crawl at 2-3 fps because every EE thread switch was a C++
-   exception unwound through the recompiled code; patch `0020` runs each
-   EE thread on its own fiber, following Sinan Karakaya's fork, which hit
-   the same wall with Dragon Quest VIII's movies. Next: press Start where
-   the title screen should appear after the opening, and measure the
-   movie frame rate against real time. Repeat with
-   `UN5_PAD_SCRIPT="600:cross:8"`.
-   `tools/debug-traces.diff` keeps temporary traces; `tools/decompile.sh
-   out.c <hex addr>...` decompiles functions from the phase 1 Ghidra
-   project.
+   Open: the title's background is not drawn (the screen stays black
+   apart from the logo), and Start on the title has not been confirmed
+   yet; the scripted runs that seemed to show otherwise had a zsh bug
+   (`$t:start` is a history modifier, write `${t}:start`). The movies run
+   at about 0.6x speed: rendering movie frames through the CPU GS is the
+   bottleneck, so OPENING takes over three minutes. Repeat with
+   `UN5_PAD_SCRIPT="600:cross:8"` plus Start presses after the opening.
+   `tools/decompile.sh out.c <hex addr>...` decompiles functions from the
+   phase 1 Ghidra project.
 2. Look at [z3xox/BT3-Recomp](https://github.com/z3xox/BT3-Recomp)'s native
    `cri_adxi` (same IOP module, GPL-3.0) and
    [ico-pc](https://github.com/nathanialf/ico-pc)'s software SPU2 (MIT) for

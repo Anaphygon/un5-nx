@@ -1,0 +1,166 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 26 Oct 2026 23:16:01 +0700
+Subject: [PATCH 22/23] perf(scheduler): a switch to another thread costs the
+ kernel's 512 cycles
+
+Ported from Sinan Karakaya's PS2Recomp fork (834dbd8, 979903d). The EE
+clock only advanced by the safe points around a yield, so threads that
+hand over to each other in a loop, like libmpeg's producer and decoder,
+took far more host turns per field than hardware takes. Each switch to
+a different thread now charges 512 cycles; the last-run thread is
+forgotten with its record, as a new thread may reuse its ID.
+
+Co-Authored-By: Sinan Karakaya <me@sinankarakaya.fr>
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ps2xRuntime/include/runtime/ee_scheduler.h | 12 ++++++
+ ps2xRuntime/src/lib/Kernel/EeScheduler.cpp | 10 +++++
+ ps2xTest/src/ps2_runtime_kernel_tests.cpp  | 44 ++++++++++++++++++++++
+ 3 files changed, 66 insertions(+)
+
+diff --git a/ps2xRuntime/include/runtime/ee_scheduler.h b/ps2xRuntime/include/runtime/ee_scheduler.h
+index 46b45a6..e20477b 100644
+--- a/ps2xRuntime/include/runtime/ee_scheduler.h
++++ b/ps2xRuntime/include/runtime/ee_scheduler.h
+@@ -274,6 +274,13 @@ public:
+     static constexpr uint64_t kEeClockHz = 294912000ull;
+     static constexpr uint32_t kGeneratedCheckpointCycles = 32u;
+     static constexpr uint32_t kGuestDispatchCycles = 8u;
++    // What switching to another thread costs: the EE kernel saves one
++    // thread's registers and loads the next's, hundreds of cycles. Charged
++    // per switch, threads yielding to each other in a loop take a few
++    // thousand turns per field, as on hardware; charged only the safe points
++    // around the yield, movie threads that hand over in a loop take ~100,000
++    // turns a field and the movie runs slow (Sinan Karakaya's fork, 834dbd8).
++    static constexpr uint32_t kThreadSwitchCycles = 512u;
+     static constexpr uint64_t kDefaultTimeSliceCycles = 65536ull;
+ 
+     explicit EeScheduler(PS2Runtime &runtime);
+@@ -288,6 +295,8 @@ public:
+     void postEvent(EeEvent event);
+     [[nodiscard]] bool checkpointDue(uint32_t cycles = kGeneratedCheckpointCycles) noexcept;
+     void accountCycles(uint32_t cycles) noexcept;
++    // EE cycles charged so far. Executor only.
++    [[nodiscard]] uint64_t eeCycle() const noexcept { return m_eeCycle; }
+     [[nodiscard]] bool isExecutingGuest() const noexcept;
+ 
+     // Kernel object API. All calls except postEvent/requestStop execute on the
+@@ -442,6 +451,9 @@ private:
+     uint32_t m_enabledIntcMask = 0xFFFFFFFFu;
+     uint32_t m_enabledDmacMask = 0xFFFFFFFFu;
+     int m_currentThreadId = 0;
++    // The guest thread the executor last switched to; see kThreadSwitchCycles.
++    // Cleared with its record, as a new thread can be given the same ID.
++    int m_lastRunThreadId = 0;
+     bool m_rescheduleRequested = false;
+     bool m_timeSliceExpired = false;
+     bool m_insideInterrupt = false;
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+index 54e5c62..dc3f1f0 100644
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -109,6 +109,7 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
+     m_enabledIntcMask = 0xFFFFFFFFu;
+     m_enabledDmacMask = 0xFFFFFFFFu;
+     m_currentThreadId = 0;
++    m_lastRunThreadId = 0;
+     m_rescheduleRequested = false;
+     m_timeSliceExpired = false;
+     m_insideInterrupt = false;
+@@ -180,6 +181,11 @@ void EeScheduler::run()
+             }
+             if (next)
+             {
++                if (next->id != m_lastRunThreadId)
++                {
++                    accountCycles(kThreadSwitchCycles);
++                    m_lastRunThreadId = next->id;
++                }
+                 makeRunning(*next);
+             }
+             else
+@@ -510,6 +516,8 @@ int EeScheduler::deleteThread(int id, uint32_t &ownedStack)
+     {
+         ownedStack = it->second.stack;
+     }
++    if (m_lastRunThreadId == id)
++        m_lastRunThreadId = 0;
+     m_threads.erase(it);
+     publishSnapshot();
+     return KE_OK;
+@@ -561,6 +569,8 @@ int EeScheduler::startThread(int id, uint32_t arg, const R5900Context &caller, b
+         // This usually runs on the record's own fiber, so the record has to
+         // outlive the call; see m_exitedThread.
+         m_exitedThread = m_threads.extract(id);
++        if (m_lastRunThreadId == id)
++            m_lastRunThreadId = 0;
+     }
+     if (ownedStack != 0u)
+     {
+diff --git a/ps2xTest/src/ps2_runtime_kernel_tests.cpp b/ps2xTest/src/ps2_runtime_kernel_tests.cpp
+index 5a52bf2..b42d0a9 100644
+--- a/ps2xTest/src/ps2_runtime_kernel_tests.cpp
++++ b/ps2xTest/src/ps2_runtime_kernel_tests.cpp
+@@ -381,6 +381,23 @@ namespace
+         runtime->requestStop();
+     }
+ 
++    uint64_t gSwitchBefore = 0u;
++    uint64_t gSwitchAfter = 0u;
++
++    void switchYield(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        gSwitchBefore = runtime->eeScheduler().eeCycle();
++        ctx->pc = K_SCHED_A_RESUME;
++        setRegU32(*ctx, 4, 5u);
++        RotateThreadReadyQueue(rdram, ctx, runtime);
++    }
++
++    void switchPeer(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        gSwitchAfter = runtime->eeScheduler().eeCycle();
++        ctx->pc = 0u;
++    }
++
+     void schedulerRotateAResume(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+     {
+         gSchedulerTrace->push_back(11);
+@@ -935,6 +952,33 @@ void register_ps2_runtime_kernel_tests()
+             t.IsTrue(trace == expected, "explicit rotation should move the current head behind its FIFO peer");
+         });
+ 
++        tc.Run("a switch to another thread charges the kernel's switch cost", [](TestCase &t)
++        {
++            TestEnv env;
++            std::vector<int> trace;
++            gSchedulerTrace = &trace;
++            gSwitchBefore = gSwitchAfter = 0u;
++            env.runtime.registerFunction(K_SCHED_MAIN, schedulerMainExit);
++            env.runtime.registerFunction(K_SCHED_A, switchYield);
++            env.runtime.registerFunction(K_SCHED_A_RESUME, schedulerRotateAResume);
++            env.runtime.registerFunction(K_SCHED_B, switchPeer);
++            env.ctx.pc = K_SCHED_MAIN;
++
++            EeScheduler &ee = env.runtime.eeScheduler();
++            ee.reset(env.rdram.data(), env.ctx);
++            const int first = ee.createThread(EeThreadCreateParams{0, K_SCHED_A, 0x20000u, 0x800u, 0, 5, 0});
++            const int second = ee.createThread(EeThreadCreateParams{0, K_SCHED_B, 0x21000u, 0x800u, 0, 5, 0});
++            ee.startThread(first, 0, env.ctx, false);
++            ee.startThread(second, 0, env.ctx, false);
++            ee.run();
++
++            // Threads that hand over to each other in a loop must move the EE
++            // clock like the hardware kernel does, or a movie field takes
++            // ~100,000 turns of the host loop instead of a few thousand.
++            t.IsTrue(gSwitchAfter >= gSwitchBefore + EeScheduler::kThreadSwitchCycles,
++                     "yielding to a peer should cost at least one thread switch");
++        });
++
+         tc.Run("RotateThreadReadyQueue alone at its priority keeps running", [](TestCase &t)
+         {
+             TestEnv env;
+-- 
+2.54.0 (Apple Git-157)
+
