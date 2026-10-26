@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Mon, 26 Oct 2026 20:04:38 +0700
-Subject: [PATCH 16/17] tools(pad): UN5_PAD_SCRIPT drives port 0 without a
+Subject: [PATCH 16/19] tools(pad): UN5_PAD_SCRIPT drives port 0 without a
  keyboard
 
 UN5_PAD_SCRIPT="tick:button[+button]:frames,..." holds buttons on port 0

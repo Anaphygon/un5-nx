@@ -1,0 +1,86 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 26 Oct 2026 21:36:03 +0700
+Subject: [PATCH 19/19] perf(scheduler): RotateThreadReadyQueue alone at its
+ priority does not switch
+
+A thread alone at its priority that rotates its ready queue keeps
+running on the EE, but the runtime always rescheduled it, a full context
+switch. libmpeg's player yields this way in tight loops.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ps2xRuntime/src/lib/Kernel/EeScheduler.cpp |  7 +++++
+ ps2xTest/src/ps2_runtime_kernel_tests.cpp  | 31 ++++++++++++++++++++++
+ 2 files changed, 38 insertions(+)
+
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+index 452c03a..633e62d 100644
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -770,6 +770,13 @@ int EeScheduler::rotateReadyQueue(int priority, bool interruptSafe)
+     }
+ 
+     GuestThread *self = currentThread();
++    if (self && self->currentPriority == priority && m_readyQueues[priority].empty())
++    {
++        // Alone at its priority: rotating changes nothing and the caller keeps
++        // running. Switching anyway costs a full context switch, and libmpeg's
++        // player yields this way in a tight loop (SLES-55605 movies ran at 1 fps).
++        return KE_OK;
++    }
+     if (self && self->currentPriority == priority)
+     {
+         enqueueReady(*self);
+diff --git a/ps2xTest/src/ps2_runtime_kernel_tests.cpp b/ps2xTest/src/ps2_runtime_kernel_tests.cpp
+index ef9238f..5a52bf2 100644
+--- a/ps2xTest/src/ps2_runtime_kernel_tests.cpp
++++ b/ps2xTest/src/ps2_runtime_kernel_tests.cpp
+@@ -370,6 +370,17 @@ namespace
+         RotateThreadReadyQueue(rdram, ctx, runtime);
+     }
+ 
++    void schedulerRotateAlone(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        gSchedulerTrace->push_back(10);
++        ctx->pc = K_SCHED_A_RESUME;
++        setRegU32(*ctx, 4, 5u);
++        RotateThreadReadyQueue(rdram, ctx, runtime);
++        gSchedulerTrace->push_back(12);   // only reached if the call did not switch away
++        ctx->pc = 0u;
++        runtime->requestStop();
++    }
++
+     void schedulerRotateAResume(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+     {
+         gSchedulerTrace->push_back(11);
+@@ -924,6 +935,26 @@ void register_ps2_runtime_kernel_tests()
+             t.IsTrue(trace == expected, "explicit rotation should move the current head behind its FIFO peer");
+         });
+ 
++        tc.Run("RotateThreadReadyQueue alone at its priority keeps running", [](TestCase &t)
++        {
++            TestEnv env;
++            std::vector<int> trace;
++            gSchedulerTrace = &trace;
++            env.runtime.registerFunction(K_SCHED_MAIN, schedulerMainExit);
++            env.runtime.registerFunction(K_SCHED_A, schedulerRotateAlone);
++            env.runtime.registerFunction(K_SCHED_A_RESUME, schedulerRotateAResume);
++            env.ctx.pc = K_SCHED_MAIN;
++
++            EeScheduler &ee = env.runtime.eeScheduler();
++            ee.reset(env.rdram.data(), env.ctx);
++            const int only = ee.createThread(EeThreadCreateParams{0, K_SCHED_A, 0x20000u, 0x800u, 0, 5, 0});
++            ee.startThread(only, 0, env.ctx, false);
++            ee.run();
++
++            const std::vector<int> expected{1, 10, 12};
++            t.IsTrue(trace == expected, "with no peer at its priority the caller should continue without a switch");
++        });
++
+         tc.Run("starting a strictly higher-priority thread preempts immediately", [](TestCase &t)
+         {
+             TestEnv env;
+-- 
+2.54.0 (Apple Git-157)
+
