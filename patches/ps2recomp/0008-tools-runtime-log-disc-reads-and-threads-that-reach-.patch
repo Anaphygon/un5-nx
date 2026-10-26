@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Mon, 26 Oct 2026 03:14:25 +0700
-Subject: [PATCH 08/19] tools(runtime): log disc reads and threads that reach
+Subject: [PATCH 08/20] tools(runtime): log disc reads and threads that reach
  pc 0
 
 sceCdRead is otherwise silent, which hides whether the game is loading:

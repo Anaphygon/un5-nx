@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Mon, 26 Oct 2026 20:04:38 +0700
-Subject: [PATCH 15/19] fix(pad): pressure mode reports the DualShock 2 ID 0x79
+Subject: [PATCH 15/20] fix(pad): pressure mode reports the DualShock 2 ID 0x79
 
 scePadRead always reported 0x73 for an analog pad, also after
 scePadEnterPressMode. A DualShock 2 in pressure mode reports 0x79 (nine

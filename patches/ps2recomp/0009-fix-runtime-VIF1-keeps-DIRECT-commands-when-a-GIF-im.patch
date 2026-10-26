@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Mon, 26 Oct 2026 05:10:00 +0700
-Subject: [PATCH 09/19] fix(runtime): VIF1 keeps DIRECT commands when a GIF
+Subject: [PATCH 09/20] fix(runtime): VIF1 keeps DIRECT commands when a GIF
  image spans them
 
 When a PATH2 IMAGE packet was longer than its DIRECT, the interpreter

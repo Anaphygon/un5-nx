@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Mon, 26 Oct 2026 05:10:00 +0700
-Subject: [PATCH 11/19] tools(runtime): separate the function log tracker; log
+Subject: [PATCH 11/20] tools(runtime): separate the function log tracker; log
  display and VRAM
 
 PS2X_ENABLE_AGRESSIVE_LOGS also enabled PS2_FUNCTION_LOG_TRACKER, which

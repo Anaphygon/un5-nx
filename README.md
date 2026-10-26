@@ -15,8 +15,7 @@ talked to is replaced by native code instead of being emulated.
 **Status: experimental, phase 2 of 8.** The game recompiles with no errors,
 links into a macOS arm64 executable, boots its threads and IOP modules,
 loads its data and sound bank, draws the language select and takes
-keyboard or gamepad input there, then plays its intro movies, so far at
-2-3 frames a second. It is not playable.
+keyboard or gamepad input there, then plays all of its intro movies. It is not playable.
 
 ## Read the plan
 
@@ -98,6 +97,8 @@ Bugs found while porting this game, fixed with tests in
   pass movie audio to the game, so the intro movie never started.
 - DMA left `MADR` stale after a chain stopped, so the game's DMA interrupt
   handler took its error path and froze the movie.
+- Every EE thread switch was a C++ exception; threads now run on fibers,
+  ported from [Sinan Karakaya's PS2Recomp fork](https://github.com/Sinan-Karakaya/PS2Recomp).
 
 ## Contributors
 

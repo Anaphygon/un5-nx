@@ -76,7 +76,7 @@ function address in code, and `J`/`JAL` targets outside their own function.
 Kept as a commit series on branch `un5-nx` of `third_party/PS2Recomp`,
 exported with `git format-patch` to `patches/ps2recomp/` and applied by
 `tools/setup_ps2recomp.sh`. Each fix has a test; the full suite (451 runtime
-tests, now 457, plus the IOP suites) passes, and the new tests fail without their fix.
+tests, now 459, plus the IOP suites) passes, and the new tests fail without their fix.
 
 | Patch | What |
 |---|---|
@@ -98,6 +98,7 @@ tests, now 457, plus the IOP suites) passes, and the new tests fail without thei
 | `0017` fix(runtime) | The game's `malloc` leaves a heap reserve for the runtime's own allocations |
 | `0018` fix(dma) | A VIF chain leaves `MADR` just past the last data it moved |
 | `0019` perf(scheduler) | `RotateThreadReadyQueue` alone at its priority does not switch threads |
+| `0020` perf(scheduler) | EE threads run on fibers: a thread switch swaps stacks instead of throwing through the guest call chain (ported from Sinan Karakaya's fork) |
 | `0016` tools | `UN5_PAD_SCRIPT="tick:button[+button]:frames,..."` presses buttons on port 0 for scripted runs |
 
 With the analyzer and runtime fixed, `tools/fixmap.py` no longer filters
@@ -110,22 +111,22 @@ the moment, so they wait here.
 
 ## Next
 
-1. Confirming the language plays `PSS/LOGO_C.PSS` and `PSS/NARUTO10.PSS`
-   (CRIWARE logo, then the "10" anniversary intro) with picture and audio
-   callbacks, but at about 2-3 frames a second:
+1. Confirming the language plays all three intro movies to the end:
+   `LOGO_C.PSS`, `NARUTO10.PSS` (CRIWARE, then the "10" anniversary logo)
+   and `OPENING.PSS`, then loops back to `NARUTO10.PSS`.
 
-   ![Intro movie](intro-movie.png)
+   ![Opening movie](opening-movie.png)
 
-   The player's two threads share priority 125 and hand over to each
-   other with `RotateThreadReadyQueue` in tight loops. Each EE thread
-   switch in the runtime is a C++ exception unwound to the scheduler, and
-   on macOS every unwind looks up the unwind tables of this very large
-   binary again, frame by frame; that is where the time goes. Next: a
-   cheaper thread switch (or cached unwind lookup). Repeat with
+   They used to crawl at 2-3 fps because every EE thread switch was a C++
+   exception unwound through the recompiled code; patch `0020` runs each
+   EE thread on its own fiber, following Sinan Karakaya's fork, which hit
+   the same wall with Dragon Quest VIII's movies. Next: press Start where
+   the title screen should appear after the opening, and measure the
+   movie frame rate against real time. Repeat with
    `UN5_PAD_SCRIPT="600:cross:8"`.
-   `tools/debug-traces.diff` keeps temporary traces (GS primitives, VIF1
-   chain dump); `tools/decompile.sh out.c <hex addr>...` decompiles functions
-   from the phase 1 Ghidra project.
+   `tools/debug-traces.diff` keeps temporary traces; `tools/decompile.sh
+   out.c <hex addr>...` decompiles functions from the phase 1 Ghidra
+   project.
 2. Look at [z3xox/BT3-Recomp](https://github.com/z3xox/BT3-Recomp)'s native
    `cri_adxi` (same IOP module, GPL-3.0) and
    [ico-pc](https://github.com/nathanialf/ico-pc)'s software SPU2 (MIT) for
