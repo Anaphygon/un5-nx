@@ -10,6 +10,9 @@
 #include "GS/Renderers/HW/GSRendererHW.h"
 #include "GS/Renderers/OpenGL/GSDeviceOGL.h"
 #include "common/Console.h"
+#include "common/Timer.h"
+
+#include <cstdio>
 
 Pcsx2Config::GSOptions GSConfig;
 
@@ -18,12 +21,38 @@ static_assert(sizeof(Pcsx2Config) <= (1 << 16));
 
 namespace {
 alignas(16) u8 s_privileged[0x2000];
+
+// Fields per second, every 5 s: the Switch has no title bar to show it in.
+void log_speed()
+{
+	static Common::Timer::Value s_start = 0;
+	static u32 s_fields = 0;
+	const Common::Timer::Value now = Common::Timer::GetCurrentValue();
+	if (!s_start)
+		s_start = now;
+	++s_fields;
+	const double seconds = Common::Timer::ConvertValueToSeconds(now - s_start);
+	if (seconds < 5.0)
+		return;
+	Console.WriteLn("[speed] %.1f fps", static_cast<double>(s_fields) / seconds);
+	s_start = now;
+	s_fields = 0;
+}
+
+// PCSX2 logs through Console; the runner's log is stderr.
+void log_to_stderr(LOGLEVEL, ConsoleColors, std::string_view message)
+{
+	std::fwrite(message.data(), 1, message.size(), stderr);
+	if (message.empty() || message.back() != '\n')
+		std::fputc('\n', stderr);
+}
 }
 
 namespace un5gs {
 
 bool open()
 {
+	Log::SetHostOutputLevel(LOGLEVEL_DEV, log_to_stderr);
 	GSConfig.Renderer = GSRendererType::OGL;
 	EmuConfig.CurrentAspectRatio = AspectRatioType::R4_3;
 	EmuConfig.CurrentCustomAspectRatio = 0.0f;
@@ -89,6 +118,7 @@ void vsync(std::uint32_t field, bool registers_written)
 	r.PCRTCDisplays.CalculateFramebufferOffset(r.m_scanmask_used, r.m_regs->DISP[0].DISPFB, r.m_regs->DISP[1].DISPFB);
 	r.Flush(GSState::VSYNC);
 	r.VSync(field, registers_written, r.IsIdleFrame());
+	log_speed();
 }
 
 void read_fifo(void* data, std::uint32_t qwords)

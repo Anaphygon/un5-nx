@@ -1,0 +1,15 @@
+diff --git a/pcsx2/GS/Renderers/OpenGL/GSDeviceOGL.cpp b/pcsx2/GS/Renderers/OpenGL/GSDeviceOGL.cpp
+index 5527245..6c2cf08 100644
+--- a/pcsx2/GS/Renderers/OpenGL/GSDeviceOGL.cpp
++++ b/pcsx2/GS/Renderers/OpenGL/GSDeviceOGL.cpp
+@@ -2708,6 +2708,10 @@ bool GSDeviceOGL::CreateImGuiProgram()
+ 
+ void GSDeviceOGL::RenderImGui()
+ {
++	// A host with no ImGui context (un5-nx on the Switch) has no overlay to draw.
++	if (!ImGui::GetCurrentContext())
++		return;
++
+ 	ImGui::Render();
+ 	const ImDrawData* draw_data = ImGui::GetDrawData();
+ 	if (draw_data->CmdLists.Size == 0)

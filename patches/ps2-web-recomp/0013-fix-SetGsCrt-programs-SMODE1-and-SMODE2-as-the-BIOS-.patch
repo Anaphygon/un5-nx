@@ -1,0 +1,58 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 27 Oct 2026 22:43:38 +0700
+Subject: [PATCH 13/13] fix: SetGsCrt programs SMODE1 and SMODE2 as the BIOS
+ does
+
+The HLE SetGsCrt only noted the mode. A GS that reads the video mode from SMODE1's CMOD field (PCSX2's does: 2 NTSC, 3 PAL) found 0 and treated the screen as VESA, which on a Switch with PCSX2's GS plugged in left it black. SetGsCrt now writes SMODE1 with the BIOS's values for the two SDTV modes and SMODE2 from the interlace and field arguments. A loaded state also hands the privileged registers to an external GS, which otherwise only sees them as the game writes them.
+
+A UN5 battle replay on the Mac (state-based) is byte-identical; a fresh boot now has SMODE2 set from SetGsCrt.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ runtime/src/gs/gs.cpp | 11 +++++++++++
+ runtime/src/hw.cpp    |  6 ++++++
+ 2 files changed, 17 insertions(+)
+
+diff --git a/runtime/src/gs/gs.cpp b/runtime/src/gs/gs.cpp
+index a0b8b2f..adf8fab 100644
+--- a/runtime/src/gs/gs.cpp
++++ b/runtime/src/gs/gs.cpp
+@@ -1132,6 +1132,17 @@ void render_state(ps2::state::Stream &s) {
+     s.pod(g_transfer);
+     s.pod(g_carry);
+     s.size(g_carried);
++    // A loaded state sets the registers directly; an external GS gets them
++    // too (but not GS memory, which it rebuilds as the game uploads again).
++    if (!s.saving()) {
++        if (const ExternalGs *external = external_gs()) {
++            const std::pair<std::uint32_t, std::uint64_t> registers[] = {
++                {0x00, g_pmode}, {0x10, g_smode1}, {0x20, g_smode2}, {0x30, g_srfsh}, {0x40, g_synch1}, {0x50, g_synch2},
++                {0x60, g_syncv}, {0x70, g_dispfb[0]}, {0x80, g_display[0]}, {0x90, g_dispfb[1]}, {0xA0, g_display[1]},
++                {0xB0, g_extbuf}, {0xC0, g_extdata}, {0xD0, g_extwrite}, {0xE0, g_bgcolor}};
++            for (const auto &[offset, value] : registers) std::memcpy(external->privileged() + offset, &value, sizeof value);
++        }
++    }
+     std::vector<std::uint32_t> vram, clut;
+     std::uint32_t scale = 1;
+ #ifdef PS2_GPU
+diff --git a/runtime/src/hw.cpp b/runtime/src/hw.cpp
+index e56369b..680901c 100644
+--- a/runtime/src/hw.cpp
++++ b/runtime/src/hw.cpp
+@@ -179,6 +179,12 @@ void gs_set_crt(std::uint32_t interlace, std::uint32_t mode, std::uint32_t field
+     g_crt[2] = field;
+     std::fprintf(stderr, "[gs] SetGsCrt interlace %u mode 0x%X field %u\n", interlace, mode, field);
+     if (!g_options.rate_forced) g_options.pal = mode == 3u;
++    // The BIOS programs the CRT controller here. A GS that derives the video
++    // mode from SMODE1 (PCSX2's does, from its CMOD field: 2 NTSC, 3 PAL)
++    // shows nothing without it. These are the BIOS's values for the two SDTV
++    // modes; the others leave SMODE1 alone.
++    if (mode == 2u || mode == 3u) gs::write_privileged(0x12000010u, mode == 3u ? 0x740836504ull : 0x740834504ull);
++    gs::write_privileged(0x12000020u, (interlace & 1u) | ((field & 1u) << 1));
+ }
+ 
+ void dmac_raise(unsigned channel) {
+-- 
+2.54.0 (Apple Git-157)
+

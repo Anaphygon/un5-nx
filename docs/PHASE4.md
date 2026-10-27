@@ -2,19 +2,20 @@
 
 ## Where it stands
 
-The game builds into a Switch NRO and runs in an emulator: language select,
-input and in game, with sound. It is far too slow to play, because the GS is
-drawn in software on one CPU core. Nothing has run on a Switch yet.
+**PCSX2's hardware GS runs on the Switch.** UN5 boots through its intros,
+plays battles and Master Mode (story dialogue) without crashing, drawn by
+PCSX2's OpenGL renderer on the Switch GPU. It is not yet full speed: the
+sound crackles because emulation falls behind real time, and the frame rate
+is below 30 (not yet measured; the NRO now logs `[speed]` every 5 s).
 
 | Step | State |
 |---|---|
 | Runtime and generated game code build with devkitA64 (GCC 16.1) | done, patch 0006 |
 | NRO packaging; finds its files next to itself on the SD card | done, patches 0006 and 0008 |
-| Boots in an emulator (Astris 1.0.14, Ryujinx-based, Apple silicon) | done: language select, in game |
-| Runs on a Switch | not tried |
-| GS on the Switch GPU (OpenGL 4.3 compute) | works, patch 0011: correct picture, 2.5-3.3 fps in battle |
-| A hardware-rasterising GS renderer | not started: the way to a playable frame rate |
-| Render and VU threads | runs on a Switch since patch 0010 |
+| Threads on the Switch | done, patch 0010 |
+| ps2-web-recomp's compute GS on the Switch GPU (OpenGL 4.3) | works, patch 0011: 2.5-3.3 fps in battle, too heavy |
+| **PCSX2's hardware GS on the Switch** (`gs-pcsx2/`, patches 0012-0013) | **runs: intro, battle, Master Mode** |
+| Full speed | not yet: CPU side, shader compile stutter, audio |
 
 ## Building
 
@@ -114,6 +115,26 @@ the first times the whole machine with the software GS, the second without
 drawing. If the second is already slower than 20 ms per frame, the CPU side
 has to get faster before any renderer matters; if not, a hardware-rasterising
 GL renderer (PCSX2-style) is the way to full speed.
+
+## PCSX2's GS (gs-pcsx2)
+
+- A probe NRO (`glprobe`) showed the Switch's Mesa 20.1 GL 4.3 core context
+  has every extension PCSX2's OpenGL device needs; it reports 4.3 only.
+- `gs-pcsx2/` builds PCSX2's GS (core, HW renderer, texture cache, OpenGL
+  device, ImGui, common) for the Switch with two local patches: a Switch EGL
+  context in `GLContext::Create`, and no ImGui overlay without a context.
+- ps2-web-recomp gets a generic external-GS hook (patch 0012, MIT): raw GIF
+  packets, privileged registers, vsync, GS-to-host reads; the window host
+  leaves the screen to it. PCSX2's code stays in un5-nx (GPL-3.0).
+- What it took on the Switch: no dlopen (EGL entry points through
+  eglGetProcAddress), no way to mirror heap memory (`svcMapProcessMemory`
+  fails with 0xD401, so GS memory is a plain block), the render window must
+  not be `Surfaceless` (PCSX2 then skips every present), SetGsCrt must set
+  SMODE1 (patch 0013; with it 0 PCSX2 thinks the screen is VESA).
+- Shaders are read from `sdmc:/switch/un5-nx/resources/shaders/{opengl,common}`.
+  Mesa here has no program binaries, so every new shader is compiled when
+  first used (374 in a session through intro, battle and Master Mode): a
+  likely source of stutter until they are warmed up or baked.
 
 ## Open
 

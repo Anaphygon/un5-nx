@@ -16,4 +16,4 @@ PCSX2's rules (its AGENTS.md) forbid AI agents from opening pull requests,
 issues or comments there and new contributors from sending LLM-written code:
 nothing from here is to be sent upstream by an agent.
 
-Status: compiles and links for the Switch; not yet run.
+Status: runs on a Switch (HOS 23.0.0): UN5 intro, battles and Master Mode, below full speed.

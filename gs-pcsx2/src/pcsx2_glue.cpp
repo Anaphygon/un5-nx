@@ -221,9 +221,12 @@ std::pair<u8, u8> GSGetRGBA8AlphaMinMax(const void* data, u32 width, u32 height,
 
 std::optional<WindowInfo> Host::AcquireRenderWindow(bool)
 {
-	// GLContextEGLSwitch always uses the default window; this only sets the size.
+	// Any type but Surfaceless: with it the OpenGL device makes no window
+	// surface and skips every present. GLContextEGLSwitch ignores the type
+	// and the handle and always uses the Switch's default window; the device
+	// reads the real size back from EGL.
 	WindowInfo wi;
-	wi.type = WindowInfo::Type::Surfaceless;
+	wi.type = WindowInfo::Type::Wayland;
 	wi.surface_width = 1280;
 	wi.surface_height = 720;
 	wi.surface_scale = 1.0f;
