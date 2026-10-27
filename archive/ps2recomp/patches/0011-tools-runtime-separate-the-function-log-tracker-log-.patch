@@ -1,0 +1,76 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 26 Oct 2026 05:10:00 +0700
+Subject: [PATCH 11/23] tools(runtime): separate the function log tracker; log
+ display and VRAM
+
+PS2X_ENABLE_AGRESSIVE_LOGS also enabled PS2_FUNCTION_LOG_TRACKER, which
+writes and flushes a line on every guest function entry and exit (194 MB
+in a minute, the game crawls). It is now PS2X_ENABLE_FUNCTION_LOG_TRACKER,
+off by default. Each run tick also logs both display circuits and how
+much of each MiB of GS memory is non-zero.
+
+Co-Authored-By: Lisvindanu <lisvindanu015@gmail.com>
+---
+ ps2xRuntime/CMakeLists.txt          |  8 ++++++++
+ ps2xRuntime/src/lib/ps2_runtime.cpp | 18 ++++++++++++++++++
+ 2 files changed, 26 insertions(+)
+
+diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
+index 589d768..314a5d3 100644
+--- a/ps2xRuntime/CMakeLists.txt
++++ b/ps2xRuntime/CMakeLists.txt
+@@ -12,6 +12,7 @@ option(PS2X_ENABLE_SCCACHE "Use sccache as compiler launcher when available" ON)
+ 
+ option(PS2X_ENABLE_RUNTIME_LOGS "Enable PS2 runtime logs" ON)
+ option(PS2X_ENABLE_AGRESSIVE_LOGS "Enable very verbose/agressive PS2 runtime logs" ON)
++option(PS2X_ENABLE_FUNCTION_LOG_TRACKER "Log every recompiled function's entry and exit to ps2_log.txt (very slow)" OFF)
+ option(PS2X_ENABLE_IOP_RPC_TRACE "Log unhandled IOP/SIF RPC trace suggestions" ON)
+ option(PS2X_STRICT_RETURN_DIAGNOSTICS "Route generated JR $ra returns through runtime branch diagnostics" OFF)
+ option(PS2X_SHOW_WINDOWS_CONSOLE "Show a console window for ps2EntryRunner on Windows release builds" ON)
+@@ -405,6 +406,13 @@ endif()
+ if(PS2X_ENABLE_AGRESSIVE_LOGS)
+     target_compile_definitions(ps2_runtime PUBLIC
+         AGRESSIVE_LOGS=1
++    )
++endif()
++
++# Separate from the verbose logs: it writes and flushes a line on every guest
++# function entry and exit, which dominates run time (hundreds of MB a minute).
++if(PS2X_ENABLE_FUNCTION_LOG_TRACKER)
++    target_compile_definitions(ps2_runtime PUBLIC
+         PS2_FUNCTION_LOG_TRACKER=1
+     )
+ endif()
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index e1721b4..fc4f50f 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -2453,6 +2453,24 @@ void PS2Runtime::run()
+                                                << " gsw=" << curGs
+                                                << " vif=" << curVif
+                                                << std::endl);
++                // un5-nx: both display circuits, to tell "nothing drawn" from "not shown".
++                RUNTIME_LOG("[run:display] pmode=0x" << std::hex << gs.pmode << " dispfb1=0x" << gs.dispfb1
++                                                     << " display1=0x" << gs.display1 << " dispfb2=0x" << gs.dispfb2
++                                                     << " display2=0x" << gs.display2 << " bgcolor=0x" << gs.bgcolor
++                                                     << std::dec << std::endl);
++                {   // un5-nx: is anything in GS memory at all? Non-zero bytes per 1 MiB block.
++                    const uint8_t *vram = m_memory.getGSVRAM();
++                    std::ostringstream line;
++                    line << "[run:vram]";
++                    for (uint32_t block = 0u; block < 4u; ++block)
++                    {
++                        uint32_t nonZero = 0u;
++                        for (uint32_t i = 0u; i < 0x100000u; i += 64u)
++                            nonZero += vram[block * 0x100000u + i] != 0u;
++                        line << " MiB" << block << "=" << nonZero;
++                    }
++                    RUNTIME_LOG(line.str() << std::endl);
++                }
+                 // un5-nx: what every EE thread is waiting on, to find stalls.
+                 for (const EeThreadSnapshot &t : eeSnapshot.threads)
+                 {
+-- 
+2.54.0 (Apple Git-157)
+

@@ -1,0 +1,99 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 26 Oct 2026 20:04:38 +0700
+Subject: [PATCH 15/23] fix(pad): pressure mode reports the DualShock 2 ID 0x79
+
+scePadRead always reported 0x73 for an analog pad, also after
+scePadEnterPressMode. A DualShock 2 in pressure mode reports 0x79 (nine
+halfwords: buttons, sticks, twelve pressures), and games check it:
+SLES-55605 restarts its pad setup while it sees 0x73 and so never reads
+a button.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ps2xRuntime/src/lib/Kernel/Stubs/Pad.cpp |  8 ++++-
+ ps2xTest/src/pad_input_tests.cpp         | 42 ++++++++++++++++++++++++
+ 2 files changed, 49 insertions(+), 1 deletion(-)
+
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/Pad.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/Pad.cpp
+index b50a4cf..53d3616 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/Pad.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/Pad.cpp
+@@ -7,6 +7,7 @@ namespace ps2_stubs
+     {
+         constexpr uint8_t kPadModeDigital = 0x41;
+         constexpr uint8_t kPadModeDualShock = 0x73;
++        constexpr uint8_t kPadModeDualShock2 = 0x79; // analog with 12 pressure bytes
+         constexpr uint8_t kPadAnalogCenter = 0x80;
+         constexpr int32_t kPadTypeDigital = 4;
+         constexpr int32_t kPadTypeDualShock = 7;
+@@ -245,7 +246,12 @@ namespace ps2_stubs
+         void fillPadStatus(uint8_t *data, const PadInputState &state, const PadPortState &portState)
+         {
+             std::memset(data, 0, 32);
+-            data[1] = portState.analogMode ? kPadModeDualShock : kPadModeDigital;
++            // After scePadEnterPressMode a DualShock 2 reports ID 0x79 (9 halfwords:
++            // buttons, sticks and pressures). SLES-55605 restarts its pad setup
++            // while it still sees 0x73, and never reads buttons.
++            data[1] = !portState.analogMode       ? kPadModeDigital
++                      : portState.pressureEnabled ? kPadModeDualShock2
++                                                  : kPadModeDualShock;
+             data[2] = static_cast<uint8_t>(state.buttons & 0xFFu);
+             data[3] = static_cast<uint8_t>((state.buttons >> 8) & 0xFFu);
+             data[4] = state.rx;
+diff --git a/ps2xTest/src/pad_input_tests.cpp b/ps2xTest/src/pad_input_tests.cpp
+index 07f9b7a..8312bd4 100644
+--- a/ps2xTest/src/pad_input_tests.cpp
++++ b/ps2xTest/src/pad_input_tests.cpp
+@@ -354,6 +354,48 @@ void register_pad_input_tests()
+             closePadPort(ctx, rdram);
+         });
+ 
++        tc.Run("pressure mode reports the DualShock 2 ID 0x79", [](TestCase &t)
++               {
++            std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0);
++            R5900Context ctx;
++            const uint8_t *data = rdram.data() + kPadDataAddr;
++
++            ps2_stubs::scePadInit(rdram.data(), &ctx, nullptr);
++            openPadPort(ctx, rdram);
++
++            auto settle = [&]()
++            {
++                setRegU32(ctx, 4, 0u);
++                setRegU32(ctx, 5, 0u);
++                ps2_stubs::scePadGetState(rdram.data(), &ctx, nullptr);
++            };
++
++            setRegU32(ctx, 4, 0u);
++            setRegU32(ctx, 5, 0u);
++            setRegU32(ctx, 6, 1);
++            setRegU32(ctx, 7, 3);
++            ps2_stubs::scePadSetMainMode(rdram.data(), &ctx, nullptr);
++            settle();
++
++            setRegU32(ctx, 4, 0u);
++            setRegU32(ctx, 5, 0u);
++            ps2_stubs::scePadEnterPressMode(rdram.data(), &ctx, nullptr);
++            settle();
++            runPadRead(ctx, rdram);
++            // SLES-55605 restarts its pad setup while the ID still reads 0x73
++            // after entering pressure mode, and never reads a button.
++            t.Equals(data[1], static_cast<uint8_t>(0x79), "pressure mode should report ID 0x79");
++
++            setRegU32(ctx, 4, 0u);
++            setRegU32(ctx, 5, 0u);
++            ps2_stubs::scePadExitPressMode(rdram.data(), &ctx, nullptr);
++            settle();
++            runPadRead(ctx, rdram);
++            t.Equals(data[1], static_cast<uint8_t>(0x73), "leaving pressure mode should report 0x73 again");
++
++            closePadPort(ctx, rdram);
++        });
++
+         tc.Run("pad setters return success", [](TestCase &t)
+                {
+             std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0);
+-- 
+2.54.0 (Apple Git-157)
+

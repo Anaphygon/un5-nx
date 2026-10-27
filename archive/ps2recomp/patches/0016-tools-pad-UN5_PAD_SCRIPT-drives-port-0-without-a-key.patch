@@ -1,0 +1,121 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 26 Oct 2026 20:04:38 +0700
+Subject: [PATCH 16/23] tools(pad): UN5_PAD_SCRIPT drives port 0 without a
+ keyboard
+
+UN5_PAD_SCRIPT="tick:button[+button]:frames,..." holds buttons on port 0
+from a VSync tick for a number of frames, e.g. "600:cross:8", so runs
+can be scripted and repeated without a window in focus.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ps2xRuntime/src/lib/Kernel/Stubs/Pad.cpp | 79 ++++++++++++++++++++++++
+ 1 file changed, 79 insertions(+)
+
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/Pad.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/Pad.cpp
+index 53d3616..6c42cf0 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/Pad.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/Pad.cpp
+@@ -1,5 +1,11 @@
+ #include "Common.h"
+ #include "Pad.h"
++#include "runtime/ee_scheduler.h"
++#include <iostream>
++#include <cstdlib>
++#include <vector>
++#include <string>
++#include <sstream>
+ 
+ namespace ps2_stubs
+ {
+@@ -272,6 +278,78 @@ namespace ps2_stubs
+             data[19] = pressureValue(state, portState, kPadBtnR2);
+         }
+ 
++        // un5-nx: UN5_PAD_SCRIPT="tick:button[+button]:frames,..." holds buttons on
++        // port 0 for a number of VSync ticks, so a run can be driven without
++        // a keyboard, e.g. "600:cross:10,900:start:10".
++        struct ScriptedPress
++        {
++            uint64_t tick = 0u;
++            uint64_t frames = 0u;
++            uint16_t mask = 0u;
++        };
++
++        uint16_t scriptButtonMask(const std::string &name)
++        {
++            static const std::pair<const char *, uint16_t> kNames[] = {
++                {"up", kPadBtnUp}, {"down", kPadBtnDown}, {"left", kPadBtnLeft}, {"right", kPadBtnRight},
++                {"cross", kPadBtnCross}, {"circle", kPadBtnCircle}, {"square", kPadBtnSquare},
++                {"triangle", kPadBtnTriangle}, {"start", kPadBtnStart}, {"select", kPadBtnSelect},
++                {"l1", kPadBtnL1}, {"r1", kPadBtnR1}, {"l2", kPadBtnL2}, {"r2", kPadBtnR2},
++                {"l3", kPadBtnL3}, {"r3", kPadBtnR3},
++            };
++            for (const auto &[key, mask] : kNames)
++            {
++                if (name == key)
++                    return mask;
++            }
++            std::cerr << "[pad:script] unknown button '" << name << "'" << std::endl;
++            return 0u;
++        }
++
++        const std::vector<ScriptedPress> &padScript()
++        {
++            static const std::vector<ScriptedPress> s_script = []
++            {
++                std::vector<ScriptedPress> script;
++                const char *env = std::getenv("UN5_PAD_SCRIPT");
++                if (!env)
++                    return script;
++                std::stringstream entries(env);
++                std::string entry;
++                while (std::getline(entries, entry, ','))
++                {
++                    std::stringstream fields(entry);
++                    std::string tick, buttons, frames;
++                    if (!std::getline(fields, tick, ':') || !std::getline(fields, buttons, ':'))
++                        continue;
++                    std::getline(fields, frames, ':');
++                    ScriptedPress press;
++                    press.tick = std::strtoull(tick.c_str(), nullptr, 10);
++                    press.frames = frames.empty() ? 6u : std::strtoull(frames.c_str(), nullptr, 10);
++                    std::stringstream names(buttons);
++                    std::string name;
++                    while (std::getline(names, name, '+'))
++                        press.mask = static_cast<uint16_t>(press.mask | scriptButtonMask(name));
++                    script.push_back(press);
++                }
++                return script;
++            }();
++            return s_script;
++        }
++
++        void applyPadScript(PadInputState &state, int port, PS2Runtime *runtime)
++        {
++            const std::vector<ScriptedPress> &script = padScript();
++            if (script.empty() || port != 0 || !runtime)
++                return;
++            const uint64_t tick = runtime->eeScheduler().currentVSyncTick();
++            for (const ScriptedPress &press : script)
++            {
++                if (tick >= press.tick && tick < press.tick + press.frames)
++                    setButton(state, press.mask, true);
++            }
++        }
++
+         bool readPadPortData(int port, int slot, PS2Runtime *runtime, uint8_t *outData, uint32_t dataAddr)
+         {
+             if (!outData)
+@@ -319,6 +397,7 @@ namespace ps2_stubs
+                     applyGamepadState(state);
+                     applyKeyboardState(state, portState.analogMode);
+                 }
++                applyPadScript(state, port, runtime);
+             }
+ 
+             fillPadStatus(outData, state, portState);
+-- 
+2.54.0 (Apple Git-157)
+

@@ -1,0 +1,116 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 26 Oct 2026 02:12:26 +0700
+Subject: [PATCH 02/23] fix(analyzer): only patch stores that write into the
+ code they jump to
+
+tryPatchSelfModifyingStore replaced "sw; j/jal" with a NOP whenever the
+store target was a code address. Storing a global and then calling is
+ordinary compiled code, and when one ELF section holds both code and data
+(SLES_556.05 does) every global is a code address: 32 real stores were
+removed, one of them a thread priority.
+
+A self-modifying store writes into the code about to run, so the store
+must now land inside the function the jump enters.
+
+Co-Authored-By: Lisvindanu <lisvindanu015@gmail.com>
+---
+ ps2xAnalyzer/include/ps2recomp/elf_analyzer.h |  6 +++++
+ ps2xAnalyzer/src/elf_analyzer.cpp             | 21 ++++++++++++++++
+ ps2xTest/src/elf_analyzer_tests.cpp           | 24 +++++++++++++++++++
+ 3 files changed, 51 insertions(+)
+
+diff --git a/ps2xAnalyzer/include/ps2recomp/elf_analyzer.h b/ps2xAnalyzer/include/ps2recomp/elf_analyzer.h
+index df29dfc..85258e4 100644
+--- a/ps2xAnalyzer/include/ps2recomp/elf_analyzer.h
++++ b/ps2xAnalyzer/include/ps2recomp/elf_analyzer.h
+@@ -51,6 +51,12 @@ namespace ps2recomp
+     public:
+         static int findEntryFunctionIndexForHeuristics(const std::vector<Function> &functions, uint32_t entryAddress);
+         static int findFallbackEntryFunctionIndexForHeuristics(const std::vector<Function> &functions);
++        // True when a store just before a jump writes into the function the
++        // jump enters: the self-modifying pattern, as opposed to "store a
++        // global, then call".
++        static bool storeTargetsJumpedFunctionForHeuristics(const std::vector<Function> &functions,
++                                                            uint32_t jumpTarget,
++                                                            uint32_t storeTarget);
+ 
+     public:
+         static bool hasHardwareIOSignalForHeuristics(const std::vector<Instruction> &instructions);
+diff --git a/ps2xAnalyzer/src/elf_analyzer.cpp b/ps2xAnalyzer/src/elf_analyzer.cpp
+index 5c57cdb..eefd4f8 100644
+--- a/ps2xAnalyzer/src/elf_analyzer.cpp
++++ b/ps2xAnalyzer/src/elf_analyzer.cpp
+@@ -571,6 +571,17 @@ namespace ps2recomp
+             return false;
+         }
+ 
++        // "Store a global, then call" is ordinary compiled code, and when one
++        // ELF section holds both code and data every global passes the
++        // isCodeAddress test above. Code that patches itself writes into the
++        // code it is about to run, so require the store to land inside the
++        // function the jump enters; otherwise a real data write is replaced
++        // with a NOP.
++        if (!storeTargetsJumpedFunctionForHeuristics(m_context.functions, jumpTarget, targetAddr))
++        {
++            return false;
++        }
++
+         std::cout << "Potential self-modifying code at " << formatAddress(storeInst.address)
+                   << " writing to " << formatAddress(targetAddr)
+                   << " then jumping to " << formatAddress(jumpTarget)
+@@ -581,6 +592,16 @@ namespace ps2recomp
+         return true;
+     }
+ 
++    bool ElfAnalyzer::storeTargetsJumpedFunctionForHeuristics(const std::vector<Function> &functions,
++                                                              uint32_t jumpTarget,
++                                                              uint32_t storeTarget)
++    {
++        const auto callee = std::find_if(functions.begin(), functions.end(),
++                                         [&](const Function &f)
++                                         { return jumpTarget >= f.start && jumpTarget < f.end; });
++        return callee != functions.end() && storeTarget >= callee->start && storeTarget < callee->end;
++    }
++
+     bool ElfAnalyzer::tryResolveBasePlusOffset(
+         const std::vector<Instruction> &instructions,
+         size_t index,
+diff --git a/ps2xTest/src/elf_analyzer_tests.cpp b/ps2xTest/src/elf_analyzer_tests.cpp
+index 8cba9b5..082e7e7 100644
+--- a/ps2xTest/src/elf_analyzer_tests.cpp
++++ b/ps2xTest/src/elf_analyzer_tests.cpp
+@@ -177,6 +177,30 @@ void register_elf_analyzer_tests()
+             (void)hasLargeComplexMMI;
+             (void)hasSelfModifying; });
+ 
++                       tc.Run("self-modifying store must write into the function it jumps to", [](TestCase &t)
++                              {
++            Function caller;
++            caller.name = "caller";
++            caller.start = 0x00100000;
++            caller.end = 0x00100100;
++            Function callee;
++            callee.name = "callee";
++            callee.start = 0x00200000;
++            callee.end = 0x00200100;
++            std::vector<Function> functions{caller, callee};
++
++            // Patching the code about to run: the store lands in the callee.
++            t.IsTrue(ElfAnalyzer::storeTargetsJumpedFunctionForHeuristics(functions, 0x00200000, 0x00200040),
++                     "store into the jumped-to function is self-modifying");
++            // "Store a global, then call": an ELF with one section holding code
++            // and data puts globals at code addresses, but not in the callee.
++            t.IsFalse(ElfAnalyzer::storeTargetsJumpedFunctionForHeuristics(functions, 0x00200000, 0x003F6188),
++                      "store to a global before a call is not self-modifying");
++            t.IsFalse(ElfAnalyzer::storeTargetsJumpedFunctionForHeuristics(functions, 0x00200000, 0x00100040),
++                      "store into another function is not this pattern");
++            t.IsFalse(ElfAnalyzer::storeTargetsJumpedFunctionForHeuristics(functions, 0x00300000, 0x00300000),
++                      "jump outside known functions is not patched"); });
++
+                        tc.Run("jump-table detection finds canonical sltiu/bne/lw/jr pattern", [](TestCase &t)
+                               {
+             // sltiu -> bne/beq bounds check -> ... -> lui/addiu base -> lw -> jr loadedReg
+-- 
+2.54.0 (Apple Git-157)
+

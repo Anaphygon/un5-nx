@@ -64,7 +64,7 @@ erasing the draw buffer while copying it.
 | Movie stops on the CRIWARE logo | The game's `malloc` took the whole guest heap, so the runtime could not allocate libmpeg callback data and dropped every audio packet; the player waits for audio before it shows video | Patch `0017`: the game's allocations leave a reserve |
 | Movie stops after its first frames | After a DMA chain stopped on an END tag, `MADR` was left stale; the game's DMAC handler finds that END tag at `MADR - 0x10` to run its callback, so it took its error path and the player's frames were never released | Patch `0018` |
 | The game crawls | `PS2X_ENABLE_AGRESSIVE_LOGS` also flushed a log line per guest call (194 MB a minute) | Patch `0011`: separate, off by default |
-| Precompiled header errors on rebuild | The generated headers are in the runner's PCH and ninja does not rebuild it | `tools/build_mac.sh` drops the PCH when they change |
+| Precompiled header errors on rebuild | The generated headers are in the runner's PCH and ninja does not rebuild it | `archive/ps2recomp/tools/build_mac.sh` drops the PCH when they change |
 
 Seeds come from: the constructor table, data words that point at a function
 start (a stack prologue, or right after a `jr $ra`/`j` and padding), slots
@@ -74,8 +74,8 @@ function address in code, and `J`/`JAL` targets outside their own function.
 ## Changes to PS2Recomp
 
 Kept as a commit series on branch `un5-nx` of `third_party/PS2Recomp`,
-exported with `git format-patch` to `patches/ps2recomp/` and applied by
-`tools/setup_ps2recomp.sh`. Each fix has a test; the full suite (451 runtime
+exported with `git format-patch` to `archive/ps2recomp/patches/` and applied by
+`archive/ps2recomp/tools/setup_ps2recomp.sh`. Each fix has a test; the full suite (451 runtime
 tests, now 461, plus the IOP suites) passes, and the new tests fail without their fix.
 
 | Patch | What |
@@ -104,7 +104,7 @@ tests, now 461, plus the IOP suites) passes, and the new tests fail without thei
 | `0023` tools | `UN5_PAD_SCRIPT` reports how many presses it parsed |
 | `0016` tools | `UN5_PAD_SCRIPT="tick:button[+button]:frames,..."` presses buttons on port 0 for scripted runs |
 
-With the analyzer and runtime fixed, `tools/fixmap.py` no longer filters
+With the analyzer and runtime fixed, `archive/ps2recomp/tools/fixmap.py` no longer filters
 the analyzer's patches or binds `sceCdLayerSearchFile` itself; the
 recompiled output is identical apart from that call now using its own name.
 

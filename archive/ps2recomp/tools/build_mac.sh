@@ -5,12 +5,12 @@
 #      the build stays incremental),
 #   2. configure and build ps2EntryRunner.
 #
-#   tools/build_mac.sh            -> build/mac/ps2xRuntime/ps2EntryRunner
+#   archive/ps2recomp/tools/build_mac.sh            -> build/mac/ps2xRuntime/ps2EntryRunner
 #
 # JOBS defaults to half the cores: a full build of ~8,800 generated files
 # at full speed overheats the Mac.
 set -eu
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/../../.."
 ROOT=$(pwd)
 REC=$ROOT/third_party/PS2Recomp
 GEN=$ROOT/build/recomp/output
@@ -21,7 +21,7 @@ JOBS=${JOBS:-$(( $(sysctl -n hw.ncpu) / 2 ))}
 [ -d "$GEN" ] || { echo "no $GEN; run ps2_recomp first" >&2; exit 1; }
 
 [ "$(git -C "$REC" rev-parse --abbrev-ref HEAD)" = un5-nx ] ||
-    { echo "PS2Recomp is not on branch un5-nx; run tools/setup_ps2recomp.sh" >&2; exit 1; }
+    { echo "PS2Recomp is not on branch un5-nx; run archive/ps2recomp/tools/setup_ps2recomp.sh" >&2; exit 1; }
 
 mkdir -p "$RUNNER"
 changed=0

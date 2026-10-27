@@ -1,0 +1,77 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 26 Oct 2026 18:39:36 +0700
+Subject: [PATCH 14/23] fix(gs): TEST.ZTE = 0 turns the Z buffer off
+
+The CPU backend ignored ZTE: it tested depth by ZTST and wrote depth
+unless ZMSK was set. With ZTE = 0 the GS neither tests nor writes depth,
+and PCSX2's software renderer masks depth writes the same way.
+
+SLES-55605 presents each frame by copying its draw buffer (fbp 0) to the
+display buffer with ZBUF at zbp 0, ZMSK = 0 and ZTE = 0. Writing depth
+there erased the draw buffer while it was being copied, so only two
+strips of the language menu survived.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp |  8 ++++++--
+ ps2xTest/src/ps2_gs_tests.cpp             | 17 +++++++++++++++++
+ 2 files changed, 23 insertions(+), 2 deletions(-)
+
+diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+index f0ad507..6bda889 100644
+--- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+@@ -877,7 +877,11 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
+         return;
+     }
+ 
+-    const uint32_t ztestMethod = static_cast<uint32_t>((ctx.test >> 17) & 3u);
++    // TEST.ZTE = 0 turns the Z buffer off: no depth test and no depth write,
++    // whatever ZTST and ZBUF.ZMSK say (as PCSX2's software renderer does).
++    // Games point ZBUF at their draw buffer for 2D copies with ZTE = 0.
++    const bool depthEnabled = ((ctx.test >> 16) & 1u) != 0u;
++    const uint32_t ztestMethod = depthEnabled ? static_cast<uint32_t>((ctx.test >> 17) & 3u) : 1u;
+     const bool alphaBlendEnabled = state.prim.abe;
+     const bool preserveDestinationAlpha = writeMask.writeRgb && !writeMask.writeAlpha && fpsm == GS_PSM_CT32;
+     const bool destinationAlphaTestNeedsRead = ((ctx.test >> 14) & 0x1u) != 0u && (fpsm == GS_PSM_CT32 || fpsm == GS_PSM_CT16 || fpsm == GS_PSM_CT16S);
+@@ -1006,7 +1010,7 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
+         WriteVramUnlocked(fpsm, fbp, fbw, x, y, pixel);
+     }
+ 
+-    if (writeMask.writeDepth && !ctx.zbuf.zmask)
++    if (writeMask.writeDepth && depthEnabled && !ctx.zbuf.zmask)
+     {
+         WriteVramUnlocked(zpsm, zbp, fbw, x, y, z);
+     }
+diff --git a/ps2xTest/src/ps2_gs_tests.cpp b/ps2xTest/src/ps2_gs_tests.cpp
+index 113cc88..10777dd 100644
+--- a/ps2xTest/src/ps2_gs_tests.cpp
++++ b/ps2xTest/src/ps2_gs_tests.cpp
+@@ -3796,6 +3796,23 @@ void register_ps2_gs_tests()
+                      "ZMSK should preserve depth");
+         });
+ 
++        tc.Run("GS ZTE=0 neither tests nor writes depth", [](TestCase &t)
++        {
++            // ZTE off with ZTST = GREATER and a stored depth the pixel would fail:
++            // the Z buffer is off, so the pixel is drawn and depth is untouched.
++            // SLES-55605 copies its draw buffer with ZBUF pointing at that buffer
++            // and ZTE = 0; writing depth there erased the frame it was copying.
++            constexpr uint64_t kTest = (3ull << 17);   // ZTE = 0, ZTST = GREATER
++            const GsPixelTestResult result =
++                drawGsPixelForTests(GS_PSM_CT32, kTest, false,
++                                    0x00030201u, 0xFFFFFFFFu, 0x80u);
++
++            t.Equals(result.framebuffer, 0x80563412u,
++                     "with ZTE=0 the depth test should not reject the pixel");
++            t.Equals(result.depth, 0xFFFFFFFFu,
++                     "with ZTE=0 depth should not be written");
++        });
++
+         tc.Run("GS DATE and DATM inspect the framebuffer-format alpha bit", [](TestCase &t)
+         {
+             constexpr uint32_t kInitialDepth = 0x11111111u;
+-- 
+2.54.0 (Apple Git-157)
+

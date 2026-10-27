@@ -1,0 +1,107 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 26 Oct 2026 02:12:26 +0700
+Subject: [PATCH 01/23] fix(runtime): EE thread priority 0 and
+ ChangeThreadPriority's return value
+
+The EE kernel takes thread priorities 0-127 and runs the main thread at
+0; 1-126 is the IOP's range. CreateThread and ChangeThreadPriority
+rejected 0 with KE_ILLEGAL_PRIORITY.
+
+ChangeThreadPriority returned KE_OK, but the EE kernel returns the
+priority before the change, and games save it to restore after a raised
+section. Naruto Shippuden: Ultimate Ninja 5 did that and left its main
+thread at priority 0 and its logic thread unstarted.
+
+Co-Authored-By: Lisvindanu <lisvindanu015@gmail.com>
+---
+ ps2xRuntime/src/lib/Kernel/EeScheduler.cpp    |  6 ++--
+ .../src/lib/Kernel/Syscalls/Thread.cpp        |  4 ++-
+ ps2xTest/src/ps2_runtime_kernel_tests.cpp     | 32 +++++++++++++++++++
+ 3 files changed, 39 insertions(+), 3 deletions(-)
+
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+index c5e31c4..7479f39 100644
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -423,7 +423,9 @@ void EeScheduler::setupCurrentThread(uint32_t stack, uint32_t stackSize, uint32_
+ int EeScheduler::createThread(const EeThreadCreateParams &params)
+ {
+     assertExecutor();
+-    if (params.priority < 1 || params.priority >= kPriorityCount)
++    // The EE kernel takes priorities 0-127, 0 being the highest (the main
++    // thread runs at 0 too); 1-126 is the IOP's range, not the EE's.
++    if (params.priority < 0 || params.priority >= kPriorityCount)
+     {
+         return KE_ILLEGAL_PRIORITY;
+     }
+@@ -701,7 +703,7 @@ int EeScheduler::cancelWakeup(int id)
+ int EeScheduler::changePriority(int id, int priority, bool interruptSafe, int &oldPriority)
+ {
+     assertExecutor();
+-    if (priority < 1 || priority >= kPriorityCount)
++    if (priority < 0 || priority >= kPriorityCount)
+     {
+         return KE_ILLEGAL_PRIORITY;
+     }
+diff --git a/ps2xRuntime/src/lib/Kernel/Syscalls/Thread.cpp b/ps2xRuntime/src/lib/Kernel/Syscalls/Thread.cpp
+index 5110ee2..d099e05 100644
+--- a/ps2xRuntime/src/lib/Kernel/Syscalls/Thread.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Syscalls/Thread.cpp
+@@ -112,7 +112,9 @@ namespace ps2_syscalls
+             const int priority = static_cast<int>(getRegU32(ctx, 5));
+             int oldPriority = 0;
+             const int result = ee.changePriority(id, priority, interruptSafe, oldPriority);
+-            setReturnS32(ctx, result);
++            // The EE kernel returns the priority before the change on success;
++            // games save it to restore later (a "raise, work, restore" section).
++            setReturnS32(ctx, result == KE_OK ? oldPriority : result);
+             ee.transferIfRequested(interruptSafe);
+         }
+ 
+diff --git a/ps2xTest/src/ps2_runtime_kernel_tests.cpp b/ps2xTest/src/ps2_runtime_kernel_tests.cpp
+index 63b12d9..41815d4 100644
+--- a/ps2xTest/src/ps2_runtime_kernel_tests.cpp
++++ b/ps2xTest/src/ps2_runtime_kernel_tests.cpp
+@@ -572,6 +572,38 @@ void register_ps2_runtime_kernel_tests()
+                      "SET_GPR_U32 must preserve the upper 64 bits of the 128-bit GPR");
+         });
+ 
++        tc.Run("EE thread priority 0 is valid and ChangeThreadPriority returns the old priority", [](TestCase &t)
++        {
++            TestEnv env;
++            EeThreadCreateAbi threadParam{};
++            threadParam.func = K_SCHED_HIGH;
++            threadParam.stack = 0x00018000u;
++            threadParam.stack_size = 0x1000;
++            threadParam.initial_priority = 0;   // the EE takes 0-127; 1-126 is the IOP's range
++            std::memcpy(env.rdram.data() + K_PARAM_ADDR, &threadParam, sizeof(threadParam));
++
++            setRegU32(env.ctx, 4, K_PARAM_ADDR);
++            CreateThread(env.rdram.data(), &env.ctx, &env.runtime);
++            const int threadId = getRegS32(env.ctx, 2);
++            t.IsTrue(threadId >= 2, "CreateThread must accept priority 0 on the EE");
++
++            // Games save the returned value to restore it after a raised section.
++            setRegU32(env.ctx, 4, static_cast<uint32_t>(threadId));
++            setRegU32(env.ctx, 5, 50u);
++            ChangeThreadPriority(env.rdram.data(), &env.ctx, &env.runtime);
++            t.Equals(getRegS32(env.ctx, 2), 0, "ChangeThreadPriority must return the priority before the change");
++
++            setRegU32(env.ctx, 4, static_cast<uint32_t>(threadId));
++            setRegU32(env.ctx, 5, 60u);
++            ChangeThreadPriority(env.rdram.data(), &env.ctx, &env.runtime);
++            t.Equals(getRegS32(env.ctx, 2), 50, "the second change must return the first change's priority");
++
++            setRegU32(env.ctx, 4, static_cast<uint32_t>(threadId));
++            setRegU32(env.ctx, 5, 128u);
++            ChangeThreadPriority(env.rdram.data(), &env.ctx, &env.runtime);
++            t.IsTrue(getRegS32(env.ctx, 2) < 0, "priority 128 is out of range and must fail");
++        });
++
+         tc.Run("CreateThread and CreateSema decode the exact PS2SDK EE layouts", [](TestCase &t)
+         {
+             TestEnv env;
+-- 
+2.54.0 (Apple Git-157)
+

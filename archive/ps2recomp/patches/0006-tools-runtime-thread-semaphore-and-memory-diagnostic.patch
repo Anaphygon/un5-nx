@@ -1,0 +1,99 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 26 Oct 2026 02:12:26 +0700
+Subject: [PATCH 06/23] tools(runtime): thread, semaphore and memory
+ diagnostics
+
+Each run tick also logs every EE thread's status, wait reason and PC, the
+semaphores with waiters, and the guest words named in
+UN5_WATCH=0xADDR,...; refused CreateThread calls are logged.
+
+Co-Authored-By: Lisvindanu <lisvindanu015@gmail.com>
+---
+ .../src/lib/Kernel/Syscalls/Thread.cpp        | 12 +++++-
+ ps2xRuntime/src/lib/ps2_runtime.cpp           | 39 +++++++++++++++++++
+ 2 files changed, 50 insertions(+), 1 deletion(-)
+
+diff --git a/ps2xRuntime/src/lib/Kernel/Syscalls/Thread.cpp b/ps2xRuntime/src/lib/Kernel/Syscalls/Thread.cpp
+index d099e05..bfb95ed 100644
+--- a/ps2xRuntime/src/lib/Kernel/Syscalls/Thread.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Syscalls/Thread.cpp
+@@ -232,7 +232,16 @@ namespace ps2_syscalls
+             param->initial_priority,
+             param->option,
+         };
+-        setReturnS32(ctx, scheduler(rdram, ctx, runtime).createThread(decoded));
++        const int created = scheduler(rdram, ctx, runtime).createThread(decoded);
++        if (created < 0)
++        {
++            // un5-nx: a refused thread leaves the game waiting on it forever.
++            std::cerr << "[CreateThread:refused] result=" << created
++                      << " priority=" << param->initial_priority << std::hex
++                      << " func=0x" << param->func << " attr=0x" << param->attr
++                      << " caller=0x" << getRegU32(ctx, 31) << std::dec << std::endl;
++        }
++        setReturnS32(ctx, created);
+     }
+ 
+     void DeleteThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+@@ -254,6 +263,7 @@ namespace ps2_syscalls
+ 
+     void StartThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
++
+         EeScheduler &ee = scheduler(rdram, ctx, runtime);
+         const int id = static_cast<int>(getRegU32(ctx, 4));
+         const uint32_t arg = getRegU32(ctx, 5);
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 288379c..949aefd 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -2438,6 +2438,45 @@ void PS2Runtime::run()
+                                                << " gsw=" << curGs
+                                                << " vif=" << curVif
+                                                << std::endl);
++                // un5-nx: what every EE thread is waiting on, to find stalls.
++                for (const EeThreadSnapshot &t : eeSnapshot.threads)
++                {
++                    RUNTIME_LOG("[run:thread] id=" << t.id
++                                                   << " status=" << static_cast<int>(t.status)
++                                                   << " wait=" << static_cast<int>(t.waitReason)
++                                                   << " waitId=" << t.waitId
++                                                   << " prio=" << t.currentPriority
++                                                   << std::hex << " pc=0x" << t.pc << " ra=0x" << t.ra
++                                                   << " entry=0x" << t.entry << std::dec << std::endl);
++                }
++                // un5-nx: UN5_WATCH=0xADDR,0xADDR,... prints guest words each tick.
++                if (const char *watch = std::getenv("UN5_WATCH"))
++                {
++                    std::ostringstream line;
++                    line << "[run:watch]" << std::hex;
++                    for (const char *p = watch; *p;)
++                    {
++                        char *end = nullptr;
++                        const uint32_t addr = static_cast<uint32_t>(std::strtoul(p, &end, 16));
++                        if (end == p)
++                        {
++                            break;
++                        }
++                        uint32_t value = 0u;
++                        std::memcpy(&value, m_memory.getRDRAM() + (addr & 0x01FFFFFCu), sizeof value);
++                        line << " " << addr << "=" << value;
++                        p = (*end == ',') ? end + 1 : end;
++                    }
++                    RUNTIME_LOG(line.str() << std::endl);
++                }
++                for (const EeSemaphoreSnapshot &s : eeSnapshot.semaphores)
++                {
++                    if (s.waiters != 0u)
++                    {
++                        RUNTIME_LOG("[run:sema] id=" << s.id << " count=" << s.count << "/" << s.maxCount
++                                                     << " waiters=" << s.waiters << std::endl);
++                    }
++                }
+ 
+             }
+         });
+-- 
+2.54.0 (Apple Git-157)
+

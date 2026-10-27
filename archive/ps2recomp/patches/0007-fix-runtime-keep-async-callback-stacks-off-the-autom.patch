@@ -1,0 +1,122 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 26 Oct 2026 03:14:25 +0700
+Subject: [PATCH 07/23] fix(runtime): keep async callback stacks off the
+ automatic main stack
+
+SetupThread with stack -1 puts the main stack's sp below a reserved area
+at the top of RAM, sized like the stack itself. Async callback stacks
+(interrupt handlers, RPC end functions, 16 KB each) are carved downward
+from the top of RAM, so from the third one on they landed on the main
+stack and overwrote its saved return addresses: in SLES-55605 the main
+thread resumed from SleepThread, loaded ra = 0 and ended, and nothing
+drove the game's loader any more.
+
+Callback stacks now start below the automatic main stack.
+
+Co-Authored-By: Lisvindanu <lisvindanu015@gmail.com>
+---
+ ps2xRuntime/include/ps2_runtime.h             |  3 ++
+ .../src/lib/Kernel/Syscalls/System.cpp        |  9 ++++++
+ ps2xRuntime/src/lib/ps2_runtime.cpp           | 10 +++++++
+ ps2xTest/src/ps2_runtime_kernel_tests.cpp     | 29 +++++++++++++++++++
+ 4 files changed, 51 insertions(+)
+
+diff --git a/ps2xRuntime/include/ps2_runtime.h b/ps2xRuntime/include/ps2_runtime.h
+index 4b9242c..4c2053e 100644
+--- a/ps2xRuntime/include/ps2_runtime.h
++++ b/ps2xRuntime/include/ps2_runtime.h
+@@ -384,6 +384,9 @@ public:
+     uint32_t guestHeapEnd() const;
+     uint32_t guestHeapLimit() const;
+     uint32_t reserveAsyncCallbackStack(uint32_t size, uint32_t alignment = 16u);
++    // Keeps async callback stacks below [stackBase, ...): SetupThread's
++    // automatic main stack, which they would otherwise grow into.
++    void excludeMainStackFromCallbackStacks(uint32_t stackBase);
+ 
+     void drainCompletedDmacHandlers(uint8_t *rdram);
+ 
+diff --git a/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp b/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
+index 9614016..2948dcc 100644
+--- a/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
+@@ -524,6 +524,15 @@ namespace ps2_syscalls
+         if (stack == 0xFFFFFFFFu)
+         {
+             initialStack = sp;
++            // The automatic stack grows down from sp. Async callback stacks
++            // (interrupt handlers, RPC end functions) are carved downward from
++            // the top of RAM and, past the area reserved above sp, would land
++            // on this stack and overwrite the main thread's saved registers.
++            // Callback stacks therefore start below the main stack.
++            if (runtime)
++            {
++                runtime->excludeMainStackFromCallbackStacks(sp > stackSize ? sp - stackSize : 0u);
++            }
+         }
+         else if (stack != 0u)
+         {
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 949aefd..9f8c199 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -1996,6 +1996,16 @@ uint32_t PS2Runtime::guestHeapLimit() const
+     return m_guestHeapConfigured ? m_guestHeapLimit : m_guestHeapSuggestedBase;
+ }
+ 
++void PS2Runtime::excludeMainStackFromCallbackStacks(uint32_t stackBase)
++{
++    std::lock_guard<std::mutex> lock(m_asyncCallbackStackMutex);
++    const uint32_t base = stackBase & ~(kGuestHeapDefaultAlignment - 1u);
++    if (base < m_asyncCallbackStackTop)
++    {
++        m_asyncCallbackStackTop = base;
++    }
++}
++
+ uint32_t PS2Runtime::reserveAsyncCallbackStack(uint32_t size, uint32_t alignment)
+ {
+     if (size == 0u)
+diff --git a/ps2xTest/src/ps2_runtime_kernel_tests.cpp b/ps2xTest/src/ps2_runtime_kernel_tests.cpp
+index 41815d4..582f8c4 100644
+--- a/ps2xTest/src/ps2_runtime_kernel_tests.cpp
++++ b/ps2xTest/src/ps2_runtime_kernel_tests.cpp
+@@ -1111,6 +1111,35 @@ void register_ps2_runtime_kernel_tests()
+             t.Equals(setupSp & 0xFu, 0u, "SetupThread should always return a 16-byte aligned stack pointer");
+         });
+ 
++        tc.Run("async callback stacks never overlap SetupThread's automatic main stack", [](TestCase &t)
++        {
++            TestEnv env;
++            constexpr uint32_t kMainStackSize = 0x00008000u;   // what SLES-55605 asks for
++
++            env.ctx.pc = 0x00100000u;
++            setRegU32(env.ctx, 29, PS2_RAM_SIZE - 0x10u);
++            setRegU32(env.ctx, 4, 0x00617EF0u);
++            setRegU32(env.ctx, 5, 0xFFFFFFFFu);
++            setRegU32(env.ctx, 6, kMainStackSize);
++            t.IsTrue(callSyscall(0x3Cu, env.rdram.data(), &env.ctx, &env.runtime),
++                     "SetupThread syscall should dispatch");
++            const uint32_t sp = ::getRegU32(&env.ctx, 2);
++            const uint32_t stackBottom = sp - kMainStackSize;
++
++            // Interrupt handlers and RPC end functions each get a 16 KB stack.
++            // The main stack's reserved area holds only two; the rest must go
++            // below it rather than into [stackBottom, sp), where they would
++            // overwrite the main thread's saved return addresses.
++            for (int i = 0; i < 8; ++i)
++            {
++                const uint32_t top = env.runtime.reserveAsyncCallbackStack(0x4000u, 16u);
++                t.IsTrue(top != 0u, "callback stack reservation should succeed");
++                const uint32_t bottom = top + 0x10u - 0x4000u;
++                t.IsTrue(top + 0x10u <= stackBottom || bottom >= sp,
++                         "a callback stack must not overlap the automatic main stack");
++            }
++        });
++
+         tc.Run("SetupThread exposes stable main stack metadata through ReferThreadStatus", [](TestCase &t)
+         {
+             TestEnv env;
+-- 
+2.54.0 (Apple Git-157)
+

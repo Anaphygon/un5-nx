@@ -1,0 +1,254 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 26 Oct 2026 21:06:07 +0700
+Subject: [PATCH 17/23] fix(runtime): the game's malloc leaves a reserve for
+ HLE allocations
+
+The game's malloc/calloc/realloc (and the newlib _r forms) shared the
+guest heap with the runtime's own allocations. SLES-55605 asks malloc
+for ever smaller blocks until one fits, taking the whole heap for its
+allocator; after that every guestMalloc failed, so libmpeg stream
+callbacks were silently dropped, the movie player never got its audio
+and stopped on the CRIWARE logo.
+
+Allocations made for the game now leave 1 MiB (or a sixteenth of a
+small heap) free; runtime-internal allocations may still use it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ps2xRuntime/include/ps2_runtime.h             |  8 +++
+ .../src/lib/Kernel/Stubs/Compatibility.cpp    |  8 +--
+ ps2xRuntime/src/lib/Kernel/Stubs/LibC.cpp     |  8 +--
+ ps2xRuntime/src/lib/ps2_runtime.cpp           | 69 +++++++++++++++++++
+ ps2xTest/src/ps2_runtime_kernel_tests.cpp     | 23 +++++++
+ 5 files changed, 108 insertions(+), 8 deletions(-)
+
+diff --git a/ps2xRuntime/include/ps2_runtime.h b/ps2xRuntime/include/ps2_runtime.h
+index 3dde3a3..e621e2b 100644
+--- a/ps2xRuntime/include/ps2_runtime.h
++++ b/ps2xRuntime/include/ps2_runtime.h
+@@ -385,6 +385,13 @@ public:
+     uint32_t guestCalloc(uint32_t count, uint32_t size, uint32_t alignment = 16u);
+     uint32_t guestRealloc(uint32_t guestAddr, uint32_t newSize, uint32_t alignment = 16u);
+     void guestFree(uint32_t guestAddr);
++    // The game's own malloc/calloc/realloc go through these. They leave a
++    // reserve free for the runtime's HLE allocations (MPEG callback data,
++    // thread stacks...), which games that probe for the largest block they
++    // can get would otherwise take.
++    uint32_t guestMallocForGame(uint32_t size, uint32_t alignment = 16u);
++    uint32_t guestCallocForGame(uint32_t count, uint32_t size, uint32_t alignment = 16u);
++    uint32_t guestReallocForGame(uint32_t guestAddr, uint32_t newSize, uint32_t alignment = 16u);
+     uint32_t guestHeapBase() const;
+     uint32_t guestHeapEnd() const;
+     uint32_t guestHeapLimit() const;
+@@ -483,6 +490,7 @@ private:
+     uint32_t allocateGuestBlockLocked(uint32_t size, uint32_t alignment);
+     void freeGuestBlockLocked(uint32_t guestAddr);
+     void coalesceGuestHeapLocked();
++    bool leavesRuntimeReserveLocked(uint64_t extraBytes) const;
+     void HandleIntegerOverflow(R5900Context *ctx);
+ 
+     [[nodiscard]] ps2x::iop::RpcAbi selectIopRpcAbi(const ps2x::iop::RpcAbiRequest &request) const;
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/Compatibility.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/Compatibility.cpp
+index 9f8f59f..12954d2 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/Compatibility.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/Compatibility.cpp
+@@ -8,7 +8,7 @@ namespace ps2_stubs
+     {
+         const uint32_t count = getRegU32(ctx, 5); // $a1
+         const uint32_t size = getRegU32(ctx, 6);  // $a2
+-        const uint32_t guestAddr = runtime ? runtime->guestCalloc(count, size) : 0u;
++        const uint32_t guestAddr = runtime ? runtime->guestCallocForGame(count, size) : 0u;
+         setReturnU32(ctx, guestAddr);
+     }
+ 
+@@ -43,7 +43,7 @@ namespace ps2_stubs
+     {
+         const uint32_t oldGuestAddr = getRegU32(ctx, 5); // $a1
+         const uint32_t newSize = getRegU32(ctx, 6);      // $a2
+-        const uint32_t guestAddr = runtime ? runtime->guestRealloc(oldGuestAddr, newSize) : 0u;
++        const uint32_t guestAddr = runtime ? runtime->guestReallocForGame(oldGuestAddr, newSize) : 0u;
+         setReturnU32(ctx, guestAddr);
+     }
+ 
+@@ -51,14 +51,14 @@ namespace ps2_stubs
+     {
+         const uint32_t alignment = getRegU32(ctx, 5); // $a1
+         const uint32_t size = getRegU32(ctx, 6);      // $a2
+-        const uint32_t guestAddr = runtime ? runtime->guestMalloc(size, alignment) : 0u;
++        const uint32_t guestAddr = runtime ? runtime->guestMallocForGame(size, alignment) : 0u;
+         setReturnU32(ctx, guestAddr);
+     }
+ 
+     void malloc_r(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
+         const uint32_t size = getRegU32(ctx, 5); // $a1
+-        const uint32_t guestAddr = runtime ? runtime->guestMalloc(size) : 0u;
++        const uint32_t guestAddr = runtime ? runtime->guestMallocForGame(size) : 0u;
+         setReturnU32(ctx, guestAddr);
+     }
+ 
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/LibC.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/LibC.cpp
+index d467c4b..2548f60 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/LibC.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/LibC.cpp
+@@ -50,7 +50,7 @@ namespace ps2_stubs
+     void malloc(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
+         const uint32_t size = getRegU32(ctx, 4); // $a0
+-        const uint32_t guestAddr = runtime ? runtime->guestMalloc(size) : 0u;
++        const uint32_t guestAddr = runtime ? runtime->guestMallocForGame(size) : 0u;
+         setReturnU32(ctx, guestAddr);
+     }
+ 
+@@ -58,7 +58,7 @@ namespace ps2_stubs
+     {
+         const uint32_t alignment = getRegU32(ctx, 4); // $a0
+         const uint32_t size = getRegU32(ctx, 5);      // $a1
+-        const uint32_t guestAddr = runtime ? runtime->guestMalloc(size, alignment) : 0u;
++        const uint32_t guestAddr = runtime ? runtime->guestMallocForGame(size, alignment) : 0u;
+         setReturnU32(ctx, guestAddr);
+     }
+ 
+@@ -75,7 +75,7 @@ namespace ps2_stubs
+     {
+         const uint32_t count = getRegU32(ctx, 4); // $a0
+         const uint32_t size = getRegU32(ctx, 5);  // $a1
+-        const uint32_t guestAddr = runtime ? runtime->guestCalloc(count, size) : 0u;
++        const uint32_t guestAddr = runtime ? runtime->guestCallocForGame(count, size) : 0u;
+         setReturnU32(ctx, guestAddr);
+     }
+ 
+@@ -83,7 +83,7 @@ namespace ps2_stubs
+     {
+         const uint32_t oldGuestAddr = getRegU32(ctx, 4); // $a0
+         const uint32_t newSize = getRegU32(ctx, 5);      // $a1
+-        const uint32_t newGuestAddr = runtime ? runtime->guestRealloc(oldGuestAddr, newSize) : 0u;
++        const uint32_t newGuestAddr = runtime ? runtime->guestReallocForGame(oldGuestAddr, newSize) : 0u;
+         setReturnU32(ctx, newGuestAddr);
+     }
+ 
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index fc4f50f..7a5c2b9 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -91,6 +91,9 @@ namespace
+     constexpr uint32_t kGuestHeapDefaultAlignment = 16u;
+     constexpr uint32_t kGuestHeapSafetyPad = 0x1000u;
+     constexpr uint32_t kGuestHeapHardLimit = 0x01F00000u;
++    // Heap kept free of the game's own allocations for the runtime's HLE code
++    // (at most; see leavesRuntimeReserveLocked).
++    constexpr uint64_t kGuestHeapRuntimeReserve = 0x00100000u;
+ 
+     constexpr uint32_t COP0_CAUSE_EXCCODE_MASK = 0x0000007Cu;
+     constexpr uint32_t COP0_CAUSE_BD = 0x80000000u;
+@@ -1849,6 +1852,72 @@ uint32_t PS2Runtime::guestMalloc(uint32_t size, uint32_t alignment)
+     return allocateGuestBlockLocked(size, alignment);
+ }
+ 
++bool PS2Runtime::leavesRuntimeReserveLocked(uint64_t extraBytes) const
++{
++    uint64_t freeBytes = 0u;
++    for (const GuestHeapBlock &block : m_guestHeapBlocks)
++    {
++        if (block.free)
++            freeBytes += block.size;
++    }
++    // A sixteenth of a small heap, so tiny heaps stay usable by the game.
++    const uint64_t heapSize = m_guestHeapLimit > m_guestHeapBase ? m_guestHeapLimit - m_guestHeapBase : 0u;
++    const uint64_t reserve = std::min<uint64_t>(kGuestHeapRuntimeReserve, heapSize / 16u);
++    return freeBytes >= extraBytes + reserve;
++}
++
++uint32_t PS2Runtime::guestMallocForGame(uint32_t size, uint32_t alignment)
++{
++    std::lock_guard<std::mutex> lock(m_guestHeapMutex);
++    ensureGuestHeapInitializedLocked();
++    if (!leavesRuntimeReserveLocked(alignGuestHeapValue(size, kGuestHeapDefaultAlignment)))
++    {
++        return 0u;
++    }
++    return allocateGuestBlockLocked(size, alignment);
++}
++
++uint32_t PS2Runtime::guestCallocForGame(uint32_t count, uint32_t size, uint32_t alignment)
++{
++    if (count == 0u || size == 0u || count > (std::numeric_limits<uint32_t>::max() / size))
++    {
++        return 0u;
++    }
++    const uint32_t totalSize = count * size;
++    const uint32_t guestAddr = guestMallocForGame(totalSize, alignment);
++    uint8_t *rdram = m_memory.getRDRAM();
++    if (guestAddr != 0u && rdram)
++    {
++        const uint32_t physAddr = guestAddr & PS2_RAM_MASK;
++        if (physAddr + totalSize <= PS2_RAM_SIZE)
++            std::memset(rdram + physAddr, 0, totalSize);
++    }
++    return guestAddr;
++}
++
++uint32_t PS2Runtime::guestReallocForGame(uint32_t guestAddr, uint32_t newSize, uint32_t alignment)
++{
++    if (guestAddr == 0u)
++    {
++        return guestMallocForGame(newSize, alignment);
++    }
++    {
++        std::lock_guard<std::mutex> lock(m_guestHeapMutex);
++        ensureGuestHeapInitializedLocked();
++        const int32_t index = findGuestHeapBlockIndexLocked(guestAddr);
++        if (index >= 0)
++        {
++            const uint64_t oldSize = m_guestHeapBlocks[static_cast<size_t>(index)].size;
++            const uint64_t wanted = alignGuestHeapValue(newSize, kGuestHeapDefaultAlignment);
++            if (wanted > oldSize && !leavesRuntimeReserveLocked(wanted - oldSize))
++            {
++                return 0u;
++            }
++        }
++    }
++    return guestRealloc(guestAddr, newSize, alignment);
++}
++
+ uint32_t PS2Runtime::guestCalloc(uint32_t count, uint32_t size, uint32_t alignment)
+ {
+     if (count == 0u || size == 0u)
+diff --git a/ps2xTest/src/ps2_runtime_kernel_tests.cpp b/ps2xTest/src/ps2_runtime_kernel_tests.cpp
+index 1005d05..ef9238f 100644
+--- a/ps2xTest/src/ps2_runtime_kernel_tests.cpp
++++ b/ps2xTest/src/ps2_runtime_kernel_tests.cpp
+@@ -1035,6 +1035,29 @@ void register_ps2_runtime_kernel_tests()
+             t.IsTrue(reent != direct, "_memalign_r should allocate a distinct block");
+         });
+ 
++        tc.Run("the game's malloc leaves heap for the runtime", [](TestCase &t)
++        {
++            TestEnv env;
++            // 1 MiB heap: the game's allocations must leave 1/16 of it free.
++            env.runtime.configureGuestHeap(0x00200000u, 0x00300000u);
++
++            // SLES-55605 asks malloc for ever smaller blocks until one fits, to
++            // take all memory for its own allocator.
++            uint32_t got = 0u;
++            uint32_t size = 0x00100000u;
++            for (; size >= 0x1000u && got == 0u; size -= 0x1000u)
++            {
++                setRegU32(env.ctx, 4, size);
++                ps2_stubs::malloc(env.rdram.data(), &env.ctx, &env.runtime);
++                got = ::getRegU32(&env.ctx, 2);
++            }
++            t.IsTrue(got != 0u, "a probing malloc should still get most of the heap");
++            t.IsTrue(size + 0x1000u <= 0x00100000u - 0x00010000u, "the game should not get the runtime's reserve");
++
++            // HLE code (MPEG stream callbacks, thread stacks) allocates here.
++            t.IsTrue(env.runtime.guestMalloc(0x40u) != 0u, "the runtime should still allocate after the game took its share");
++        });
++
+         tc.Run("allocator compatibility stubs use the runtime guest heap", [](TestCase &t)
+         {
+             TestEnv env;
+-- 
+2.54.0 (Apple Git-157)
+

@@ -1,0 +1,144 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 26 Oct 2026 05:50:36 +0700
+Subject: [PATCH 12/23] fix(iop): sceCdRead may fill IOP RAM the module never
+ allocated
+
+readSectors refused any destination ownsRamRange did not know about,
+i.e. memory no allocation or earlier write had touched. The drive DMAs
+anywhere in IOP RAM, and modules use fixed buffers: SLES-55605's SNDBASE
+reads its sound bank header (COMM_HD) to 0x1BA400, got 'CD READ
+Fail...' forever, and the sound driver never finished loading. Only the
+bounds are checked now; writeRam enforces them.
+
+The test host in iop_import_tests can now read files, so the test
+searches a file and reads it into an untouched buffer.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ps2xIOP/src/emulator/imports/iop_cdvd.cpp |  5 +-
+ ps2xIOP/tests/iop_import_tests.cpp        | 69 +++++++++++++++++++++++
+ 2 files changed, 73 insertions(+), 1 deletion(-)
+
+diff --git a/ps2xIOP/src/emulator/imports/iop_cdvd.cpp b/ps2xIOP/src/emulator/imports/iop_cdvd.cpp
+index ad58fb4..e14ac55 100644
+--- a/ps2xIOP/src/emulator/imports/iop_cdvd.cpp
++++ b/ps2xIOP/src/emulator/imports/iop_cdvd.cpp
+@@ -659,7 +659,10 @@ namespace ps2x::iop::detail
+                 return true;
+             }
+             const uint64_t byteCount64 = static_cast<uint64_t>(sectors) * kSectorSize;
+-            if (byteCount64 > IopMemory::RamSize || !memory.ownsRamRange(destination, static_cast<size_t>(byteCount64)))
++            // The drive DMAs into any IOP RAM, including buffers at fixed addresses
++            // the module never allocated (SLES-55605's SNDBASE reads its sound bank
++            // header to 0x1BA400), so only the bounds matter; writeRam checks them.
++            if (byteCount64 > IopMemory::RamSize)
+             {
+                 lastError = kCdvdErrorRead;
+                 return false;
+diff --git a/ps2xIOP/tests/iop_import_tests.cpp b/ps2xIOP/tests/iop_import_tests.cpp
+index 3035618..d50b59f 100644
+--- a/ps2xIOP/tests/iop_import_tests.cpp
++++ b/ps2xIOP/tests/iop_import_tests.cpp
+@@ -16,6 +16,7 @@
+ #include <filesystem>
+ #include <string>
+ #include <string_view>
++#include <vector>
+ 
+ namespace
+ {
+@@ -62,8 +63,27 @@ namespace
+             return kind == HostPathKind::CdRoot ? root.string() : std::string{};
+         }
+ 
++        uint64_t openHostFile(std::string_view path) override
++        {
++            openPaths.emplace_back(path);
++            return openPaths.size();
++        }
++
++        bool readHostFile(uint64_t handle, uint64_t offset, void *destination, size_t size, size_t &bytesRead) override
++        {
++            bytesRead = 0u;
++            if (handle == 0u || handle > openPaths.size())
++                return false;
++            std::ifstream file(openPaths[handle - 1u], std::ios::binary);
++            file.seekg(static_cast<std::streamoff>(offset));
++            file.read(static_cast<char *>(destination), static_cast<std::streamsize>(size));
++            bytesRead = static_cast<size_t>(file.gcount());
++            return true;
++        }
++
+     private:
+         std::filesystem::path root;
++        std::vector<std::filesystem::path> openPaths;
+     };
+ 
+     class RecordingExecutor final : public IopGuestExecutor
+@@ -274,6 +294,54 @@ namespace
+         return passed;
+     }
+ 
++    bool testCdvdReadIntoUnallocatedRam()
++    {
++        const auto suffix = std::to_string(
++            static_cast<unsigned long long>(std::chrono::steady_clock::now().time_since_epoch().count()));
++        const std::filesystem::path root =
++            std::filesystem::temp_directory_path() / ("ps2x-iop-cdvd-read-" + suffix);
++        std::error_code error;
++        std::filesystem::create_directories(root / "DATA", error);
++        if (!expect(!error, "could not create the temporary CD root"))
++            return false;
++        {
++            std::ofstream bank(root / "DATA" / "SNDDATA.BIN", std::ios::binary);
++            bank.write("IECSsreV", 8);
++        }
++
++        CdRootHost host(root);
++        IopMemory memory;
++        IopKernel kernel(memory);
++        kernel.reset();
++        IopCdvd cdvd(host, memory, kernel);
++        cdvd.reset();
++
++        constexpr uint32_t resultAddress = 0x2400u;
++        constexpr uint32_t pathAddress = 0x2480u;
++        const char path[] = "cdrom0:\\DATA\\SNDDATA.BIN;1";
++        (void)memory.writeRam(pathAddress, path, sizeof(path));
++        IopCpuState cpu{};
++        cpu.gpr[4] = resultAddress;
++        cpu.gpr[5] = pathAddress;
++        if (!expect(cdvd.dispatchImport(10u, cpu) && cpu.gpr[2] == 1u, "sceCdSearchFile did not find the file"))
++            return false;
++
++        // A fixed buffer the module never allocated, as SLES-55605's SNDBASE uses.
++        constexpr uint32_t buffer = 0x1BA400u;
++        cpu = {};
++        cpu.gpr[4] = memory.read32(resultAddress);
++        cpu.gpr[5] = 1u;
++        cpu.gpr[6] = buffer;
++        cpu.gpr[7] = 0x2500u;
++        const bool passed =
++            expect(cdvd.dispatchImport(6u, cpu), "cdvdman:6 was not handled") &&
++            expect(cpu.gpr[2] == 1u, "sceCdRead refused a buffer in unallocated RAM") &&
++            expect(memory.readString(buffer, 8u) == "IECSsreV", "sceCdRead did not fill the buffer");
++
++        std::filesystem::remove_all(root, error);
++        return passed;
++    }
++
+     bool testTimrmanPeriodicCallback()
+     {
+         IopTimrman timrman;
+@@ -331,6 +399,7 @@ namespace
+ int main()
+ {
+     if (!testLoadcoreRebootLibraryMode() || !testCdvdSpecialControl() || !testCdvdSearchFile() ||
++        !testCdvdReadIntoUnallocatedRam() ||
+         !testTimrmanPeriodicCallback())
+         return 1;
+     std::cout << "ps2xIOP import tests passed\n";
+-- 
+2.54.0 (Apple Git-157)
+

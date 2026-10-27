@@ -20,10 +20,10 @@ a macOS arm64 executable.**
 disc/SLES_556.05
   -> tools/ghidra_export.sh   Ghidra 12.1.4 headless, r5900:LE:32:default,
                               PS2Recomp ExportPS2Functions.java  (46 s)
-  -> tools/fixmap.py          keep functions in code ranges, drop labels,
+  -> archive/ps2recomp/tools/fixmap.py          keep functions in code ranges, drop labels,
                               reuse the analyzer's SDK stubs and tables
   -> ps2_recomp               build/recomp/output, 8,762 files
-  -> tools/build_mac.sh       copy into the runner, ninja -j5
+  -> archive/ps2recomp/tools/build_mac.sh       copy into the runner, ninja -j5
 ```
 
 ## What it took

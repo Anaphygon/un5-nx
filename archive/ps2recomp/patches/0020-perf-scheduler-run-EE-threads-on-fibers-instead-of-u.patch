@@ -1,0 +1,1130 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 26 Oct 2026 21:52:48 +0700
+Subject: [PATCH 20/23] perf(scheduler): run EE threads on fibers instead of
+ unwinding to switch
+
+Ported from Sinan Karakaya's PS2Recomp fork (GPL-3.0), commits 8b83b2b,
+684c3ce, e44c029, 3a2bb26, b26188d and a12955b: EeFiber (native x86-64
+and ARM64 switches, Win32 fibers, ucontext fallback) and its tests are
+taken as they are; the scheduler side is rewritten against this tree.
+
+Each guest thread runs on its own stack. A yield (transferIfRequested)
+and sleep, semaphore and event-flag waits suspend that stack instead of
+throwing EeDispatcherTransfer through the guest's whole C++ call chain.
+On macOS every such throw walked the unwind tables of the recompiled
+binary frame by frame; SLES-55605's movie player yields thousands of
+times a frame and ran at 2-3 fps. Waits with a completion, thread exit
+and the executor's own stack still throw. A self-deleted thread's
+record lives until its fiber has stopped, and a thread made dormant
+while suspended drops its stale fiber.
+
+Co-Authored-By: Sinan Karakaya <karakaya.sinan@proton.me>
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ps2xRuntime/include/runtime/ee_fiber.h     |  49 +++
+ ps2xRuntime/include/runtime/ee_scheduler.h |  35 ++
+ ps2xRuntime/src/lib/Kernel/EeFiber.cpp     | 476 +++++++++++++++++++++
+ ps2xRuntime/src/lib/Kernel/EeScheduler.cpp | 190 +++++++-
+ ps2xTest/CMakeLists.txt                    |   1 +
+ ps2xTest/src/ee_fiber_tests.cpp            | 147 +++++++
+ ps2xTest/src/main.cpp                      |   2 +
+ 7 files changed, 879 insertions(+), 21 deletions(-)
+ create mode 100644 ps2xRuntime/include/runtime/ee_fiber.h
+ create mode 100644 ps2xRuntime/src/lib/Kernel/EeFiber.cpp
+ create mode 100644 ps2xTest/src/ee_fiber_tests.cpp
+
+diff --git a/ps2xRuntime/include/runtime/ee_fiber.h b/ps2xRuntime/include/runtime/ee_fiber.h
+new file mode 100644
+index 0000000..3fd8978
+--- /dev/null
++++ b/ps2xRuntime/include/runtime/ee_fiber.h
+@@ -0,0 +1,49 @@
++#pragma once
++
++#include <cstddef>
++#include <cstdint>
++
++// A stack a guest thread can be suspended on and resumed into.
++//
++// The EE scheduler used to transfer control by throwing EeDispatcherTransfer,
++// which unwinds the guest's whole C++ call chain and then rebuilds it on the
++// way back. That cost ~10us per switch against the ~540ns a 60fps movie frame
++// can afford, because DQ8's movie thread yields ~31,000 times per frame.
++// Suspending the stack instead makes a switch a register save and a stack
++// pointer swap.
++//
++// x86-64 and ARM64 get native switches and Windows uses its own fibers; other
++// targets fall back to ucontext, which is correct but pays a sigprocmask
++// syscall per switch. setjmp/longjmp across stacks is deliberately not used:
++// glibc's _FORTIFY_SOURCE turns it into an abort ("longjmp causes
++// uninitialized stack frame").
++class EeFiber
++{
++public:
++    using EntryFn = void (*)(void *user);
++
++    EeFiber() = default;
++    ~EeFiber();
++
++    EeFiber(const EeFiber &) = delete;
++    EeFiber &operator=(const EeFiber &) = delete;
++
++    // Allocates the stack and arms `entry`; entry must never return.
++    bool create(EntryFn entry, void *user, size_t stackBytes);
++    [[nodiscard]] bool valid() const noexcept { return m_platform != nullptr; }
++    void destroy();
++
++    // Called from the scheduler: run this fiber until it switches back.
++    void resume();
++    // Called from inside the fiber: hand control back to whoever resumed it.
++    void suspend();
++
++    [[nodiscard]] static bool usingFastSwitch() noexcept;
++
++private:
++    void *m_stack = nullptr;      // lowest address of the allocation (none on Windows)
++    size_t m_stackBytes = 0u;
++    void *m_fiberSp = nullptr;    // suspended fiber stack pointer
++    void *m_returnSp = nullptr;   // stack pointer of whoever called resume()
++    void *m_platform = nullptr;   // per-backend state; non-null once create() succeeds
++};
+diff --git a/ps2xRuntime/include/runtime/ee_scheduler.h b/ps2xRuntime/include/runtime/ee_scheduler.h
+index f247ff9..46b45a6 100644
+--- a/ps2xRuntime/include/runtime/ee_scheduler.h
++++ b/ps2xRuntime/include/runtime/ee_scheduler.h
+@@ -1,6 +1,7 @@
+ #pragma once
+ 
+ #include "ps2_runtime.h"
++#include "runtime/ee_fiber.h"
+ 
+ #include <array>
+ #include <atomic>
+@@ -8,7 +9,9 @@
+ #include <condition_variable>
+ #include <cstdint>
+ #include <deque>
++#include <exception>
+ #include <functional>
++#include <memory>
+ #include <mutex>
+ #include <optional>
+ #include <thread>
+@@ -123,6 +126,11 @@ struct GuestThread
+     EeWaitState wait{};
+     std::function<void(R5900Context &)> resumeCompletion;
+     std::vector<GuestInvocation> invocations;
++    // Host stack this thread's guest code runs on, created on first dispatch.
++    // While inGuestCall is set the stack is suspended part way through a guest
++    // call and must be resumed, not re-entered from the saved pc.
++    std::unique_ptr<EeFiber> fiber;
++    bool inGuestCall = false;
+ 
+     [[nodiscard]] R5900Context &activeContext()
+     {
+@@ -374,11 +382,20 @@ private:
+     GuestThread &acquireInvocationThread();
+     void enqueueReady(GuestThread &thread, bool front = false);
+     void removeReady(GuestThread &thread);
++    // Runs one guest dispatch on `thread`'s fiber, creating it if needed, and
++    // returns when the fiber suspends or the call completes.
++    void enterGuest(GuestThread &thread);
++    // The fiber's body: run the pending dispatch, hand control back, repeat.
++    static void fiberEntry(void *user);
++    void runPendingGuestCall();
+     [[nodiscard]] GuestThread *selectReady();
+     void makeRunning(GuestThread &thread);
+     void makeDormant(GuestThread &thread);
+     void removeFromWaitObject(GuestThread &thread);
+     [[noreturn]] void blockCurrent(EeWaitState wait);
++    // Suspends the guest stack instead of unwinding it; see the definition for
++    // when that is allowed.
++    void blockCurrentResumable(EeWaitState wait);
+     void makeReady(GuestThread &thread, int result, bool interruptSafe);
+     void requestPreemptionIfHigher(const GuestThread &readyThread, bool interruptSafe);
+     void applyPendingPreemption();
+@@ -402,6 +419,10 @@ private:
+     uint8_t *m_rdram = nullptr;
+     std::array<std::deque<int>, kPriorityCount> m_readyQueues{};
+     std::unordered_map<int, GuestThread> m_threads;
++    // A thread that deleted itself. Its record owns the fiber the deletion
++    // ran on, so it is kept until enterGuest() is back on the executor's own
++    // stack; its ID is free for reuse meanwhile.
++    std::unordered_map<int, GuestThread>::node_type m_exitedThread;
+     std::unordered_map<int, EeSemaphore> m_semaphores;
+     std::unordered_map<int, EeEventFlag> m_eventFlags;
+     std::unordered_map<int, EeAlarm> m_alarms;
+@@ -434,6 +455,20 @@ private:
+     std::atomic<bool> m_checkpointPending{false};
+     uint32_t m_debugPublishCountdown = 0u;
+ 
++    // Guest code runs on a per-thread fiber so a yield can suspend the stack
++    // instead of unwinding it. Null while the executor is on its own stack.
++    EeFiber *m_activeFiber = nullptr;
++    // The thread a fiber dispatch is running for; cleared when the dispatch
++    // finishes, so still set after resume() means the fiber suspended.
++    int m_dispatchedThreadId = 0;
++    // Handed to the fiber for the dispatch it is about to run.
++    PS2Runtime::RecompiledFunction m_pendingFunction = nullptr;
++    R5900Context *m_pendingContext = nullptr;
++    bool m_pendingInsideInterrupt = false;
++    // A non-transfer exception escaping guest code, rethrown by the executor
++    // once it is back on its own stack.
++    std::exception_ptr m_fiberException;
++
+     mutable std::mutex m_eventMutex;
+     std::condition_variable m_eventCv;
+     std::deque<EeEvent> m_events;
+diff --git a/ps2xRuntime/src/lib/Kernel/EeFiber.cpp b/ps2xRuntime/src/lib/Kernel/EeFiber.cpp
+new file mode 100644
+index 0000000..4961db6
+--- /dev/null
++++ b/ps2xRuntime/src/lib/Kernel/EeFiber.cpp
+@@ -0,0 +1,476 @@
++#include "runtime/ee_fiber.h"
++
++#include <cstdlib>
++#include <cstring>
++#include <new>
++
++#if defined(_WIN32)
++#define EE_FIBER_WIN32 1
++#ifndef WIN32_LEAN_AND_MEAN
++#define WIN32_LEAN_AND_MEAN
++#endif
++#ifndef NOMINMAX
++#define NOMINMAX
++#endif
++#include <windows.h>
++#else
++#define EE_FIBER_WIN32 0
++#endif
++
++#if defined(__unix__) || defined(__APPLE__)
++#include <sys/mman.h>
++#include <unistd.h>
++#define EE_FIBER_HAVE_MMAP 1
++#else
++#define EE_FIBER_HAVE_MMAP 0
++#endif
++
++#if !EE_FIBER_WIN32
++namespace
++{
++    size_t stackPageSize()
++    {
++#if EE_FIBER_HAVE_MMAP
++        static const size_t size = static_cast<size_t>(sysconf(_SC_PAGESIZE));
++        return size;
++#else
++        return 4096u;
++#endif
++    }
++    // Whole mapping including one guard page at the low end.
++    void *mmapStack(size_t bytes)
++    {
++#if EE_FIBER_HAVE_MMAP
++        void *base = mmap(nullptr, bytes, PROT_READ | PROT_WRITE,
++                          MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
++        if (base == MAP_FAILED)
++        {
++            return nullptr;
++        }
++        if (mprotect(base, stackPageSize(), PROT_NONE) != 0)
++        {
++            munmap(base, bytes);
++            return nullptr;
++        }
++        return base;
++#else
++        return std::aligned_alloc(64u, bytes);
++#endif
++    }
++
++    void munmapStack(void *base, size_t bytes)
++    {
++#if EE_FIBER_HAVE_MMAP
++        if (base != nullptr)
++        {
++            munmap(base, bytes);
++        }
++#else
++        (void)bytes;
++        std::free(base);
++#endif
++    }
++} // namespace
++#endif
++
++#if defined(__x86_64__) && (defined(__linux__) || defined(__unix__) || defined(__APPLE__)) && !defined(EE_FIBER_FORCE_UCONTEXT)
++#define EE_FIBER_FAST_X86_64 1
++#else
++#define EE_FIBER_FAST_X86_64 0
++#endif
++
++#if defined(__aarch64__) && (defined(__linux__) || defined(__APPLE__)) && !defined(EE_FIBER_FORCE_UCONTEXT)
++#define EE_FIBER_FAST_ARM64 1
++#else
++#define EE_FIBER_FAST_ARM64 0
++#endif
++#define EE_FIBER_FAST (EE_FIBER_FAST_X86_64 || EE_FIBER_FAST_ARM64)
++#define EE_FIBER_UCONTEXT (!EE_FIBER_FAST && !EE_FIBER_WIN32)
++
++#if EE_FIBER_UCONTEXT
++#if defined(__APPLE__) && !defined(_XOPEN_SOURCE)
++#define _XOPEN_SOURCE 700
++#endif
++#include <ucontext.h>
++#endif
++
++namespace
++{
++#if EE_FIBER_FAST_X86_64
++    // Mach-O: C symbols take a leading underscore, .hidden is .private_extern,
++    // there is no .type or .size, and .align N aligns to 2^N, hence .p2align.
++#if defined(__APPLE__)
++#define EE_ASM_SYMBOL(name) "_" #name
++#define EE_ASM_FUNCTION(name) ".globl _" #name "\n.private_extern _" #name "\n"
++#define EE_ASM_FUNCTION_END(name) ""
++#else
++#define EE_ASM_SYMBOL(name) #name
++#define EE_ASM_FUNCTION(name) ".globl " #name "\n.hidden " #name "\n.type " #name ",@function\n"
++#define EE_ASM_FUNCTION_END(name) ".size " #name ",.-" #name "\n"
++#endif
++
++    // void eeFiberSwitch(void **saveSp, void *targetSp)
++    //
++    // Saves the callee-saved registers and the FP control words on the current
++    // stack, records the resulting stack pointer through saveSp, switches to
++    // targetSp and restores the same set from there. The final `ret` lands on
++    // whatever return address that stack was suspended at -- for a fresh fiber,
++    // the trampoline create() planted.
++    extern "C" void eeFiberSwitch(void **saveSp, void *targetSp);
++    __asm__(
++        ".text\n"
++        EE_ASM_FUNCTION(eeFiberSwitch)
++        ".p2align 4\n"
++        EE_ASM_SYMBOL(eeFiberSwitch) ":\n"
++        "    pushq %rbp\n"
++        "    pushq %rbx\n"
++        "    pushq %r12\n"
++        "    pushq %r13\n"
++        "    pushq %r14\n"
++        "    pushq %r15\n"
++        "    subq  $8, %rsp\n"
++        "    stmxcsr (%rsp)\n"
++        "    fnstcw 4(%rsp)\n"
++        "    movq %rsp, (%rdi)\n"
++        "    movq %rsi, %rsp\n"
++        "    ldmxcsr (%rsp)\n"
++        "    fldcw 4(%rsp)\n"
++        "    addq $8, %rsp\n"
++        "    popq %r15\n"
++        "    popq %r14\n"
++        "    popq %r13\n"
++        "    popq %r12\n"
++        "    popq %rbx\n"
++        "    popq %rbp\n"
++        "    ret\n"
++        EE_ASM_FUNCTION_END(eeFiberSwitch));
++
++    struct FiberBootstrap
++    {
++        EeFiber::EntryFn entry;
++        void *user;
++    };
++
++    // Reached by the first `ret` out of eeFiberSwitch. %rbx carries the
++    // bootstrap because create() planted it in the saved-register slot.
++    extern "C" void eeFiberTrampoline();
++    __asm__(
++        ".text\n"
++        EE_ASM_FUNCTION(eeFiberTrampoline)
++        ".p2align 4\n"
++        EE_ASM_SYMBOL(eeFiberTrampoline) ":\n"
++        // Entered by `ret`, so rsp%16 == 8 as at any function entry. SysV wants
++        // rsp%16 == 0 immediately before a call; without this the callee's
++        // 16-byte SSE spills fault.
++        "    subq $8, %rsp\n"
++        "    movq %rbx, %rdi\n"
++        "    call " EE_ASM_SYMBOL(eeFiberEnter) "\n"
++        "    hlt\n" // eeFiberEnter never returns
++        EE_ASM_FUNCTION_END(eeFiberTrampoline));
++
++    // Only the asm calls this, which GCC's LTO cannot see: without `used` it
++    // drops the definition and the trampoline's call fails to link.
++    extern "C" __attribute__((used)) void eeFiberEnter(void *bootstrap)
++    {
++        auto *boot = static_cast<FiberBootstrap *>(bootstrap);
++        boot->entry(boot->user);
++        std::abort(); // entry must never return
++    }
++#undef EE_ASM_SYMBOL
++#undef EE_ASM_FUNCTION
++#undef EE_ASM_FUNCTION_END
++#elif EE_FIBER_FAST_ARM64
++    struct FiberBootstrap
++    {
++        EeFiber::EntryFn entry;
++        void *user;
++    };
++
++    extern "C" void eeFiberSwitch(void **saveSp, void *targetSp);
++    extern "C" void eeFiberTrampoline();
++    // Called only from the asm below; `used` keeps LTO from dropping it.
++    extern "C" __attribute__((used)) void eeFiberEnter(void *bootstrap)
++    {
++        auto *boot = static_cast<FiberBootstrap *>(bootstrap);
++        boot->entry(boot->user);
++        std::abort();
++    }
++
++#if defined(__APPLE__)
++#define EE_ASM_SYMBOL(name) "_" #name
++#else
++#define EE_ASM_SYMBOL(name) #name
++#endif
++    // AAPCS64: x19-x30, the low halves of v8-v15, and the FP environment.
++    // x18 is platform-reserved and must never be used as a scratch register.
++    __asm__(
++        ".text\n"
++        ".p2align 2\n"
++        ".globl " EE_ASM_SYMBOL(eeFiberSwitch) "\n"
++        EE_ASM_SYMBOL(eeFiberSwitch) ":\n"
++        "sub sp, sp, #176\n"
++        "stp x19, x20, [sp, #0]\n"
++        "stp x21, x22, [sp, #16]\n"
++        "stp x23, x24, [sp, #32]\n"
++        "stp x25, x26, [sp, #48]\n"
++        "stp x27, x28, [sp, #64]\n"
++        "stp x29, x30, [sp, #80]\n"
++        "stp d8, d9, [sp, #96]\n"
++        "stp d10, d11, [sp, #112]\n"
++        "stp d12, d13, [sp, #128]\n"
++        "stp d14, d15, [sp, #144]\n"
++        "mrs x9, fpcr\n"
++        "mrs x10, fpsr\n"
++        "stp x9, x10, [sp, #160]\n"
++        "mov x9, sp\n"
++        "str x9, [x0]\n"
++        "mov sp, x1\n"
++        "ldp x11, x12, [sp, #160]\n"
++        "cmp x9, x11\n"
++        "b.eq 1f\n"
++        "msr fpcr, x11\n"
++        "1:\n"
++        "cmp x10, x12\n"
++        "b.eq 2f\n"
++        "msr fpsr, x12\n"
++        "2:\n"
++        "ldp d8, d9, [sp, #96]\n"
++        "ldp d10, d11, [sp, #112]\n"
++        "ldp d12, d13, [sp, #128]\n"
++        "ldp d14, d15, [sp, #144]\n"
++        "ldp x19, x20, [sp, #0]\n"
++        "ldp x21, x22, [sp, #16]\n"
++        "ldp x23, x24, [sp, #32]\n"
++        "ldp x25, x26, [sp, #48]\n"
++        "ldp x27, x28, [sp, #64]\n"
++        "ldp x29, x30, [sp, #80]\n"
++        "add sp, sp, #176\n"
++        "ret\n"
++        ".p2align 2\n"
++        ".globl " EE_ASM_SYMBOL(eeFiberTrampoline) "\n"
++        EE_ASM_SYMBOL(eeFiberTrampoline) ":\n"
++        "mov x0, x19\n"
++        "bl " EE_ASM_SYMBOL(eeFiberEnter) "\n"
++        "brk #0\n");
++#undef EE_ASM_SYMBOL
++#elif EE_FIBER_WIN32
++    // Win32 fibers rather than a hand-rolled switch: SwitchToFiber also moves
++    // the TEB stack bounds, without which C++ exceptions cannot unwind a fiber.
++    struct FiberPlatform
++    {
++        void *fiber = nullptr;
++        void *caller = nullptr;
++        EeFiber::EntryFn entry = nullptr;
++        void *user = nullptr;
++    };
++
++    void WINAPI fiberStart(void *param)
++    {
++        auto *self = static_cast<FiberPlatform *>(param);
++        self->entry(self->user);
++        std::abort(); // returning would end the thread
++    }
++
++    // SwitchToFiber needs a fiber to come back to, so a thread becomes one the
++    // first time it resumes anything.
++    void *currentFiber()
++    {
++        if (IsThreadAFiber())
++        {
++            return GetCurrentFiber();
++        }
++        void *self = ConvertThreadToFiberEx(nullptr, FIBER_FLAG_FLOAT_SWITCH);
++        if (self == nullptr)
++        {
++            std::abort();
++        }
++        return self;
++    }
++#else
++    struct FiberPlatform
++    {
++        ucontext_t fiber{};
++        ucontext_t caller{};
++        EeFiber::EntryFn entry = nullptr;
++        void *user = nullptr;
++    };
++
++    FiberPlatform *g_startingFiber = nullptr;
++
++    void fiberTrampoline()
++    {
++        FiberPlatform *self = g_startingFiber;
++        self->entry(self->user);
++        std::abort();
++    }
++#endif
++} // namespace
++
++bool EeFiber::usingFastSwitch() noexcept
++{
++    return EE_FIBER_FAST != 0;
++}
++
++EeFiber::~EeFiber()
++{
++    destroy();
++}
++
++void EeFiber::destroy()
++{
++#if EE_FIBER_WIN32
++    if (auto *platform = static_cast<FiberPlatform *>(m_platform))
++    {
++        DeleteFiber(platform->fiber);
++        delete platform;
++    }
++#elif EE_FIBER_UCONTEXT
++    delete static_cast<FiberPlatform *>(m_platform);
++#else
++    std::free(m_platform);
++#endif
++    m_platform = nullptr;
++#if !EE_FIBER_WIN32
++    munmapStack(m_stack, m_stackBytes);
++#endif
++    m_stack = nullptr;
++    m_stackBytes = 0u;
++    m_fiberSp = nullptr;
++    m_returnSp = nullptr;
++}
++
++bool EeFiber::create(EntryFn entry, void *user, size_t stackBytes)
++{
++    destroy();
++    if (entry == nullptr || stackBytes < 64u * 1024u)
++    {
++        return false;
++    }
++#if EE_FIBER_WIN32
++    // The fiber reserves its own stack, guard page included.
++    auto *platform = new (std::nothrow) FiberPlatform();
++    if (platform == nullptr)
++    {
++        return false;
++    }
++    platform->entry = entry;
++    platform->user = user;
++    platform->fiber = CreateFiberEx(0, stackBytes, FIBER_FLAG_FLOAT_SWITCH, fiberStart, platform);
++    if (platform->fiber == nullptr)
++    {
++        delete platform;
++        return false;
++    }
++    m_platform = platform;
++    return true;
++#else
++    // Guest call chains nest in C++ through dispatchGuestBranch, so a fiber
++    // stack can run deep. Map it with a PROT_NONE guard page at the low end:
++    // an overflow then faults on the guard instead of quietly writing into
++    // whatever the allocator put underneath.
++    const size_t pageSize = stackPageSize();
++    const size_t mapped = ((stackBytes + pageSize - 1u) / pageSize) * pageSize + pageSize;
++    void *base = mmapStack(mapped);
++    if (base == nullptr)
++    {
++        return false;
++    }
++    void *stack = static_cast<char *>(base) + pageSize;
++    m_stack = base;
++    m_stackBytes = mapped;
++    stackBytes = mapped - pageSize;
++
++#if EE_FIBER_FAST
++    auto *boot = static_cast<FiberBootstrap *>(std::malloc(sizeof(FiberBootstrap)));
++    if (boot == nullptr)
++    {
++        destroy();
++        return false;
++    }
++    boot->entry = entry;
++    boot->user = user;
++    m_platform = boot;
++
++#if EE_FIBER_FAST_X86_64
++    // Build the frame eeFiberSwitch will pop: FP words, r15..rbx, rbp, then the
++    // return address it rets to. rbx carries the bootstrap into the trampoline.
++    auto *top = reinterpret_cast<uintptr_t *>(static_cast<char *>(stack) + stackBytes);
++    top = reinterpret_cast<uintptr_t *>(reinterpret_cast<uintptr_t>(top) & ~static_cast<uintptr_t>(15));
++    // SysV wants rsp % 16 == 8 on entry, i.e. the return-address slot 16-aligned.
++    *--top = 0u;                                              // alignment padding
++    *--top = reinterpret_cast<uintptr_t>(&eeFiberTrampoline); // ret target
++    *--top = 0u;                                              // rbp
++    *--top = reinterpret_cast<uintptr_t>(boot);               // rbx
++    *--top = 0u;                                              // r12
++    *--top = 0u;                                              // r13
++    *--top = 0u;                                              // r14
++    *--top = 0u;                                              // r15
++    // mxcsr (low 32) + x87 control word (next 16), matching the switch's layout.
++    uint32_t mxcsr = 0x1F80u;
++    uint16_t fcw = 0x037Fu;
++    __asm__ __volatile__("stmxcsr %0" : "=m"(mxcsr));
++    __asm__ __volatile__("fnstcw %0" : "=m"(fcw));
++    --top;
++    std::memcpy(top, &mxcsr, sizeof(mxcsr));
++    std::memcpy(reinterpret_cast<char *>(top) + 4, &fcw, sizeof(fcw));
++    m_fiberSp = top;
++#else
++    auto *top = reinterpret_cast<uint64_t *>(static_cast<char *>(stack) + stackBytes) - 22;
++    std::memset(top, 0, 176);
++    top[0] = reinterpret_cast<uintptr_t>(boot);                 // x19
++    top[11] = reinterpret_cast<uintptr_t>(&eeFiberTrampoline);  // x30
++    __asm__ __volatile__("mrs %0, fpcr" : "=r"(top[20]));
++    __asm__ __volatile__("mrs %0, fpsr" : "=r"(top[21]));
++    m_fiberSp = top;
++#endif
++#else
++    auto *platform = new (std::nothrow) FiberPlatform();
++    if (platform == nullptr)
++    {
++        destroy();
++        return false;
++    }
++    platform->entry = entry;
++    platform->user = user;
++    if (getcontext(&platform->fiber) != 0)
++    {
++        delete platform;
++        destroy();
++        return false;
++    }
++    platform->fiber.uc_stack.ss_sp = stack;
++    platform->fiber.uc_stack.ss_size = stackBytes;
++    platform->fiber.uc_link = nullptr;
++    makecontext(&platform->fiber, fiberTrampoline, 0);
++    m_platform = platform;
++#endif
++    return true;
++#endif
++}
++
++void EeFiber::resume()
++{
++#if EE_FIBER_FAST
++    eeFiberSwitch(&m_returnSp, m_fiberSp);
++#elif EE_FIBER_WIN32
++    auto *platform = static_cast<FiberPlatform *>(m_platform);
++    platform->caller = currentFiber();
++    SwitchToFiber(platform->fiber);
++#else
++    auto *platform = static_cast<FiberPlatform *>(m_platform);
++    g_startingFiber = platform;
++    swapcontext(&platform->caller, &platform->fiber);
++#endif
++}
++
++void EeFiber::suspend()
++{
++#if EE_FIBER_FAST
++    eeFiberSwitch(&m_fiberSp, m_returnSp);
++#elif EE_FIBER_WIN32
++    SwitchToFiber(static_cast<FiberPlatform *>(m_platform)->caller);
++#else
++    auto *platform = static_cast<FiberPlatform *>(m_platform);
++    swapcontext(&platform->fiber, &platform->caller);
++#endif
++}
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+index 633e62d..54e5c62 100644
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -5,6 +5,7 @@
+ 
+ #include <algorithm>
+ #include <cassert>
++#include <cstdlib>
+ #include <cstring>
+ #include <limits>
+ #include <stdexcept>
+@@ -88,6 +89,7 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
+     m_rdram = rdram;
+     m_readyQueues = {};
+     m_threads.clear();
++    m_exitedThread = {};
+     m_semaphores.clear();
+     m_eventFlags.clear();
+     m_alarms.clear();
+@@ -198,6 +200,34 @@ void EeScheduler::run()
+ 
+         GuestThread *running = currentThread();
+         assert(running != nullptr);
++
++        // Suspended part way through a guest call: its stack is still live, so
++        // resume it rather than dispatching the saved pc, which points into the
++        // middle of a function the fiber is already executing.
++        if (running->inGuestCall)
++        {
++            enterGuest(*running);
++            if (m_fiberException)
++            {
++                std::exception_ptr escaped;
++                std::swap(escaped, m_fiberException);
++                m_running.store(false, std::memory_order_release);
++                publishSnapshot();
++                std::rethrow_exception(escaped);
++            }
++            processPendingEvents();
++            if (m_rescheduleRequested && m_currentThreadId != 0)
++            {
++                GuestThread *preempted = currentThread();
++                assert(preempted != nullptr);
++                enqueueReady(*preempted, !m_timeSliceExpired);
++                m_currentThreadId = 0;
++                m_rescheduleRequested = false;
++                m_timeSliceExpired = false;
++            }
++            continue;
++        }
++
+         if (running->resumeCompletion)
+         {
+             auto completion = std::move(running->resumeCompletion);
+@@ -305,25 +335,19 @@ void EeScheduler::run()
+             continue;
+         }
+ 
+-        try
+-        {
+-            m_insideInterrupt = !running->invocations.empty() && running->invocations.back().kind == GuestInvocationKind::Interrupt;
+-            m_guestExecuting.store(true, std::memory_order_release);
+-            function(m_rdram, &context, &m_runtime);
+-            m_guestExecuting.store(false, std::memory_order_release);
+-            m_insideInterrupt = false;
+-        }
+-        catch (const EeDispatcherTransfer &)
+-        {
+-            m_guestExecuting.store(false, std::memory_order_release);
+-            m_insideInterrupt = false;
+-        }
+-        catch (...)
++        m_pendingFunction = function;
++        m_pendingContext = &context;
++        m_pendingInsideInterrupt =
++            !running->invocations.empty() &&
++            running->invocations.back().kind == GuestInvocationKind::Interrupt;
++        enterGuest(*running);
++        if (m_fiberException)
+         {
+-            m_guestExecuting.store(false, std::memory_order_release);
++            std::exception_ptr escaped;
++            std::swap(escaped, m_fiberException);
+             m_running.store(false, std::memory_order_release);
+             publishSnapshot();
+-            throw;
++            std::rethrow_exception(escaped);
+         }
+ 
+         processPendingEvents();
+@@ -534,7 +558,9 @@ int EeScheduler::startThread(int id, uint32_t arg, const R5900Context &caller, b
+     m_currentThreadId = 0;
+     if (deleteThreadRecord && id != kMainThreadId)
+     {
+-        m_threads.erase(id);
++        // This usually runs on the record's own fiber, so the record has to
++        // outlive the call; see m_exitedThread.
++        m_exitedThread = m_threads.extract(id);
+     }
+     if (ownedStack != 0u)
+     {
+@@ -663,7 +689,7 @@ void EeScheduler::sleepCurrent()
+         setReturnS32(&self->activeContext(), KE_OK);
+         return;
+     }
+-    blockCurrent(EeWaitState{EeWaitReason::Sleep, std::monostate{}});
++    blockCurrentResumable(EeWaitState{EeWaitReason::Sleep, std::monostate{}});
+ }
+ 
+ int EeScheduler::wakeupThread(int id, bool interruptSafe)
+@@ -770,7 +796,7 @@ int EeScheduler::rotateReadyQueue(int priority, bool interruptSafe)
+     }
+ 
+     GuestThread *self = currentThread();
+-    if (self && self->currentPriority == priority && m_readyQueues[priority].empty())
++    if (self && self->currentPriority == priority && m_readyQueues[priority].empty() && !m_rescheduleRequested)
+     {
+         // Alone at its priority: rotating changes nothing and the caller keeps
+         // running. Switching anyway costs a full context switch, and libmpeg's
+@@ -837,6 +863,16 @@ void EeScheduler::transferIfRequested(bool interruptSafe)
+     m_rescheduleRequested = false;
+     m_timeSliceExpired = false;
+     publishSnapshot();
++
++    // The thread stays runnable, so its C++ stack is still wanted: suspend it
++    // rather than unwinding and rebuilding it. Only the executor's own stack
++    // has nowhere to suspend to (direct-syscall tests, embedders), and it still
++    // throws.
++    if (m_activeFiber != nullptr)
++    {
++        m_activeFiber->suspend();
++        return;
++    }
+     throw EeDispatcherTransfer{};
+ }
+ 
+@@ -952,7 +988,7 @@ void EeScheduler::waitSemaphore(int id)
+     GuestThread *self = currentThread();
+     assert(self != nullptr);
+     object->waiters.push_back(self->id);
+-    blockCurrent(EeWaitState{EeWaitReason::Semaphore, EeSemaphoreWait{id}});
++    blockCurrentResumable(EeWaitState{EeWaitReason::Semaphore, EeSemaphoreWait{id}});
+ }
+ 
+ int EeScheduler::createEventFlag(uint32_t initialBits, uint32_t attr, uint32_t option)
+@@ -1075,7 +1111,7 @@ void EeScheduler::waitEventFlag(int id, uint32_t bits, uint32_t mode, uint32_t r
+         return;
+     }
+     flag->waiters.push_back(self->id);
+-    blockCurrent(EeWaitState{EeWaitReason::EventFlag,
++    blockCurrentResumable(EeWaitState{EeWaitReason::EventFlag,
+                              EeEventFlagWait{id, bits, mode, resultAddress}});
+ }
+ 
+@@ -1670,6 +1706,13 @@ void EeScheduler::makeDormant(GuestThread &item)
+     item.suspendCount = 0;
+     item.wakeupCount = 0;
+     item.invocations.clear();
++    // un5-nx: a thread terminated while its fiber is suspended in a wait must
++    // not resume that stale call when it is started again.
++    if (item.inGuestCall && item.fiber && item.fiber.get() != m_activeFiber)
++    {
++        item.fiber.reset();
++        item.inGuestCall = false;
++    }
+ }
+ 
+ void EeScheduler::removeFromWaitObject(GuestThread &item)
+@@ -1702,6 +1745,111 @@ void EeScheduler::removeFromWaitObject(GuestThread &item)
+     item.wait = {};
+ }
+ 
++// Sleep, semaphore and event-flag waits only take a return value from
++// makeReady() and their callers have nothing left to do, so the guest stack
++// can be suspended and resumed in place. Waits carrying a completion still
++// throw: the completion re-invokes its syscall on wake and would run twice
++// against a stack that is still there.
++void EeScheduler::blockCurrentResumable(EeWaitState wait)
++{
++    assert(!wait.completion && "a resumable block must not carry a completion");
++    if (m_activeFiber == nullptr)
++    {
++        blockCurrent(std::move(wait));
++    }
++    GuestThread *self = currentThread();
++    assert(self != nullptr);
++    self->wait = std::move(wait);
++    self->status = self->suspendCount == 0 ? EeThreadStatus::Waiting : EeThreadStatus::WaitingSuspended;
++    m_currentThreadId = 0;
++    publishSnapshot();
++    m_activeFiber->suspend();
++}
++
++void EeScheduler::fiberEntry(void *user)
++{
++    auto *self = static_cast<EeScheduler *>(user);
++    for (;;)
++    {
++        self->runPendingGuestCall();
++        // The dispatch is over; hand the executor back its stack. Resumed when
++        // this thread is scheduled again with a new pending call.
++        self->m_activeFiber->suspend();
++    }
++}
++
++// Runs on the fiber's stack. Nothing may escape it: an exception unwinding past
++// the fiber entry has no frame to land on.
++void EeScheduler::runPendingGuestCall()
++{
++    PS2Runtime::RecompiledFunction function = m_pendingFunction;
++    R5900Context *context = m_pendingContext;
++    m_pendingFunction = nullptr;
++    m_pendingContext = nullptr;
++    try
++    {
++        m_insideInterrupt = m_pendingInsideInterrupt;
++        m_guestExecuting.store(true, std::memory_order_release);
++        if (function != nullptr && context != nullptr)
++        {
++            function(m_rdram, context, &m_runtime);
++        }
++    }
++    catch (const EeDispatcherTransfer &)
++    {
++        // A block, an invocation push or a thread exit. The stack is unwound,
++        // so the next dispatch starts from the thread's saved pc again.
++    }
++    catch (...)
++    {
++        m_fiberException = std::current_exception();
++    }
++    m_guestExecuting.store(false, std::memory_order_release);
++    m_insideInterrupt = false;
++    m_dispatchedThreadId = 0;
++}
++
++void EeScheduler::enterGuest(GuestThread &thread)
++{
++    if (!thread.fiber)
++    {
++        // Sized for deeply nested guest call chains; mapped lazily, so the
++        // resident cost is only the pages a thread actually touches.
++        static const size_t stackBytes = []
++        {
++            const char *value = std::getenv("PS2X_EE_FIBER_STACK_KB");
++            const long long parsed = value ? std::atoll(value) : 0;
++            const size_t kb = parsed > 0 ? static_cast<size_t>(parsed) : 8192u;
++            return kb * 1024u;
++        }();
++        thread.fiber = std::make_unique<EeFiber>();
++        if (!thread.fiber->create(&EeScheduler::fiberEntry, this, stackBytes))
++        {
++            thread.fiber.reset();
++            throw std::runtime_error("EE scheduler could not allocate a guest fiber stack");
++        }
++    }
++
++    assert(m_activeFiber == nullptr && "guest fibers must not nest");
++    m_activeFiber = thread.fiber.get();
++    m_dispatchedThreadId = thread.id;
++    thread.inGuestCall = true;
++    m_activeFiber->resume();
++    m_activeFiber = nullptr;
++    // Cleared by the fiber when a dispatch finishes; still set means it
++    // suspended part way through and its stack is waiting to be resumed.
++    if (m_dispatchedThreadId == 0)
++    {
++        thread.inGuestCall = false;
++    }
++    // `thread` may have deleted itself; now that its fiber is suspended, the
++    // record can go.
++    if (!m_exitedThread.empty())
++    {
++        m_exitedThread = {};
++    }
++}
++
+ void EeScheduler::blockCurrent(EeWaitState wait)
+ {
+     GuestThread *self = currentThread();
+diff --git a/ps2xTest/CMakeLists.txt b/ps2xTest/CMakeLists.txt
+index 3eaa8b3..e7c9d6f 100644
+--- a/ps2xTest/CMakeLists.txt
++++ b/ps2xTest/CMakeLists.txt
+@@ -25,6 +25,7 @@ add_library(ps2_test_lib STATIC
+     src/r5900_decoder_tests.cpp
+     src/elf_analyzer_tests.cpp
+     src/pad_input_tests.cpp
++    src/ee_fiber_tests.cpp
+     src/ps2_runtime_io_tests.cpp
+     src/ps2_runtime_kernel_tests.cpp
+     src/ps2_runtime_interrupt_tests.cpp
+diff --git a/ps2xTest/src/ee_fiber_tests.cpp b/ps2xTest/src/ee_fiber_tests.cpp
+new file mode 100644
+index 0000000..568ee0a
+--- /dev/null
++++ b/ps2xTest/src/ee_fiber_tests.cpp
+@@ -0,0 +1,147 @@
++#include "MiniTest.h"
++#include "runtime/ee_fiber.h"
++
++#include <cmath>
++#include <string>
++#include <vector>
++
++// The scheduler suspends guest stacks on these instead of unwinding them, so
++// what matters is that a live C++ call chain -- locals, destructors, an
++// in-flight exception -- survives being parked and resumed.
++namespace
++{
++    struct Marker
++    {
++        int *counter;
++        explicit Marker(int *c) : counter(c) {}
++        ~Marker() { ++*counter; }
++    };
++
++    struct Ctx
++    {
++        EeFiber *fiber = nullptr;
++        long rounds = 0;
++        long observed = 0;
++        int destructed = 0;
++        bool caught = false;
++        bool deepOk = false;
++        double fp = 0.0;
++        std::string payload;
++    };
++
++    struct Boom
++    {
++    };
++
++    void deepFrames(Ctx *c, int depth)
++    {
++        Marker marker(&c->destructed);
++        std::string local = "frame-" + std::to_string(depth);
++        if (depth > 0)
++        {
++            deepFrames(c, depth - 1);
++            c->deepOk = c->deepOk && local == ("frame-" + std::to_string(depth));
++            return;
++        }
++        c->deepOk = true;
++        for (int i = 0; i < 4; ++i)
++        {
++            c->payload = "suspended-at-depth";
++            c->fiber->suspend();
++            c->deepOk = c->deepOk && c->payload == "suspended-at-depth";
++        }
++    }
++
++    void fiberBody(void *user)
++    {
++        auto *c = static_cast<Ctx *>(user);
++        for (long i = 0; i < c->rounds; ++i)
++        {
++            ++c->observed;
++            c->fiber->suspend();
++        }
++        deepFrames(c, 32);
++        c->fiber->suspend();
++        try
++        {
++            Marker marker(&c->destructed);
++            throw Boom{};
++        }
++        catch (const Boom &)
++        {
++            c->caught = true;
++        }
++        c->fiber->suspend();
++        c->fp = 0.0;
++        for (int i = 0; i < 8; ++i)
++        {
++            c->fp += std::sqrt(static_cast<double>(i + 1));
++            c->fiber->suspend();
++        }
++        for (;;)
++        {
++            c->fiber->suspend();
++        }
++    }
++} // namespace
++
++void register_ee_fiber_tests()
++{
++    MiniTest::Case("EeFiber", [](TestCase &tc)
++    {
++        tc.Run("a suspended fiber keeps its C++ stack alive", [](TestCase &t)
++        {
++            EeFiber fiber;
++            Ctx ctx;
++            ctx.fiber = &fiber;
++            ctx.rounds = 256;
++            t.IsTrue(fiber.create(fiberBody, &ctx, 1u << 20u), "create succeeds");
++            t.IsTrue(fiber.valid(), "valid after create");
++
++            for (long i = 0; i < ctx.rounds; ++i)
++                fiber.resume();
++            t.Equals(ctx.rounds, ctx.observed, "every round trip ran exactly once");
++
++            for (int i = 0; i < 5; ++i)
++                fiber.resume();
++            t.IsTrue(ctx.deepOk, "a 32-frame call chain survived being suspended");
++            t.IsTrue(ctx.payload == "suspended-at-depth", "locals intact across suspend");
++
++            const int beforeThrow = ctx.destructed;
++            fiber.resume();
++            t.IsTrue(ctx.caught, "an exception is caught inside the fiber");
++            t.IsTrue(ctx.destructed > beforeThrow, "unwinding ran destructors on the fiber stack");
++
++            for (int i = 0; i < 8; ++i)
++                fiber.resume();
++            double expected = 0.0;
++            for (int i = 0; i < 8; ++i)
++                expected += std::sqrt(static_cast<double>(i + 1));
++            t.IsTrue(std::fabs(ctx.fp - expected) < 1e-9, "FP state survives switching");
++        });
++
++        tc.Run("many fibers interleave without disturbing each other", [](TestCase &t)
++        {
++            constexpr int kCount = 32;
++            std::vector<EeFiber> fibers(kCount);
++            std::vector<Ctx> ctxs(kCount);
++            bool created = true;
++            for (int i = 0; i < kCount; ++i)
++            {
++                ctxs[i].fiber = &fibers[i];
++                ctxs[i].rounds = 40;
++                created = created && fibers[i].create(fiberBody, &ctxs[i], 256u * 1024u);
++            }
++            t.IsTrue(created, "all stacks allocated");
++
++            for (int round = 0; round < 40; ++round)
++                for (int i = 0; i < kCount; ++i)
++                    fibers[i].resume();
++
++            bool allRan = true;
++            for (int i = 0; i < kCount; ++i)
++                allRan = allRan && ctxs[i].observed == 40;
++            t.IsTrue(allRan, "each fiber advanced exactly its own count");
++        });
++    });
++}
+diff --git a/ps2xTest/src/main.cpp b/ps2xTest/src/main.cpp
+index 7b78891..10ab711 100644
+--- a/ps2xTest/src/main.cpp
++++ b/ps2xTest/src/main.cpp
+@@ -6,6 +6,7 @@ void register_code_generator_tests();
+ void register_r5900_decoder_tests();
+ void register_elf_analyzer_tests();
+ void register_pad_input_tests();
++void register_ee_fiber_tests();
+ void register_ps2_runtime_io_tests();
+ void register_ps2_runtime_kernel_tests();
+ void register_ps2_runtime_interrupt_tests();
+@@ -29,6 +30,7 @@ int main()
+     register_r5900_decoder_tests();
+     register_elf_analyzer_tests();
+     register_pad_input_tests();
++    register_ee_fiber_tests();
+     register_ps2_runtime_io_tests();
+     register_ps2_runtime_kernel_tests();
+     register_ps2_runtime_interrupt_tests();
+-- 
+2.54.0 (Apple Git-157)
+
