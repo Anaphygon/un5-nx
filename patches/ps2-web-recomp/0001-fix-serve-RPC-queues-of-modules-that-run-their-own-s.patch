@@ -1,0 +1,126 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 27 Oct 2026 11:37:56 +0700
+Subject: [PATCH 1/4] fix: serve RPC queues of modules that run their own
+ server loop
+
+Naruto Shippuden Ultimate Ninja 5's sound driver takes requests with sceSifGetNextRequest and runs them with sceSifExecRequest instead of calling sceSifRpcLoop, sleeping between requests. Both were missing, so its bind waited forever and the game stayed on a black screen after the intro. A request for a queue whose thread sleeps now wakes it as the SIF interrupt's iWakeupThread does.
+
+Not covered by a test: the IOP side has no harness yet. Checked by running UN5 to its title screen.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ runtime/src/iop/sif.cpp | 60 +++++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 58 insertions(+), 2 deletions(-)
+
+diff --git a/runtime/src/iop/sif.cpp b/runtime/src/iop/sif.cpp
+index 555a167..e3245a1 100644
+--- a/runtime/src/iop/sif.cpp
++++ b/runtime/src/iop/sif.cpp
+@@ -83,7 +83,12 @@ std::map<std::uint32_t, CmdHandler> g_cmd_handlers;
+ std::uint32_t g_sreg[32] = {};
+ std::map<std::uint32_t, int> g_iop_clients;
+ std::uint32_t g_iop_rpc_id = 1;
+-std::uint32_t g_loop_stub = 0, g_finish_stub = 0;
++std::uint32_t g_loop_stub = 0, g_finish_stub = 0, g_exec_finish_stub = 0;
++// sceSifGetNextRequest hands a request to a module that runs its own server
++// loop; sceSifExecRequest then runs it. Keyed by the server's descriptor, and
++// by the thread whose call returns to its caller once the server function has.
++std::map<std::uint32_t, Request> g_taken_requests;
++std::map<int, std::uint32_t> g_exec_returns;
+ std::uint32_t g_iop_dma_id = 1, g_ee_dma_id = 1;
+ std::uint64_t g_ee_dma_done = 0;
+ 
+@@ -122,9 +127,17 @@ void deliver_request(std::uint32_t queue) {
+     auto t = g_queue_threads.find(queue);
+     if (t == g_queue_threads.end()) return;
+     iop::kernel::Thread *th = iop::kernel::thread(t->second);
+-    if (th && th->status == iop::kernel::kWait && th->wait == iop::kernel::kWaitRpc) {
++    if (!th) return;
++    if (th->status == iop::kernel::kWait && th->wait == iop::kernel::kWaitRpc) {
+         iop::kernel::wake(*th, 0);
+         iop::kernel::reschedule();
++    } else if (th->status == iop::kernel::kWait && th->wait == iop::kernel::kWaitSleep) {
++        // A module looping on sceSifGetNextRequest sleeps between requests;
++        // the IOP's SIF interrupt wakes the queue's thread, as iWakeupThread.
++        iop::kernel::wake(*th, 0);
++        iop::kernel::reschedule();
++    } else if (th->wait != iop::kernel::kWaitRpc) {
++        ++th->wakeups;
+     }
+ }
+ 
+@@ -350,6 +363,16 @@ void rpc_finish(iop::Cpu &c) {
+     c.npc = c.pc + 4;
+ }
+ 
++void exec_finish(iop::Cpu &c) {
++    iop::kernel::Thread *t = iop::kernel::current();
++    if (!t) return;
++    rpc_finish(c);
++    auto r = g_exec_returns.find(t->id);
++    c.pc = r != g_exec_returns.end() ? r->second : 0u;
++    c.npc = c.pc + 4;
++    if (r != g_exec_returns.end()) g_exec_returns.erase(r);
++}
++
+ void install_iop_side() {
+     iop::kernel::register_job(iop::kernel::kJobSifDmaCallback, [](const iop::kernel::Job &j) { iop::kernel::call_guest(j.a, j.b); });
+     iop::kernel::register_job(iop::kernel::kJobSifReply, [](const iop::kernel::Job &) {
+@@ -360,6 +383,7 @@ void install_iop_side() {
+     });
+     g_loop_stub = iop::kernel::hle_stub(rpc_loop);
+     g_finish_stub = iop::kernel::hle_stub(rpc_finish);
++    g_exec_finish_stub = iop::kernel::hle_stub(exec_finish);
+ 
+     iop::kernel::register_hle_library("sifman", 0x0101);
+     def("sifman", 4, "sceSifDma2Init", [](iop::Cpu &c) { c.r[2] = 0; });
+@@ -469,6 +493,36 @@ void install_iop_side() {
+         g_queue_threads[arg(c, 0)] = static_cast<int>(arg(c, 1));
+         c.r[2] = 0;
+     });
++    def("sifcmd", 20, "sceSifGetNextRequest", [](iop::Cpu &c) {
++        auto &queue = g_requests[arg(c, 0)];
++        if (queue.empty()) { c.r[2] = 0; return; }
++        Request request = std::move(queue.front());
++        queue.pop_front();
++        const std::uint32_t server = request.call.server_data ^ kServerXor;
++        const Server &s = g_servers[server];
++        if (s.buf && !request.data.empty()) std::memcpy(iop::ram_ptr(s.buf), request.data.data(), request.data.size());
++        iop::write32(s.sd + 36, request.call.rpc_number);
++        g_taken_requests[s.sd] = std::move(request);
++        c.r[2] = s.sd;
++    });
++    def("sifcmd", 21, "sceSifExecRequest", [](iop::Cpu &c) {
++        iop::kernel::Thread *t = iop::kernel::current();
++        auto it = g_taken_requests.find(arg(c, 0));
++        if (!t || it == g_taken_requests.end()) { c.r[2] = 0; return; }
++        const Request request = std::move(it->second);
++        g_taken_requests.erase(it);
++        const std::uint32_t server = request.call.server_data ^ kServerXor;
++        const Server &s = g_servers[server];
++        t->rpc_server = server;
++        g_held_calls[server] = request.call;
++        g_exec_returns[t->id] = c.r[31];
++        c.r[4] = request.call.rpc_number;
++        c.r[5] = s.buf;
++        c.r[6] = request.size;
++        c.r[31] = g_exec_finish_stub;
++        c.pc = s.func;
++        c.npc = c.pc + 4;
++    });
+     def("sifcmd", 22, "sceSifRpcLoop", [](iop::Cpu &c) {
+         iop::kernel::Thread *t = iop::kernel::current();
+         if (t) t->rpc_queue = arg(c, 0);
+@@ -718,6 +772,8 @@ void reset() {
+     g_held_calls.clear();
+     g_hle_replies.clear();
+     g_requests.clear();
++    g_taken_requests.clear();
++    g_exec_returns.clear();
+     g_queue_threads.clear();
+     g_cmd_handlers.clear();
+     g_iop_clients.clear();
+-- 
+2.54.0 (Apple Git-157)
+

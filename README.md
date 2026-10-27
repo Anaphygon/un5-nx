@@ -3,8 +3,10 @@
 A native port of *Naruto Shippuden: Ultimate Ninja 5* (PlayStation 2, PAL,
 `SLES-55605`) to the **Nintendo Switch, macOS and Windows**. The game's MIPS
 code is statically recompiled to C++ with
-[PS2Recomp](https://github.com/ran-j/PS2Recomp), and the PS2 hardware it
-talked to is replaced by native code instead of being emulated.
+[ps2-web-recomp](https://github.com/snuri00/ps2-web-recomp), and the PS2
+hardware it talked to is replaced by native code instead of being emulated.
+Phases 1 and 2 were done on [PS2Recomp](https://github.com/ran-j/PS2Recomp)
+and are kept in [`archive/ps2recomp`](archive/ps2recomp).
 
 > [!IMPORTANT]
 > This repository contains **no game files** (ISO, executable, overlays, IRX
@@ -12,11 +14,11 @@ talked to is replaced by native code instead of being emulated.
 > of the game. Everything derived from your disc is built on your own
 > computer and stays there.
 
-**Status: experimental, phase 3 of 8.** The game recompiles with no errors,
-links into a macOS arm64 executable, boots its threads and IOP modules,
-loads its data and sound bank, draws the language select and takes
-keyboard or gamepad input there, plays its intro movies, takes Start on the title screen and loads its
-first overlay (`PRG/BTL.BIN`), whose code is not recompiled yet (phase 3). It is not playable.
+**Status: experimental, phase 4 of 8.** Playable on macOS (Apple silicon):
+intro movies, title, menus, battles and Master Mode with its story dialogue,
+with sound, mostly at 50 frames per second. Some jutsu sometimes leave the
+picture striped, and the frame rate drops now and then. Switch and Windows
+are not started. See [`docs/PHASE3.md`](docs/PHASE3.md).
 
 ## Read the plan
 
@@ -27,54 +29,73 @@ first overlay (`PRG/BTL.BIN`), whose code is not recompiled yet (phase 3). It is
   and what PS2Recomp already covers.
 - [`docs/PHASE1.md`](docs/PHASE1.md): phase 1, from 51,127 recompile errors
   to none, and the first run.
+- [`docs/PHASE2.md`](docs/PHASE2.md): phase 2, from a black screen to the
+  title screen, on PS2Recomp.
+- [`docs/PHASE3.md`](docs/PHASE3.md): phase 3, the overlays, on
+  ps2-web-recomp: the game plays on macOS.
 
 ## What has been found so far
 
 - The main ELF has no symbol table. Ghidra with the Emotion Engine processor
   module finds 8,709 functions.
-- Battle and adventure code are Metrowerks `MWo3` overlays that always load
-  at the same address (`0x6c6d00`). One hook in the game's post-load function
-  is enough to know which overlay is live.
+- Battle (`BTL`), adventure (`ADV`) and menu (`ETC`) code are Metrowerks
+  `MWo3` overlays of up to 2.2 MB that load at the same address
+  (`0x6c6d00`), with smaller ones after them at `0x8f3d00`. Most of their
+  functions are called through vtables in the main executable.
 - All VU1 microcode sits in one region of the main ELF
   (`0x3D57B8`-`0x3E8EB8`); the overlays carry none.
-- Audio goes through CRI ADX on the IOP (`cri_adxi.irx`, `sndbase.irx`),
-  which upstream PS2Recomp cannot play yet.
+- Audio goes through CRI ADX on the IOP (`cri_adxi.irx`, `sndbase.irx`).
+  The sound driver runs its own RPC server loop and insists that `close`
+  return the descriptor it closed.
 
-## Building (phase 1, macOS arm64)
+## Building (macOS, Apple silicon)
 
-Requirements: Xcode command line tools, CMake, Ninja, Python 3, Ghidra 12.1.4
-with [ghidra-emotionengine-reloaded](https://github.com/chaoticgd/ghidra-emotionengine-reloaded)
-installed, and your own disc.
+Requirements: Xcode command line tools, CMake, Ninja, Python 3, and your own
+disc of the PAL release. About 3 GB of disk.
 
 ```sh
-# 1. your disc: the ELF in disc/, the whole disc in build/game/
-# 2. PS2Recomp at the pinned commit with this project's patches, built
-tools/setup_ps2recomp.sh
-# 3. function map, recompile, build
-third_party/PS2Recomp/build/ps2xAnalyzer/ps2_analyzer disc/SLES_556.05 build/analysis/quick.toml
-tools/ghidra_export.sh
-python3 tools/fixmap.py build/ghidra/functions.csv build/analysis/quick.toml build/recomp
-third_party/PS2Recomp/build/ps2xRecomp/ps2_recomp build/recomp/un5.toml
-tools/build_mac.sh
+# ps2-web-recomp at the pinned commit with this project's patches, then a
+# first headless run that captures the overlays and translates the game
+tools/setup_ps2webrecomp.sh "/path/to/your/Naruto Shippuden - Ultimate Ninja 5.iso"
+# play; when it stops on code nobody has reached yet, it translates that code
+# and asks you to play again from there
+tools/un5_play.sh
+PS2_SCALE=2 tools/un5_play.sh   # 2x internal resolution (up to 3)
 ```
 
+Keyboard: Z cross, X circle, A square, S triangle, Enter start, arrows for
+the D-pad; gamepads work too. F5 saves a quick state and F9 loads it.
 Builds use half the CPU cores by default (`JOBS=` to change it).
 
 ## Tools
 
 | Tool | What it does |
 |---|---|
+| `tools/setup_ps2webrecomp.sh` | Clones ps2-web-recomp at the pinned commit, applies `patches/ps2-web-recomp` with `git am`, ports your disc |
+| `tools/un5_play.sh` | Plays the game; when it halts on untranslated code, captures the overlays, seeds entries and rebuilds |
+| `tools/un5_seed.py` | Finds overlay functions reached through pointers: vtables, constructor tables, `lui`/`addiu` |
 | `tools/elfinfo.py` | Segments, sections and symbol families of a PS2 ELF |
 | `tools/xref.py` | R5900-aware address cross-references and disassembly (rabbitizer) |
-| `tools/ghidra_export.sh` | Ghidra headless analysis and PS2Recomp function export |
-| `tools/fixmap.py` | Cleans the Ghidra map: code ranges only, functions only |
-| `tools/setup_ps2recomp.sh` | Clones PS2Recomp at the pinned commit, applies `patches/ps2recomp` with `git am`, builds the recompiler and analyzer |
-| `tools/build_mac.sh` | Copies the recompiled output into the runtime and builds it |
+| `tools/ghidra_export.sh` | Ghidra headless analysis of the executable (and the PS2Recomp function export) |
+| `tools/decompile.sh` | Decompiles the functions containing given addresses from that Ghidra project |
 
-## Fixes to PS2Recomp
+## Fixes to ps2-web-recomp
 
-Bugs found while porting this game, fixed with tests in
-`patches/ps2recomp/` (all PS2Recomp tests pass), ready to send upstream:
+In `patches/ps2-web-recomp/`, to be sent upstream (details in
+[`docs/PHASE3.md`](docs/PHASE3.md)):
+
+- The IOP had no `sceSifGetNextRequest`/`sceSifExecRequest`, so a module that
+  runs its own RPC server loop was never served.
+- The IOP's `close` returned 0 instead of the closed descriptor.
+- Code windows were cut into 16 KiB pieces instead of following the
+  executable's segments, so large overlays were never fully translated.
+- The native window gets F5/F9 quick save and load.
+
+## Fixes to PS2Recomp (phases 1 and 2)
+
+Bugs found while porting this game on PS2Recomp, fixed with tests in
+[`archive/ps2recomp/patches`](archive/ps2recomp/patches) (all PS2Recomp
+tests pass), ready to send upstream:
 
 - The analyzer replaced ordinary "store a global, then call" code with NOPs
   as self-modifying code whenever one ELF section holds code and data.
@@ -114,6 +135,9 @@ Bugs found while porting this game, fixed with tests in
 
 <table>
   <tr>
+    <td align="center"><a href="https://github.com/snuri00"><img src="https://github.com/snuri00.png?size=100" width="100" alt="snuri00"/><br/><b>Samir Nuri</b></a><br/><a href="https://github.com/snuri00/ps2-web-recomp">ps2-web-recomp</a>: the recompiler, overlay capture, GPU GS, VU1, sound and runtime the game now runs on</td>
+  </tr>
+  <tr>
     <td align="center"><a href="https://github.com/ran-j"><img src="https://github.com/ran-j.png?size=100" width="100" alt="ran-j"/><br/><b>ran-j</b></a><br/><a href="https://github.com/ran-j/PS2Recomp">PS2Recomp</a>: the static recompiler, analyzer, runtime and Ghidra export everything here is built with</td>
     <td align="center"><a href="https://github.com/YYOzcan"><img src="https://github.com/YYOzcan.png?size=100" width="100" alt="YYOzcan"/><br/><b>YYOzcan</b></a><br/><a href="https://github.com/YYOzcan/Tobiichi-Port">Tobiichi-Port</a>: the God of War port that showed the way, its installer model and runtime fork</td>
     <td align="center"><a href="https://github.com/Waffle565"><img src="https://github.com/Waffle565.png?size=100" width="100" alt="Waffle565"/><br/><b>Waffle565</b></a><br/><a href="https://github.com/Waffle565/God-Of-War-Native-Port">God-Of-War-Native-Port</a>: the native GS, VU1, IOP and sound runtime (studied, not copied)</td>
@@ -130,9 +154,13 @@ Bugs found while porting this game, fixed with tests in
 
 This project stands on other people's work:
 
+- **[ps2-web-recomp](https://github.com/snuri00/ps2-web-recomp)** by
+  **Samir Nuri** (snuri00), MIT: the static recompiler with overlay capture,
+  the GPU GS renderer, VU1 translation, SPU2 sound, IPU movies and the native
+  runner the game plays on since phase 3.
 - **[PS2Recomp](https://github.com/ran-j/PS2Recomp)** by **ran-j** and
   contributors: the static recompiler, analyzer, runtime and Ghidra export
-  script everything here is built with.
+  script phases 1 and 2 were built with.
 - **[Tobiichi-Port](https://github.com/YYOzcan/Tobiichi-Port)** by
   **YYOzcan**: the God of War port that showed the way, including the
   installer model (your disc, built on your computer) and how the generated
@@ -166,4 +194,4 @@ Nintendo. CRI ADX is a product of CRI Middleware.
 
 ## License
 
-GPL-3.0, the same as PS2Recomp. See [`LICENSE`](LICENSE).
+GPL-3.0, the same as PS2Recomp. ps2-web-recomp is MIT, which GPL-3.0 code may build on. See [`LICENSE`](LICENSE).

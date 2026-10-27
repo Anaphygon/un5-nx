@@ -1,0 +1,21 @@
+# Static constructors of SLES_556.05, from the table at 0x5E7210.
+# The game reaches them only through that table, so exploring finds one per run.
+5e3a00
+5e3b50
+5e3bc0
+5e3c30
+5e4c60
+5e4ca0
+5e4ce0
+5e4d20
+5e4e10
+5e4e70
+5e5090
+5e5110
+5e5f70
+5e5fe0
+5e6040
+5e60f0
+5e6110
+5e6160
+5e6810

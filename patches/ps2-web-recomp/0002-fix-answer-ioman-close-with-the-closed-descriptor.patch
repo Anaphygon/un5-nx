@@ -1,0 +1,36 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 27 Oct 2026 11:37:56 +0700
+Subject: [PATCH 2/4] fix: answer ioman close with the closed descriptor
+
+UN5's SNDBASE compares close's result with the descriptor it passed and retries until they match, printing "file close error!", so every sound file it read hung its loader and the game in Master Mode and battles.
+
+Not covered by a test: the IOP side has no harness yet. Checked by playing UN5's battles and Master Mode.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ runtime/src/iop/io.cpp | 8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/runtime/src/iop/io.cpp b/runtime/src/iop/io.cpp
+index c00c0bf..db7c3bd 100644
+--- a/runtime/src/iop/io.cpp
++++ b/runtime/src/iop/io.cpp
+@@ -143,7 +143,13 @@ void install_io() {
+     io::reset();
+     register_hle_library("ioman", 0x0104);
+     def("ioman", 4, "open", [](Cpu &c) { c.r[2] = static_cast<std::uint32_t>(io::open(ram_string(arg(c, 0)), arg(c, 1))); });
+-    def("ioman", 5, "close", [](Cpu &c) { c.r[2] = static_cast<std::uint32_t>(io::close(static_cast<int>(arg(c, 0)))); });
++    // ioman's close answers with the descriptor it closed: Naruto Shippuden
++    // Ultimate Ninja 5's SNDBASE compares the two and retries until they match.
++    def("ioman", 5, "close", [](Cpu &c) {
++        const int fd = static_cast<int>(arg(c, 0));
++        const int result = io::close(fd);
++        c.r[2] = static_cast<std::uint32_t>(result < 0 ? result : fd);
++    });
+     def("ioman", 6, "read", [](Cpu &c) {
+         std::vector<std::uint8_t> buffer(arg(c, 2));
+         const int n = io::read(static_cast<int>(arg(c, 0)), buffer.data(), arg(c, 2));
+-- 
+2.54.0 (Apple Git-157)
+

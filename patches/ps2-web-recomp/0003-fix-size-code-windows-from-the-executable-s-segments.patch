@@ -1,0 +1,147 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 27 Oct 2026 11:37:56 +0700
+Subject: [PATCH 3/4] fix: size code windows from the executable's segments
+
+A window was one 16 KiB unit rounded down from each empty segment, so an overlay larger than that was captured in pieces and its code past the first unit was never translated. UN5 loads three overlays of up to 2.2 MB at 0x6C6D00 and five more at 0x8F3D00, where the first ends. A window now starts at its segments' address, reaches the largest of them, and a capture keeps empty units inside the image.
+
+tests/windows_segments.py fails without this change.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ scripts/windows.py        | 38 +++++++++++++++++--------------
+ tests/README.md           |  1 +
+ tests/windows_segments.py | 47 +++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 69 insertions(+), 17 deletions(-)
+ create mode 100644 tests/windows_segments.py
+
+diff --git a/scripts/windows.py b/scripts/windows.py
+index 542fc09..d2a44da 100644
+--- a/scripts/windows.py
++++ b/scripts/windows.py
+@@ -33,27 +33,31 @@ def load_phdrs(elf):
+ 
+ 
+ def windows(elf):
+-    out = []
++    # Several overlays may share one load address (Naruto Shippuden Ultimate
++    # Ninja 5 loads BTL, ADV and ETC at 0x6C6D00, each a segment of its own
++    # size): one window per address, as large as the largest of them.
++    ends = {}
+     for v in load_phdrs(elf):
+         if v[0] != 1 or v[4] or not (v[6] & 1):  # no PT_LOAD, has contents, not executable
+             continue
+-        base = v[2] & ~(UNIT - 1)
+-        while base in [b for b, _ in out]:
+-            base += UNIT
+-        out.append((base, UNIT))
+-    return out
++        ends[v[2]] = max(ends.get(v[2], v[2]), v[2] + v[5])
++    # The window starts where the segment does, not at the unit below it:
++    # UN5's second level overlays start at 0x8F3D00, where BTL ends, and
++    # rounding both down would make the windows overlap.
++    return [(vaddr, max(UNIT, (end - vaddr + 3) & ~3)) for vaddr, end in sorted(ends.items())]
+ 
+ 
+-def extent(dump, base, cap=0x40000):
+-    # The ELF only says the window begins here; what the game unpacks decides
+-    # how far it reaches, so the image covers the units it wrote, stopping at
+-    # the first entirely empty one.
+-    size = 0
+-    while size < cap and size + UNIT <= len(dump) - base:
+-        if dump[base + size:base + size + UNIT] == b'\0' * UNIT:
++def extent(dump, base, cap):
++    # What the game unpacks decides how far an image reaches: the window up to
++    # its last unit holding anything. An overlay can have an all-zero unit in
++    # its middle, so only the empty tail is cut.
++    size = min(cap, max(0, len(dump) - base)) & ~3
++    while size > 0:
++        tail = size - (size - 1) % UNIT - 1
++        if dump[base + tail:base + size] != b'\0' * (size - tail):
+             break
+-        size += UNIT
+-    return size or UNIT
++        size = tail
++    return size or min(cap, UNIT)
+ 
+ 
+ def main() -> None:
+@@ -70,8 +74,8 @@ def main() -> None:
+     dump = open(sys.argv[3], 'rb').read()
+     outdir = sys.argv[4]
+     misses = sys.argv[5] if len(sys.argv) > 5 else None
+-    for base, _ in wins:
+-        size = extent(dump, base)
++    for base, window_size in wins:
++        size = extent(dump, base, window_size)
+         blob = dump[base:base + size]
+         if not any(blob):
+             continue
+diff --git a/tests/README.md b/tests/README.md
+index 11629b4..efe9a6c 100644
+--- a/tests/README.md
++++ b/tests/README.md
+@@ -9,6 +9,7 @@ cmake --build build/tools --target eerecomp
+ python3 tests/analysis_tailcall.py
+ python3 tests/elf_bss.py
+ python3 tests/codegen_fallthrough.py
++python3 tests/windows_segments.py
+ ```
+ 
+ Each script accepts `--recompiler /path/to/eerecomp` to check another build.
+diff --git a/tests/windows_segments.py b/tests/windows_segments.py
+new file mode 100644
+index 0000000..f6c627b
+--- /dev/null
++++ b/tests/windows_segments.py
+@@ -0,0 +1,47 @@
++#!/usr/bin/env python3
++"""Size code windows from the executable's segments, not one 16 KiB unit.
++
++Naruto Shippuden Ultimate Ninja 5 loads three overlays of different sizes at
++one address and two more right after the first, each an empty executable
++segment. A window must start where its segments do and reach as far as the
++largest of them, and a capture must keep an all-zero unit in the middle of an
++image.
++"""
++from pathlib import Path
++import importlib.util
++import struct
++
++root = Path(__file__).resolve().parents[1]
++spec = importlib.util.spec_from_file_location('windows', root / 'scripts/windows.py')
++windows = importlib.util.module_from_spec(spec)
++spec.loader.exec_module(windows)
++
++
++def elf(segments):
++    data = bytearray(52 + 32 * len(segments))
++    data[:7] = b'\x7fELF\x01\x01\x01'
++    struct.pack_into('<HHIIIIIHHHHHH', data, 16, 2, 8, 1, 0x100000, 52, 0, 0, 52, 32, len(segments), 40, 0, 0)
++    for i, (vaddr, filesz, memsz) in enumerate(segments):
++        struct.pack_into('<8I', data, 52 + 32 * i, 1, 0, vaddr, vaddr, filesz, memsz, 7, 16)
++    return bytes(data)
++
++
++image = elf([
++    (0x100000, 0x5000, 0x5000),  # the program itself has contents: no window
++    (0x106d00, 0, 0x22d000),
++    (0x106d00, 0, 0x1f4b00),
++    (0x106d00, 0, 0x29f00),
++    (0x333d00, 0, 0x30d00),
++    (0x333d00, 0, 0x34c00),
++])
++wins = windows.windows(image)
++assert wins == [(0x106d00, 0x22d000), (0x333d00, 0x34c00)], [(hex(b), hex(s)) for b, s in wins]
++
++dump = bytearray(0x380000)
++dump[0x106d00:0x106d04] = b'\x08\x00\xe0\x03'
++dump[0x106d00 + 0x9000:0x106d00 + 0x9004] = b'\x08\x00\xe0\x03'  # past an empty unit
++# The image ends with the last unit holding anything, the empty one before it kept.
++size = windows.extent(bytes(dump), 0x106d00, 0x22d000)
++assert size == 3 * windows.UNIT, hex(size)
++assert windows.extent(bytes(dump), 0x333d00, 0x34c00) == windows.UNIT
++print('Code window segment regression passed')
+-- 
+2.54.0 (Apple Git-157)
+

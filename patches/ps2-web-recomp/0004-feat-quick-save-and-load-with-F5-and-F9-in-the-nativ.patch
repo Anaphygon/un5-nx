@@ -1,0 +1,57 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 27 Oct 2026 11:37:56 +0700
+Subject: [PATCH 4/4] feat: quick save and load with F5 and F9 in the native
+ window
+
+The web page has quick state buttons; the native runner could only save at a frame given on the command line. Used to capture a battle in UN5 and replay it headless with both GS renderers.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ README.md       |  2 +-
+ host/window.cpp | 10 ++++++++++
+ 2 files changed, 11 insertions(+), 1 deletion(-)
+
+diff --git a/README.md b/README.md
+index 343b36b..f131b4d 100644
+--- a/README.md
++++ b/README.md
+@@ -83,7 +83,7 @@ The native runner, `build/native-mygame/ps2run`, plays the game in a window when
+ build/native-mygame/ps2run games/mygame/disc/SLUS_123.45 --disc games/mygame/disc.iso --window --memcard mygame.ps2
+ ```
+ 
+-`--fullscreen` starts in fullscreen and F11 switches back and forth. `--widescreen` is the 16:9 setting, and `--patches games/mygame/patches.txt` writes the patches `port.sh` collected, which it prints in the line to run. `PS2_SCALE=2` or `3` raises the internal resolution. As in the browser, the emulation, vector unit 1 and the GS each run on their own thread, which takes God of War II from 43 to 60 frames per second at the native resolution on the test laptop; `PS2_ONE_THREAD=1` puts everything back on one thread. The memory card file uses the same layout as the page's exported cards. On a Steam Deck the runner can be added to Steam as a non-Steam game, though nobody has tried it on one yet.
++`--fullscreen` starts in fullscreen and F11 switches back and forth. F5 saves the machine to `quicksave.state` in the working directory and F9 loads it back, like the page's quick state buttons; `--load-state quicksave.state` starts from it. `--widescreen` is the 16:9 setting, and `--patches games/mygame/patches.txt` writes the patches `port.sh` collected, which it prints in the line to run. `PS2_SCALE=2` or `3` raises the internal resolution. As in the browser, the emulation, vector unit 1 and the GS each run on their own thread, which takes God of War II from 43 to 60 frames per second at the native resolution on the test laptop; `PS2_ONE_THREAD=1` puts everything back on one thread. The memory card file uses the same layout as the page's exported cards. On a Steam Deck the runner can be added to Steam as a non-Steam game, though nobody has tried it on one yet.
+ 
+ ## Saves
+ 
+diff --git a/host/window.cpp b/host/window.cpp
+index 8289130..a61f154 100644
+--- a/host/window.cpp
++++ b/host/window.cpp
+@@ -1,5 +1,6 @@
+ #include "window.hpp"
+ 
++#include "ps2/state_request.hpp"
+ #include "ps2/system.hpp"
+ 
+ #include <SDL.h>
+@@ -196,6 +197,15 @@ void poll() {
+             SDL_SetWindowFullscreen(g_window, full ? 0 : SDL_WINDOW_FULLSCREEN_DESKTOP);
+             SDL_ShowCursor(full ? SDL_ENABLE : SDL_DISABLE);
+         }
++        // F5 saves the machine to quicksave.state in the working directory, F9
++        // loads it back, as the web build's quick state buttons do.
++        if (e.type == SDL_KEYDOWN && !e.key.repeat &&
++            (e.key.keysym.scancode == SDL_SCANCODE_F5 || e.key.keysym.scancode == SDL_SCANCODE_F9)) {
++            const bool loading = e.key.keysym.scancode == SDL_SCANCODE_F9;
++            ps2::request_state_operation(loading, "quicksave.state", [](bool load, bool success) {
++                std::fprintf(stderr, "[state] quick %s %s\n", load ? "load" : "save", success ? "done" : "failed");
++            });
++        }
+         if (e.type == SDL_WINDOWEVENT && e.window.event == SDL_WINDOWEVENT_SIZE_CHANGED && g_gpu_present) {
+             int w = 0, h = 0;
+             SDL_GetWindowSizeInPixels(g_window, &w, &h);
+-- 
+2.54.0 (Apple Git-157)
+
