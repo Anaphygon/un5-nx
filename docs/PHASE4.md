@@ -87,6 +87,26 @@ through title override and wait until `ps2run.log` ends in `stopped after
 8100 frames`. The `[time]` lines are the result. Without `args.txt` the NRO
 starts the game normally.
 
+### On a Switch (2026-10-27 evening)
+
+HOS 23.0.0, Atmosphère 1.12.0, stock clocks, title override, one thread,
+the bench above with `PS2_TIME=6880,20` (every 20 frames from the quick save):
+
+| Frames | Software GS | No drawing (`PS2_GS_NULL`) |
+|---|---|---|
+| 6880-7180 (VS screen, loading) | 80-500 ms | 4-100 ms |
+| 7200-7680 (fighting) | **1,050-1,700 ms** (~0.7 fps) | **96-128 ms** (~9 fps) |
+
+- On the Switch the software rasteriser is ~90% of the frame; on the M5 it
+  was negligible. The GS has to move to the GPU.
+- The rest of the machine (EE, IOP, VU1 code, texture uploads) costs about
+  110 ms per frame on one A57 core, 13-14 times the M5. Full speed needs
+  20 ms: about 5x. The render and VU threads on other cores could give
+  1.5-2x; the rest has to come from optimisation (an upload cache like the
+  WebGPU GS has, the VU1 and EE hot paths), none of it measured yet. 20-30
+  fps is a realistic aim after that work; 50 fps is not assured.
+- No crash in either run.
+
 **Decision (2026-10-27):** measure on a Switch before choosing the renderer.
 The NRO reads `args.txt` next to it, so the two runs below need no rebuild:
 the first times the whole machine with the software GS, the second without
