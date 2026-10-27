@@ -1,4 +1,4 @@
-# Phase 2: boot on the Mac (in progress)
+# Phase 2: boot on the Mac (done)
 
 Goal: reach the title screen on macOS arm64 and measure GS/VU1 cost.
 
@@ -114,22 +114,22 @@ the moment, so they wait here.
 
 ## Next
 
-1. Confirming the language plays the three intro movies (they cannot be
-   skipped in this game) and then reaches the **title screen**: its object
-   is created, its four assets load and it waits for Start for 475 frames
-   before returning to the intro loop, as on hardware.
+1. **Phase 2 is done.** Confirming the language plays the intro movies
+   (Start skips them), the title screen loads and takes Start: its menu
+   opens (title state 6), a choice is made (state 9) and the main state
+   machine moves on (state 4). The game then loads the overlay
+   `PRG/BTL.BIN` to `0x6C6D00` (`MWo3` header), its post-load hook
+   (`0x100270`) runs the overlay's static constructors and calls
+   `0x8EA080` inside it, which was never recompiled:
+   `[guest-branch:missing-target] ... target=0x8ea080`, and the main game
+   task stops. Overlays are phase 3.
 
    ![Title logo](title-logo.png)
 
-   Open: the title's background is not drawn (the screen stays black
-   apart from the logo), and Start on the title has not been confirmed
-   yet; the scripted runs that seemed to show otherwise had a zsh bug
-   (`$t:start` is a history modifier, write `${t}:start`). The movies run
-   at about 0.6x speed: rendering movie frames through the CPU GS is the
-   bottleneck, so OPENING takes over three minutes. Repeat with
-   `UN5_PAD_SCRIPT="600:cross:8"` plus Start presses after the opening.
-   `tools/decompile.sh out.c <hex addr>...` decompiles functions from the
-   phase 1 Ghidra project.
+   Still open from phase 2: the title's background is not drawn (only the
+   logo shows), and movies play at about 0.6x speed (movie frames go
+   through the CPU GS). Repeat a run to the title with
+   `UN5_PAD_SCRIPT` holding Start, built in zsh as `"${t}:start:12"`.
 2. Look at [z3xox/BT3-Recomp](https://github.com/z3xox/BT3-Recomp)'s native
    `cri_adxi` (same IOP module, GPL-3.0) and
    [ico-pc](https://github.com/nathanialf/ico-pc)'s software SPU2 (MIT) for

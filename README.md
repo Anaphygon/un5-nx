@@ -12,11 +12,11 @@ talked to is replaced by native code instead of being emulated.
 > of the game. Everything derived from your disc is built on your own
 > computer and stays there.
 
-**Status: experimental, phase 2 of 8.** The game recompiles with no errors,
+**Status: experimental, phase 3 of 8.** The game recompiles with no errors,
 links into a macOS arm64 executable, boots its threads and IOP modules,
 loads its data and sound bank, draws the language select and takes
-keyboard or gamepad input there, then plays all of its intro movies and reaches the title screen
-(its background is not drawn yet). It is not playable.
+keyboard or gamepad input there, plays its intro movies, takes Start on the title screen and loads its
+first overlay (`PRG/BTL.BIN`), whose code is not recompiled yet (phase 3). It is not playable.
 
 ## Read the plan
 
