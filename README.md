@@ -17,8 +17,11 @@ and are kept in [`archive/ps2recomp`](archive/ps2recomp).
 **Status: experimental, phase 4 of 8.** Playable on macOS (Apple silicon):
 intro movies, title, menus, battles and Master Mode with its story dialogue,
 with sound, mostly at 50 frames per second. Some jutsu sometimes leave the
-picture striped, and the frame rate drops now and then. Switch and Windows
-are not started. See [`docs/PHASE3.md`](docs/PHASE3.md).
+picture striped, and the frame rate drops now and then. See
+[`docs/PHASE3.md`](docs/PHASE3.md). On the **Switch** it builds into an NRO
+that reaches the game in an emulator, far too slowly to play yet (software
+GS on one core); see [`docs/PHASE4.md`](docs/PHASE4.md). Windows is not
+started.
 
 ## Read the plan
 
@@ -33,6 +36,8 @@ are not started. See [`docs/PHASE3.md`](docs/PHASE3.md).
   title screen, on PS2Recomp.
 - [`docs/PHASE3.md`](docs/PHASE3.md): phase 3, the overlays, on
   ps2-web-recomp: the game plays on macOS.
+- [`docs/PHASE4.md`](docs/PHASE4.md): phase 4, the Switch NRO: how to build
+  it, what it took, what is open.
 
 ## What has been found so far
 
@@ -97,6 +102,10 @@ In `patches/ps2-web-recomp/`, to be sent upstream (details in
 - The native window gets F5/F9 quick save and load.
 - Native frames were paced by the audio queue and came in bursts, which
   showed as stutter at a full frame rate.
+- The runner builds as a Nintendo Switch NRO with devkitPro (software GS),
+  and finds its files when an emulator passes no arguments.
+- `scripts/glsl.sh` translates the GS compute shaders to GLSL 4.30 for an
+  OpenGL backend.
 
 ## Fixes to PS2Recomp (phases 1 and 2)
 

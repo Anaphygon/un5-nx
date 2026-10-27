@@ -1,0 +1,41 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 27 Oct 2026 15:50:48 +0700
+Subject: [PATCH 7/8] feat: translate the GS compute shaders to GLSL 4.30
+
+scripts/glsl.sh runs naga over gs.wgsl, one file per compute entry point, and binds each storage and uniform block to its gs.wgsl binding, for an OpenGL backend on platforms without WebGPU such as the Switch. All nine shaders pass glslangValidator. No backend uses them yet.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ scripts/glsl.sh | 19 +++++++++++++++++++
+ 1 file changed, 19 insertions(+)
+ create mode 100755 scripts/glsl.sh
+
+diff --git a/scripts/glsl.sh b/scripts/glsl.sh
+new file mode 100755
+index 0000000..252f4a8
+--- /dev/null
++++ b/scripts/glsl.sh
+@@ -0,0 +1,19 @@
++#!/usr/bin/env bash
++# Translate the GS compute shaders to GLSL 4.30 for the OpenGL backend (the
++# Switch has no WebGPU), one file per entry point, with each storage and
++# uniform block bound to the binding number it has in gs.wgsl.
++#
++#   scripts/glsl.sh <out dir>      needs naga (cargo install naga-cli)
++set -euo pipefail
++here=$(cd "$(dirname "$0")" && pwd)
++out=${1:?usage: scripts/glsl.sh <out dir>}
++naga=${NAGA:-$(command -v naga || echo "$HOME/.cargo/bin/naga")}
++wgsl=$here/../runtime/src/gs/gpu/gs.wgsl
++mkdir -p "$out"
++for entry in $(sed -n '/^@compute/{n;s/^fn \([a-z_]*\).*/\1/p;}' "$wgsl"); do
++  "$naga" "$wgsl" "$out/$entry.comp" --entry-point "$entry" --shader-stage compute --profile core430 --compact
++  # naga leaves block bindings to the caller; the binding is in the member name.
++  sed -E -i.bak 's/^layout\((std430|std140)\)(.*_group_0_binding_([0-9]+)_cs)/layout(\1, binding = \3)\2/' "$out/$entry.comp"
++  rm -f "$out/$entry.comp.bak"
++done
++ls "$out"
+-- 
+2.54.0 (Apple Git-157)
+

@@ -1,0 +1,145 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 27 Oct 2026 15:50:48 +0700
+Subject: [PATCH 6/8] feat: build a Nintendo Switch NRO with the software GS
+
+With devkitPro's CMake toolchain the runner now builds as an NRO: wgpu-native has no Switch build, so the GS renders in software; GCC (devkitA64) gets fallbacks for clang's __builtin_elementwise_min and __builtin_reduce_or; getrusage and /proc are skipped; and launched from the homebrew menu with no arguments it takes game.elf, disc.iso and memcard.ps2 from its own folder, logging to ps2run.log there. devkitA64's GCC 16 honours [[clang::musttail]], which the generated code relies on.
+
+Checked: Naruto Shippuden Ultimate Ninja 5 builds into a 103 MB NRO (144 MB with bss); a macOS replay of a UN5 battle gives byte-identical frames before and after. Not yet run on a Switch or an emulator.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ CMakeLists.txt                 |  8 +++++++-
+ host/main.cpp                  | 15 +++++++++++++++
+ host/window.cpp                |  8 ++++++++
+ runtime/include/ps2/vu_ops.hpp | 20 ++++++++++++++++++--
+ 4 files changed, 48 insertions(+), 3 deletions(-)
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 6765f07..db06dd5 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -60,7 +60,8 @@ target_include_directories(ps2runtime PUBLIC runtime/include)
+ target_compile_options(ps2runtime PRIVATE -Wall -Wextra)
+ 
+ set(PS2_WGPU_DIR "${CMAKE_SOURCE_DIR}/third_party/wgpu-native" CACHE PATH "wgpu-native release folder")
+-if(EMSCRIPTEN OR EXISTS "${PS2_WGPU_DIR}/lib/libwgpu_native.a")
++# wgpu-native has no Switch build; the Switch renders with the software GS.
++if(NOT NINTENDO_SWITCH AND (EMSCRIPTEN OR EXISTS "${PS2_WGPU_DIR}/lib/libwgpu_native.a"))
+     set(PS2_GS_WGSL "${CMAKE_BINARY_DIR}/gs_wgsl.cpp")
+     add_custom_command(OUTPUT "${PS2_GS_WGSL}"
+         COMMAND ${CMAKE_COMMAND} -DSRC=${CMAKE_SOURCE_DIR}/runtime/src/gs/gpu/gs.wgsl -DOUT=${PS2_GS_WGSL} -DNAME=kGsShader -P ${CMAKE_SOURCE_DIR}/cmake/embed.cmake
+@@ -122,4 +123,9 @@ if(PS2_GENERATED)
+         target_compile_definitions(ps2run PRIVATE PS2_WINDOW)
+         target_link_libraries(ps2run PRIVATE SDL2::SDL2)
+     endif()
++    if(NINTENDO_SWITCH)
++        set(PS2_NRO_NAME "ps2-web-recomp" CACHE STRING "Title the homebrew menu shows for the NRO")
++        nx_generate_nacp(ps2run.nacp NAME "${PS2_NRO_NAME}" AUTHOR "ps2-web-recomp")
++        nx_create_nro(ps2run NACP ps2run.nacp)
++    endif()
+ endif()
+diff --git a/host/main.cpp b/host/main.cpp
+index 9e5e1e4..6cb16a2 100644
+--- a/host/main.cpp
++++ b/host/main.cpp
+@@ -31,6 +31,21 @@ int usage() {
+ }
+ 
+ int main(int argc, char **argv) {
++#ifdef __SWITCH__
++    // Launched from the homebrew menu with no arguments: the game sits next to
++    // the NRO as game.elf, disc.iso and memcard.ps2, and the log goes there too.
++    std::vector<std::string> defaults;
++    std::vector<char *> switch_argv;
++    if (argc < 2) {
++        std::string dir = argc > 0 && argv[0] ? argv[0] : "sdmc:/switch/ps2-web-recomp/";
++        dir = dir.substr(0, dir.find_last_of('/') + 1);
++        std::freopen((dir + "ps2run.log").c_str(), "w", stderr);
++        defaults = {"ps2run", dir + "game.elf", "--disc", dir + "disc.iso", "--memcard", dir + "memcard.ps2", "--window", "--fullscreen"};
++        for (std::string &a : defaults) switch_argv.push_back(a.data());
++        argc = static_cast<int>(switch_argv.size());
++        argv = switch_argv.data();
++    }
++#endif
+     if (argc < 2) return usage();
+     std::vector<std::string> args{argv[1]};
+     [[maybe_unused]] bool window = false, fullscreen = false;
+diff --git a/host/window.cpp b/host/window.cpp
+index 59d55bb..a47d90f 100644
+--- a/host/window.cpp
++++ b/host/window.cpp
+@@ -275,9 +275,13 @@ void pace() {
+ }
+ 
+ double process_cpu_seconds() {
++#ifdef __SWITCH__
++    return 0.0;  // libnx has no getrusage
++#else
+     rusage usage{};
+     getrusage(RUSAGE_SELF, &usage);
+     return static_cast<double>(usage.ru_utime.tv_sec + usage.ru_stime.tv_sec) + static_cast<double>(usage.ru_utime.tv_usec + usage.ru_stime.tv_usec) / 1e6;
++#endif
+ }
+ 
+ double resident_mb() {
+@@ -286,7 +290,11 @@ double resident_mb() {
+         if (std::fscanf(f, "%ld %ld", &pages, &resident) != 2) resident = 0;
+         std::fclose(f);
+     }
++#ifdef __SWITCH__
++    return 0.0;  // no /proc on the Switch
++#else
+     return static_cast<double>(resident) * static_cast<double>(sysconf(_SC_PAGESIZE)) / (1024.0 * 1024.0);
++#endif
+ }
+ 
+ void show_speed() {
+diff --git a/runtime/include/ps2/vu_ops.hpp b/runtime/include/ps2/vu_ops.hpp
+index da92434..cdc93e1 100644
+--- a/runtime/include/ps2/vu_ops.hpp
++++ b/runtime/include/ps2/vu_ops.hpp
+@@ -351,6 +351,22 @@ PS2_VU_INLINE std::uint32_t min(std::uint32_t a, std::uint32_t b) { return fp::m
+ typedef std::uint32_t v4u __attribute__((vector_size(16)));
+ typedef std::int32_t v4i __attribute__((vector_size(16)));
+ typedef float v4f __attribute__((vector_size(16)));
++// GCC (devkitA64 for the Switch) has neither of these clang builtins.
++PS2_VU_INLINE v4i vmin_i(v4i a, v4i b) {
++#if __has_builtin(__builtin_elementwise_min)
++    return __builtin_elementwise_min(a, b);
++#else
++    const v4i lt = a < b;
++    return (a & lt) | (b & ~lt);
++#endif
++}
++PS2_VU_INLINE bool vany(v4i mask) {
++#if __has_builtin(__builtin_reduce_or)
++    return __builtin_reduce_or(mask) != 0;
++#else
++    return (mask[0] | mask[1] | mask[2] | mask[3]) != 0;
++#endif
++}
+ 
+ PS2_VU_INLINE v4u vload(const Reg128 &r) {
+     v4u v;
+@@ -361,7 +377,7 @@ PS2_VU_INLINE void vstore(Reg128 &r, v4u v) { std::memcpy(&r, &v, 16); }
+ PS2_VU_INLINE v4u vsplat(std::uint32_t x) { return v4u{x, x, x, x}; }
+ PS2_VU_INLINE v4u vsel(v4u old, v4u now, v4u mask) { return (now & mask) | (old & ~mask); }
+ PS2_VU_INLINE v4u vfix(v4u x) {
+-    const v4i clamped = __builtin_elementwise_min((v4i)(x & 0x7FFFFFFFu), (v4i){0x7F7FFFFF, 0x7F7FFFFF, 0x7F7FFFFF, 0x7F7FFFFF});
++    const v4i clamped = vmin_i((v4i)(x & 0x7FFFFFFFu), (v4i){0x7F7FFFFF, 0x7F7FFFFF, 0x7F7FFFFF, 0x7F7FFFFF});
+     const v4i normal = (v4f)clamped >= (v4f)(v4i){0x00800000, 0x00800000, 0x00800000, 0x00800000};
+     return (x & 0x80000000u) | (v4u)(clamped & normal);
+ }
+@@ -406,7 +422,7 @@ PS2_VU_INLINE v4u vftoi(v4u x, int fraction) {
+ PS2_VU_INLINE v4u vitof(v4u x, int fraction) {
+     const v4i v = (v4i)x;
+     v4f f = __builtin_convertvector(v, v4f);
+-    if (__builtin_reduce_or((v4i)(x + 0x01000000u > 0x02000000u))) {
++    if (vany((v4i)(x + 0x01000000u > 0x02000000u))) {
+         const v4i big = f >= 2147483648.0f;
+         const v4i back = __builtin_convertvector((v4f)((v4i)f & ~big), v4i);
+         const v4i over = big | ((v >= 0) & (back > v)) | ((v < 0) & (back < v));
+-- 
+2.54.0 (Apple Git-157)
+

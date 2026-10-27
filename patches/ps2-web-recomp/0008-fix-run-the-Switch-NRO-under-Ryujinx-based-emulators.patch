@@ -1,0 +1,55 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 27 Oct 2026 16:31:44 +0700
+Subject: [PATCH 8/8] fix: run the Switch NRO under Ryujinx-based emulators
+
+Astris (Ryujinx-based) starts an NRO with no argv at all, so the folder fell back to sdmc:/switch/ps2-web-recomp/ and the game was never found; it is now sdmc:/switch/<PS2_NRO_NAME>/. Threads created after SDL has brought up the GPU never start there either: the first std::thread or 32 MB allocation after that stalls, while a small NRO creates both kinds of thread fine. Until the render and VU threads move to cores of their own, the Switch runs everything on the main thread (PS2_ONE_THREAD).
+
+Checked in Astris 1.0.14: Naruto Shippuden Ultimate Ninja 5 shows its language select, takes input and goes in game, very slowly with the software GS on one core. Headless (no SDL) it emulated 500 frames in 8 seconds there. Not run on a Switch.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ CMakeLists.txt | 1 +
+ host/main.cpp  | 9 ++++++++-
+ 2 files changed, 9 insertions(+), 1 deletion(-)
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index db06dd5..8b03325 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -125,6 +125,7 @@ if(PS2_GENERATED)
+     endif()
+     if(NINTENDO_SWITCH)
+         set(PS2_NRO_NAME "ps2-web-recomp" CACHE STRING "Title the homebrew menu shows for the NRO")
++        target_compile_definitions(ps2run PRIVATE PS2_NRO_DIR="sdmc:/switch/${PS2_NRO_NAME}/")
+         nx_generate_nacp(ps2run.nacp NAME "${PS2_NRO_NAME}" AUTHOR "ps2-web-recomp")
+         nx_create_nro(ps2run NACP ps2run.nacp)
+     endif()
+diff --git a/host/main.cpp b/host/main.cpp
+index 6cb16a2..faab00a 100644
+--- a/host/main.cpp
++++ b/host/main.cpp
+@@ -34,12 +34,19 @@ int main(int argc, char **argv) {
+ #ifdef __SWITCH__
+     // Launched from the homebrew menu with no arguments: the game sits next to
+     // the NRO as game.elf, disc.iso and memcard.ps2, and the log goes there too.
++    // Some loaders (the Ryujinx-based emulators) pass no argv[0] at all; then
++    // the folder is sdmc:/switch/<NRO name>/.
+     std::vector<std::string> defaults;
+     std::vector<char *> switch_argv;
+     if (argc < 2) {
+-        std::string dir = argc > 0 && argv[0] ? argv[0] : "sdmc:/switch/ps2-web-recomp/";
++        std::string dir = argc > 0 && argv[0] && std::strchr(argv[0], '/') ? argv[0] : PS2_NRO_DIR;
+         dir = dir.substr(0, dir.find_last_of('/') + 1);
+         std::freopen((dir + "ps2run.log").c_str(), "w", stderr);
++        std::setvbuf(stderr, nullptr, _IONBF, 0);
++        // Threads created after SDL has brought up the GPU never start under the
++        // Ryujinx-based emulators (malloc stalls); until the render and VU
++        // threads move to their own cores, emulation runs on the main thread.
++        setenv("PS2_ONE_THREAD", "1", 1);
+         defaults = {"ps2run", dir + "game.elf", "--disc", dir + "disc.iso", "--memcard", dir + "memcard.ps2", "--window", "--fullscreen"};
+         for (std::string &a : defaults) switch_argv.push_back(a.data());
+         argc = static_cast<int>(switch_argv.size());
+-- 
+2.54.0 (Apple Git-157)
+
