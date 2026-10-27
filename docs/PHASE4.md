@@ -50,6 +50,50 @@ override (hold R while opening a game) for the full memory: it needs about
 - Astris writes no log of its own here, so the NRO's `ps2run.log` (stderr,
   unbuffered) and probe NROs were the only window into it.
 
+## Measurements (M5 MacBook Air, a battle replayed headless)
+
+`PS2_TIME=7500,200` from a quick save at the battle's VS screen, with the
+same scripted input each time:
+
+| Configuration | ms per frame | slowest frame |
+|---|---|---|
+| Software GS | 93 | 288 |
+| Software GS, no primitives drawn (`PS2_GS_NULL`) | 93 | 430 |
+| WebGPU GS | 20.5 | 64 |
+| WebGPU GS, battle VU1 programs translated | **12.5** | 57 |
+| Software GS, battle VU1 programs translated | 85 | 305 |
+
+- Only 7 VU1 programs (intro and title) had been recorded; a battle uses 39.
+  Left to the interpreter they cost the WebGPU run 40% of its frame time.
+  `tools/un5_play.sh` now records new VU1 programs every session and
+  translates them.
+- In the software GS, drawing costs little. Two thirds of the time is the
+  textures UN5 uploads again every frame, written pixel by pixel into GS
+  memory (`dmac → vif → gif::render → write_pixel`). The WebGPU GS skips
+  uploads whose content it already holds; the software GS has no such cache.
+- The WebGPU GS spends 77% of its GPU time in `raster`, the compute shader
+  that rasterises every primitive. A Switch GPU is roughly a tenth of the
+  M5's, so the same design would land around 4 to 10 frames per second
+  there. That is an estimate, not a measurement.
+
+Checked in Astris (the NRO's ARM code runs on the M5's CPU there): the
+software-GS bench gives 90 ms per frame, as on the Mac, so the bench itself
+works end to end; only a Switch gives the numbers that decide.
+
+To run it on a Switch, copy into `sdmc:/switch/un5-nx/` the NRO, `game.elf`,
+`disc.iso`, the quick save `battle.state` and one of the two argument files
+as `args.txt` (`args-full.txt` first, then `args-null.txt`), start the NRO
+through title override and wait until `ps2run.log` ends in `stopped after
+8100 frames`. The `[time]` lines are the result. Without `args.txt` the NRO
+starts the game normally.
+
+**Decision (2026-10-27):** measure on a Switch before choosing the renderer.
+The NRO reads `args.txt` next to it, so the two runs below need no rebuild:
+the first times the whole machine with the software GS, the second without
+drawing. If the second is already slower than 20 ms per frame, the CPU side
+has to get faster before any renderer matters; if not, a hardware-rasterising
+GL renderer (PCSX2-style) is the way to full speed.
+
 ## Open
 
 - **Threads after SDL.** In the emulator, the first `std::thread` (or 32 MB

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Tue, 27 Oct 2026 16:31:44 +0700
-Subject: [PATCH 8/8] fix: run the Switch NRO under Ryujinx-based emulators
+Subject: [PATCH 8/9] fix: run the Switch NRO under Ryujinx-based emulators
 
 Astris (Ryujinx-based) starts an NRO with no argv at all, so the folder fell back to sdmc:/switch/ps2-web-recomp/ and the game was never found; it is now sdmc:/switch/<PS2_NRO_NAME>/. Threads created after SDL has brought up the GPU never start there either: the first std::thread or 32 MB allocation after that stalls, while a small NRO creates both kinds of thread fine. Until the render and VU threads move to cores of their own, the Switch runs everything on the main thread (PS2_ONE_THREAD).
 

@@ -1,0 +1,105 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 27 Oct 2026 16:55:40 +0700
+Subject: [PATCH 9/9] feat: tools to measure a run on a console
+
+PS2_TIME=from,count now reports every window of count frames, with the slowest frame in it, instead of one window. PS2_GS_NULL drops every primitive, to time the rest of the machine alone. On the Switch, args.txt next to the NRO replaces the default options, one per line, with NAME=value lines setting environment variables and $DIR/ standing for the NRO's folder, so a measurement needs no rebuild.
+
+Used on a UN5 battle replayed headless on an M5: software GS 93 ms per frame, the same with PS2_GS_NULL (most of it is texture uploads written pixel by pixel), WebGPU GS 20.5 ms; recording the battle's VU1 programs and translating them took the WebGPU run to 12.5 ms.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ host/main.cpp          | 17 +++++++++++++++++
+ runtime/src/gs/gs.cpp  |  4 +++-
+ runtime/src/system.cpp | 26 ++++++++++++++++++--------
+ 3 files changed, 38 insertions(+), 9 deletions(-)
+
+diff --git a/host/main.cpp b/host/main.cpp
+index faab00a..92e1502 100644
+--- a/host/main.cpp
++++ b/host/main.cpp
+@@ -48,6 +48,23 @@ int main(int argc, char **argv) {
+         // threads move to their own cores, emulation runs on the main thread.
+         setenv("PS2_ONE_THREAD", "1", 1);
+         defaults = {"ps2run", dir + "game.elf", "--disc", dir + "disc.iso", "--memcard", dir + "memcard.ps2", "--window", "--fullscreen"};
++        // args.txt next to the NRO replaces the options after game.elf, one per
++        // line; NAME=value lines set environment variables, and $DIR/ stands
++        // for the NRO's folder.
++        if (std::FILE *f = std::fopen((dir + "args.txt").c_str(), "r")) {
++            defaults.resize(2);
++            char line[512];
++            while (std::fgets(line, sizeof line, f)) {
++                std::string a(line);
++                while (!a.empty() && (a.back() == '\n' || a.back() == '\r' || a.back() == ' ')) a.pop_back();
++                if (a.empty() || a[0] == '#') continue;
++                for (std::size_t at; (at = a.find("$DIR/")) != std::string::npos;) a.replace(at, 5, dir);
++                const std::size_t eq = a.find('=');
++                if (a[0] != '-' && eq != std::string::npos) setenv(a.substr(0, eq).c_str(), a.substr(eq + 1).c_str(), 1);
++                else defaults.push_back(a);
++            }
++            std::fclose(f);
++        }
+         for (std::string &a : defaults) switch_argv.push_back(a.data());
+         argc = static_cast<int>(switch_argv.size());
+         argv = switch_argv.data();
+diff --git a/runtime/src/gs/gs.cpp b/runtime/src/gs/gs.cpp
+index db64ba3..0c43f3c 100644
+--- a/runtime/src/gs/gs.cpp
++++ b/runtime/src/gs/gs.cpp
+@@ -485,7 +485,9 @@ void kick(bool draw) {
+     const int needed = prim == 0 ? 1 : (prim == 1 || prim == 2 || prim == 6) ? 2 : prim == 7 ? 1 : 3;
+     if (s.count < needed) return;
+     if (draw) {
+-        if (cpu_raster()) raster::draw(s, s.queue, needed);
++        // PS2_GS_NULL drops every primitive, to time the rest of the machine alone.
++        static const bool null_gs = std::getenv("PS2_GS_NULL") != nullptr;
++        if (cpu_raster() && !null_gs) raster::draw(s, s.queue, needed);
+ #ifdef PS2_GPU
+         if (gpu_on()) gpu::draw(s, s.queue, needed);
+ #endif
+diff --git a/runtime/src/system.cpp b/runtime/src/system.cpp
+index 47d89be..81628c8 100644
+--- a/runtime/src/system.cpp
++++ b/runtime/src/system.cpp
+@@ -134,20 +134,30 @@ void apply_presses() {
+     }
+ }
+ 
++// PS2_TIME=from[,count] reports the wall time per frame over each window of
++// count frames from frame `from` on, with the slowest frame of the window.
+ void time_frames() {
+     static const char *spec = std::getenv("PS2_TIME");
+     if (!spec) return;
+     static const std::uint64_t from = std::strtoull(spec, nullptr, 10);
+-    static const std::uint64_t count = std::strchr(spec, ',') ? std::strtoull(std::strchr(spec, ',') + 1, nullptr, 10) : 500;
+-    static std::chrono::steady_clock::time_point start;
++    static const std::uint64_t count = std::max<std::uint64_t>(std::strchr(spec, ',') ? std::strtoull(std::strchr(spec, ',') + 1, nullptr, 10) : 500, 1);
++    static std::chrono::steady_clock::time_point start, last;
++    static double slowest = 0.0;
++    if (g_frames < from) return;
++    gs::flush_and_wait();
++    const auto now = std::chrono::steady_clock::now();
+     if (g_frames == from) {
+-        gs::flush_and_wait();
+-        start = std::chrono::steady_clock::now();
+-    } else if (g_frames == from + count) {
+-        gs::flush_and_wait();
+-        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+-        std::fprintf(stderr, "[time] frames %llu-%llu: %.2f ms per frame\n", static_cast<unsigned long long>(from), static_cast<unsigned long long>(from + count), ms / static_cast<double>(count));
++        start = last = now;
++        return;
+     }
++    slowest = std::max(slowest, std::chrono::duration<double, std::milli>(now - last).count());
++    last = now;
++    if ((g_frames - from) % count) return;
++    const double ms = std::chrono::duration<double, std::milli>(now - start).count();
++    std::fprintf(stderr, "[time] frames %llu-%llu: %.2f ms per frame, slowest %.2f ms\n", static_cast<unsigned long long>(g_frames - count),
++                 static_cast<unsigned long long>(g_frames), ms / static_cast<double>(count), slowest);
++    start = now;
++    slowest = 0.0;
+ }
+ 
+ void apply_patches(bool boot) {
+-- 
+2.54.0 (Apple Git-157)
+
