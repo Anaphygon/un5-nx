@@ -13,7 +13,7 @@ drawn in software on one CPU core. Nothing has run on a Switch yet.
 | Boots in an emulator (Astris 1.0.14, Ryujinx-based, Apple silicon) | done: language select, in game |
 | Runs on a Switch | not tried |
 | GS on the Switch GPU (OpenGL 4.3 compute) | shaders translated (patch 0007), backend not written |
-| Render and VU threads on cores of their own | blocked, see below |
+| Render and VU threads | runs on a Switch since patch 0010 |
 
 ## Building
 
@@ -116,14 +116,15 @@ GL renderer (PCSX2-style) is the way to full speed.
 
 ## Open
 
-- **Threads after SDL.** In the emulator, the first `std::thread` (or 32 MB
-  allocation) after SDL has brought up the GPU never returns, while a small
-  NRO creates libnx and `std::thread` threads fine, and the game runs
-  headless (no SDL) at about 60 frames per second there. Every stall was in an
-  allocation, which points at the allocator lock and a thread SDL or mesa
-  started. For now the Switch runs on one thread (`PS2_ONE_THREAD`). Next:
-  create the render and VU threads before SDL starts, or with libnx on other
-  cores.
+- **Threads (fixed, patch 0010).** The "stall after SDL" was `std::thread::detach`
+  throwing: libnx has no `pthread_detach`, the exception went uncaught and the
+  runner aborted. Astris showed that as an endless "Starting game", a Switch
+  as an Atmosphère crash report (main thread: `run_window → detach →
+  __cxa_throw → abort`). The Switch now runs the threaded runner: a battle
+  shows at 1-8 fps with the software GS; overclocking the CPU to 1785 MHz
+  barely changes that, since rasterising dominates.
+- **Audio on the Switch**: the speed line reports 0 ms of queued sound; not
+  looked at yet.
 - **GS on the GPU.** `scripts/glsl.sh` turns the nine compute shaders into
   GLSL 4.30 that passes glslangValidator; `gpu.cpp`'s wgpu calls sit in about
   seven functions (buffers, dispatch, submit, read back, present), so an

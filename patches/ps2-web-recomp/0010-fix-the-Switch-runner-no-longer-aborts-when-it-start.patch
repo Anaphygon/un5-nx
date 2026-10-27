@@ -1,0 +1,88 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 27 Oct 2026 21:14:21 +0700
+Subject: [PATCH 10/10] fix: the Switch runner no longer aborts when it starts
+ its VU thread
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+libnx has no pthread_detach, so std::thread::detach threw, nothing caught it, and the runner aborted right after opening the window: an Atmosphère crash report on a Switch (main thread: run_window -> std::thread::detach -> __cxa_throw -> abort), and an endless 'Starting game' in Astris that looked like a stall in malloc. On the Switch the VU thread object is now kept alive until std::_Exit, so the runner keeps its threads there too, and the forced single-thread mode is gone. The window's speed line also goes to the log every 5 s on the Switch, which has no title bar, and NAME= in args.txt unsets a variable.
+
+Checked on a Switch (HOS 23.0.0): the threaded runner shows a UN5 battle, at 1-8 fps with the software GS.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ host/main.cpp   | 13 ++++++-------
+ host/window.cpp | 14 ++++++++++++++
+ 2 files changed, 20 insertions(+), 7 deletions(-)
+
+diff --git a/host/main.cpp b/host/main.cpp
+index 92e1502..6ebf6bb 100644
+--- a/host/main.cpp
++++ b/host/main.cpp
+@@ -43,14 +43,10 @@ int main(int argc, char **argv) {
+         dir = dir.substr(0, dir.find_last_of('/') + 1);
+         std::freopen((dir + "ps2run.log").c_str(), "w", stderr);
+         std::setvbuf(stderr, nullptr, _IONBF, 0);
+-        // Threads created after SDL has brought up the GPU never start under the
+-        // Ryujinx-based emulators (malloc stalls); until the render and VU
+-        // threads move to their own cores, emulation runs on the main thread.
+-        setenv("PS2_ONE_THREAD", "1", 1);
+         defaults = {"ps2run", dir + "game.elf", "--disc", dir + "disc.iso", "--memcard", dir + "memcard.ps2", "--window", "--fullscreen"};
+         // args.txt next to the NRO replaces the options after game.elf, one per
+-        // line; NAME=value lines set environment variables, and $DIR/ stands
+-        // for the NRO's folder.
++        // line; NAME=value lines set environment variables (NAME= unsets one),
++        // and $DIR/ stands for the NRO's folder.
+         if (std::FILE *f = std::fopen((dir + "args.txt").c_str(), "r")) {
+             defaults.resize(2);
+             char line[512];
+@@ -60,7 +56,10 @@ int main(int argc, char **argv) {
+                 if (a.empty() || a[0] == '#') continue;
+                 for (std::size_t at; (at = a.find("$DIR/")) != std::string::npos;) a.replace(at, 5, dir);
+                 const std::size_t eq = a.find('=');
+-                if (a[0] != '-' && eq != std::string::npos) setenv(a.substr(0, eq).c_str(), a.substr(eq + 1).c_str(), 1);
++                if (a[0] != '-' && eq != std::string::npos) {
++                    if (eq + 1 == a.size()) unsetenv(a.substr(0, eq).c_str());
++                    else setenv(a.substr(0, eq).c_str(), a.substr(eq + 1).c_str(), 1);
++                }
+                 else defaults.push_back(a);
+             }
+             std::fclose(f);
+diff --git a/host/window.cpp b/host/window.cpp
+index a47d90f..3dfc547 100644
+--- a/host/window.cpp
++++ b/host/window.cpp
+@@ -315,6 +315,14 @@ void show_speed() {
+     std::snprintf(title, sizeof title, "ps2-web-recomp  %.1f fps  CPU %.0f%%  GPU %.0f%%  RAM %.0f MB  audio %.0f ms", static_cast<double>(frames) / seconds,
+                   (cpu - cpu_start) / seconds * 100.0, (gpu - gpu_start) / (seconds * 10.0), resident_mb(), queued);
+     SDL_SetWindowTitle(g_window, title);
++#ifdef __SWITCH__
++    // The Switch shows no title bar; the log gets the same line every 5 s.
++    static int seconds_since_log = 0;
++    if (++seconds_since_log >= 5) {
++        std::fprintf(stderr, "[speed] %s\n", title);
++        seconds_since_log = 0;
++    }
++#endif
+     start = now;
+     frames = 0;
+     cpu_start = cpu;
+@@ -380,7 +388,13 @@ int run_window(const std::function<int()> &emulate) {
+     ps2::start_render_thread();
+     if (!std::getenv("PS2_NO_VU_THREAD")) {
+         ps2::start_vu_thread();
++#ifdef __SWITCH__
++        // libnx has no pthread_detach, so std::thread::detach throws and the
++        // runner aborted here. The thread lives until std::_Exit below.
++        new std::thread(ps2::run_vu_thread);
++#else
+         std::thread(ps2::run_vu_thread).detach();
++#endif
+     }
+     std::atomic<bool> done{false};
+     int result = 0;
+-- 
+2.54.0 (Apple Git-157)
+
