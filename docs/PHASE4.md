@@ -12,7 +12,8 @@ drawn in software on one CPU core. Nothing has run on a Switch yet.
 | NRO packaging; finds its files next to itself on the SD card | done, patches 0006 and 0008 |
 | Boots in an emulator (Astris 1.0.14, Ryujinx-based, Apple silicon) | done: language select, in game |
 | Runs on a Switch | not tried |
-| GS on the Switch GPU (OpenGL 4.3 compute) | shaders translated (patch 0007), backend not written |
+| GS on the Switch GPU (OpenGL 4.3 compute) | works, patch 0011: correct picture, 2.5-3.3 fps in battle |
+| A hardware-rasterising GS renderer | not started: the way to a playable frame rate |
 | Render and VU threads | runs on a Switch since patch 0010 |
 
 ## Building
@@ -125,9 +126,13 @@ GL renderer (PCSX2-style) is the way to full speed.
   barely changes that, since rasterising dominates.
 - **Audio on the Switch**: the speed line reports 0 ms of queued sound; not
   looked at yet.
-- **GS on the GPU.** `scripts/glsl.sh` turns the nine compute shaders into
-  GLSL 4.30 that passes glslangValidator; `gpu.cpp`'s wgpu calls sit in about
-  seven functions (buffers, dispatch, submit, read back, present), so an
-  OpenGL device beside the wgpu one is the plan.
+- **GS on the GPU (patch 0011).** The compute shaders run on the Switch GPU
+  (NV120, Mesa 20.1, GL 4.3 core) through a surfaceless EGL context; the
+  picture is correct. In battle: 2.5-3.3 fps with the GPU busy ~58% of the
+  time, i.e. ~190 ms of GPU work per frame (loading screens reach ~24 fps).
+  The compute rasteriser (77% of GPU time on the M5) is too heavy for this
+  GPU at any level of polish; a hardware-rasterising renderer, as PCSX2's
+  and AetherSX2's, turning GS primitives into GL triangles, is the way to a
+  playable frame rate. The EGL context, buffers and loader carry over.
 - Emulator frame rates say nothing about the Switch: Astris runs the NRO's
   ARM code directly on the Mac's CPU.

@@ -1,0 +1,4107 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 27 Oct 2026 21:48:54 +0700
+Subject: [PATCH 11/11] feat: run the GS compute shaders on OpenGL 4.3 for the
+ Switch
+
+The Switch has no WebGPU. gl_device.inc and gl_public.inc give gpu.cpp an OpenGL device: its own surfaceless EGL context (made current around GL work, so SDL keeps its own), storage buffers at the WGSL bindings, the parameter record bound per dispatch, a memory barrier between dispatches, zeroed buffers, synchronous read back, and GL_TIME_ELAPSED queries feeding busy_ms. The shaders are gs.wgsl translated by scripts/glsl.sh and committed under glsl/, so a build needs no naga. gpu.cpp's WebGPU-only parts sit behind PS2_GL; the WebGPU build gives byte-identical frames on a UN5 battle replay.
+
+On a Switch (NV120, Mesa 20.1, GL 4.3 core) it renders UN5 correctly at 2.5-3.3 fps in battle, with the GPU busy about 58% of the time: about 190 ms of GPU work per frame. A compute rasteriser is too heavy for that GPU; this device is the base for a hardware-rasterising one.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ CMakeLists.txt                          |   23 +-
+ runtime/src/gs/gpu/gl_device.inc        |  241 ++++
+ runtime/src/gs/gpu/gl_public.inc        |   66 +
+ runtime/src/gs/gpu/glsl/copy_read.comp  |  217 ++++
+ runtime/src/gs/gpu/glsl/copy_write.comp |  241 ++++
+ runtime/src/gs/gpu/glsl/decode.comp     |  429 +++++++
+ runtime/src/gs/gpu/glsl/display.comp    |  247 ++++
+ runtime/src/gs/gpu/glsl/load_clut.comp  |  279 +++++
+ runtime/src/gs/gpu/glsl/raster.comp     | 1518 +++++++++++++++++++++++
+ runtime/src/gs/gpu/glsl/resolve.comp    |   74 ++
+ runtime/src/gs/gpu/glsl/snapshot.comp   |   75 ++
+ runtime/src/gs/gpu/glsl/upload.comp     |  329 +++++
+ runtime/src/gs/gpu/gpu.cpp              |   62 +-
+ 13 files changed, 3794 insertions(+), 7 deletions(-)
+ create mode 100644 runtime/src/gs/gpu/gl_device.inc
+ create mode 100644 runtime/src/gs/gpu/gl_public.inc
+ create mode 100644 runtime/src/gs/gpu/glsl/copy_read.comp
+ create mode 100644 runtime/src/gs/gpu/glsl/copy_write.comp
+ create mode 100644 runtime/src/gs/gpu/glsl/decode.comp
+ create mode 100644 runtime/src/gs/gpu/glsl/display.comp
+ create mode 100644 runtime/src/gs/gpu/glsl/load_clut.comp
+ create mode 100644 runtime/src/gs/gpu/glsl/raster.comp
+ create mode 100644 runtime/src/gs/gpu/glsl/resolve.comp
+ create mode 100644 runtime/src/gs/gpu/glsl/snapshot.comp
+ create mode 100644 runtime/src/gs/gpu/glsl/upload.comp
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 8b03325..82cb701 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -60,7 +60,7 @@ target_include_directories(ps2runtime PUBLIC runtime/include)
+ target_compile_options(ps2runtime PRIVATE -Wall -Wextra)
+ 
+ set(PS2_WGPU_DIR "${CMAKE_SOURCE_DIR}/third_party/wgpu-native" CACHE PATH "wgpu-native release folder")
+-# wgpu-native has no Switch build; the Switch renders with the software GS.
++# wgpu-native has no Switch build; the Switch uses the OpenGL device below.
+ if(NOT NINTENDO_SWITCH AND (EMSCRIPTEN OR EXISTS "${PS2_WGPU_DIR}/lib/libwgpu_native.a"))
+     set(PS2_GS_WGSL "${CMAKE_BINARY_DIR}/gs_wgsl.cpp")
+     add_custom_command(OUTPUT "${PS2_GS_WGSL}"
+@@ -84,6 +84,27 @@ if(NOT NINTENDO_SWITCH AND (EMSCRIPTEN OR EXISTS "${PS2_WGPU_DIR}/lib/libwgpu_na
+     endif()
+ endif()
+ 
++# The Switch has no WebGPU: the same compute shaders, translated to GLSL 4.30
++# by scripts/glsl.sh, run on OpenGL through mesa.
++if(NINTENDO_SWITCH)
++    set(PS2_GLSL_SOURCES)
++    foreach(entry upload copy_read copy_write load_clut display raster resolve snapshot decode)
++        set(out "${CMAKE_BINARY_DIR}/glsl_${entry}.cpp")
++        add_custom_command(OUTPUT "${out}"
++            COMMAND ${CMAKE_COMMAND} -DSRC=${CMAKE_SOURCE_DIR}/runtime/src/gs/gpu/glsl/${entry}.comp -DOUT=${out} -DNAME=kGlsl_${entry} -P ${CMAKE_SOURCE_DIR}/cmake/embed.cmake
++            DEPENDS runtime/src/gs/gpu/glsl/${entry}.comp cmake/embed.cmake)
++        list(APPEND PS2_GLSL_SOURCES "${out}")
++    endforeach()
++    find_path(PS2_EGL_INCLUDE EGL/egl.h REQUIRED)
++    find_library(PS2_EGL EGL REQUIRED)
++    find_library(PS2_GLAPI glapi REQUIRED)
++    find_library(PS2_DRM_NOUVEAU drm_nouveau REQUIRED)
++    target_sources(ps2runtime PRIVATE runtime/src/gs/gpu/gpu.cpp ${PS2_GLSL_SOURCES})
++    target_include_directories(ps2runtime PRIVATE "${PS2_EGL_INCLUDE}")
++    target_compile_definitions(ps2runtime PUBLIC PS2_GPU PS2_GL)
++    target_link_libraries(ps2runtime PUBLIC ${PS2_EGL} ${PS2_GLAPI} ${PS2_DRM_NOUVEAU})
++endif()
++
+ if(PS2_GENERATED)
+     file(GLOB PS2_UNITS CONFIGURE_DEPENDS "${PS2_GENERATED}/*.cpp")
+     add_library(ps2game STATIC ${PS2_UNITS})
+diff --git a/runtime/src/gs/gpu/gl_device.inc b/runtime/src/gs/gpu/gl_device.inc
+new file mode 100644
+index 0000000..3c30482
+--- /dev/null
++++ b/runtime/src/gs/gpu/gl_device.inc
+@@ -0,0 +1,241 @@
++// OpenGL 4.3 device for the GS compute shaders, for platforms without WebGPU
++// (the Switch, through mesa). Included by gpu.cpp inside its anonymous
++// namespace in place of the WebGPU device code; the shaders are gs.wgsl
++// translated by scripts/glsl.sh, one program per entry point.
++
++#define PS2_GL_FUNCTIONS(X)                                         \
++    X(PFNGLGETSTRINGPROC, glGetString)                              \
++    X(PFNGLGETINTEGERVPROC, glGetIntegerv)                          \
++    X(PFNGLGETERRORPROC, glGetError)                                \
++    X(PFNGLGENBUFFERSPROC, glGenBuffers)                            \
++    X(PFNGLDELETEBUFFERSPROC, glDeleteBuffers)                      \
++    X(PFNGLBINDBUFFERPROC, glBindBuffer)                            \
++    X(PFNGLBUFFERDATAPROC, glBufferData)                            \
++    X(PFNGLBUFFERSUBDATAPROC, glBufferSubData)                      \
++    X(PFNGLGETBUFFERSUBDATAPROC, glGetBufferSubData)                \
++    X(PFNGLCLEARBUFFERDATAPROC, glClearBufferData)                  \
++    X(PFNGLBINDBUFFERBASEPROC, glBindBufferBase)                    \
++    X(PFNGLBINDBUFFERRANGEPROC, glBindBufferRange)                  \
++    X(PFNGLCREATESHADERPROC, glCreateShader)                        \
++    X(PFNGLSHADERSOURCEPROC, glShaderSource)                        \
++    X(PFNGLCOMPILESHADERPROC, glCompileShader)                      \
++    X(PFNGLGETSHADERIVPROC, glGetShaderiv)                          \
++    X(PFNGLGETSHADERINFOLOGPROC, glGetShaderInfoLog)                \
++    X(PFNGLDELETESHADERPROC, glDeleteShader)                        \
++    X(PFNGLCREATEPROGRAMPROC, glCreateProgram)                      \
++    X(PFNGLATTACHSHADERPROC, glAttachShader)                        \
++    X(PFNGLLINKPROGRAMPROC, glLinkProgram)                          \
++    X(PFNGLGETPROGRAMIVPROC, glGetProgramiv)                        \
++    X(PFNGLGETPROGRAMINFOLOGPROC, glGetProgramInfoLog)              \
++    X(PFNGLUSEPROGRAMPROC, glUseProgram)                            \
++    X(PFNGLDISPATCHCOMPUTEPROC, glDispatchCompute)                  \
++    X(PFNGLMEMORYBARRIERPROC, glMemoryBarrier)                      \
++    X(PFNGLFINISHPROC, glFinish)                                    \
++    X(PFNGLFLUSHPROC, glFlush)                                      \
++    X(PFNGLGENQUERIESPROC, glGenQueries)                            \
++    X(PFNGLBEGINQUERYPROC, glBeginQuery)                            \
++    X(PFNGLENDQUERYPROC, glEndQuery)                                \
++    X(PFNGLGETQUERYOBJECTIVPROC, glGetQueryObjectiv)                \
++    X(PFNGLGETQUERYOBJECTUI64VPROC, glGetQueryObjectui64v)
++
++#define PS2_GL_DECLARE(type, name) type name = nullptr;
++PS2_GL_FUNCTIONS(PS2_GL_DECLARE)
++#undef PS2_GL_DECLARE
++
++EGLDisplay g_egl_display = EGL_NO_DISPLAY;
++EGLContext g_egl_context = EGL_NO_CONTEXT;
++GLuint g_programs[kPipelines] = {};
++
++// GPU time per submit, from a ring of GL_TIME_ELAPSED queries read once their
++// results are in, as WebGPU's timestamp queries feed busy_ms().
++constexpr int kTimers = 8;
++GLuint g_timers[kTimers] = {};
++bool g_timer_busy[kTimers] = {};
++int g_timer_next = 0;
++
++void collect_timers() {
++    for (int i = 0; i < kTimers; ++i) {
++        if (!g_timer_busy[i]) continue;
++        GLint ready = 0;
++        glGetQueryObjectiv(g_timers[i], GL_QUERY_RESULT_AVAILABLE, &ready);
++        if (!ready) continue;
++        GLuint64 ns = 0;
++        glGetQueryObjectui64v(g_timers[i], GL_QUERY_RESULT, &ns);
++        g_measured_ns += ns;
++        ++g_measured;
++        g_timer_busy[i] = false;
++    }
++}
++
++// The window (SDL) keeps its own context current on the render thread. Every
++// stretch of GL work runs under ours and hands SDL's back afterwards.
++struct Current {
++    EGLDisplay display = eglGetCurrentDisplay();
++    EGLSurface draw = eglGetCurrentSurface(EGL_DRAW), read = eglGetCurrentSurface(EGL_READ);
++    EGLContext context = eglGetCurrentContext();
++    Current() {
++        if (context != g_egl_context) eglMakeCurrent(g_egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, g_egl_context);
++    }
++    ~Current() {
++        if (context == g_egl_context) return;
++        if (context == EGL_NO_CONTEXT) eglMakeCurrent(g_egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
++        else eglMakeCurrent(display, draw, read, context);
++    }
++};
++
++// WebGPU hands out zeroed buffers and the shaders rely on it.
++Buffer make_buffer(std::uint64_t size) {
++    Current gl;
++    GLuint b = 0;
++    glGenBuffers(1, &b);
++    glBindBuffer(GL_COPY_WRITE_BUFFER, b);
++    glBufferData(GL_COPY_WRITE_BUFFER, static_cast<GLsizeiptr>(size), nullptr, GL_DYNAMIC_COPY);
++    glClearBufferData(GL_COPY_WRITE_BUFFER, GL_R32UI, GL_RED_INTEGER, GL_UNSIGNED_INT, nullptr);
++    return b;
++}
++
++void release_buffer(Buffer &b) {
++    if (!b) return;
++    Current gl;
++    glDeleteBuffers(1, &b);
++    b = 0;
++}
++
++void write_buffer(Buffer b, std::uint64_t offset, const void *data, std::uint64_t size) {
++    if (!size) return;
++    Current gl;
++    glBindBuffer(GL_COPY_WRITE_BUFFER, b);
++    glBufferSubData(GL_COPY_WRITE_BUFFER, static_cast<GLintptr>(offset), static_cast<GLsizeiptr>(size), data);
++}
++
++void ensure_capacity() {
++    const std::uint64_t data_bytes = std::max<std::uint64_t>(g_arena.size() * 4, 16);
++    if (data_bytes > g_data_size) {
++        release_buffer(g_data);
++        g_data_size = std::max<std::uint64_t>(g_data_size * 2, (data_bytes + (4u << 20) - 1) & ~((4ull << 20) - 1));
++        g_data = make_buffer(g_data_size);
++    }
++    const std::uint64_t param_bytes = std::max<std::uint64_t>(g_param_records.size(), 1) * kParamStride;
++    if (param_bytes > g_params_size) {
++        release_buffer(g_params);
++        g_params_size = std::max<std::uint64_t>(g_params_size * 2, std::max<std::uint64_t>(param_bytes, 64 * 1024));
++        g_params = make_buffer(g_params_size);
++    }
++}
++
++// Binding 2 (the parameters) is bound per dispatch, at the command's record.
++void bind_buffers() {
++    const Buffer storage[8] = {g_vram, g_tables, 0, g_data, g_clut, g_scratch, g_cache, g_decoded};
++    for (GLuint i = 0; i < 8; ++i)
++        if (storage[i]) glBindBufferBase(GL_SHADER_STORAGE_BUFFER, i, storage[i]);
++}
++
++// Unlike a WebGPU compute pass, GL orders nothing between dispatches: each
++// one waits for the storage writes of the one before it. There is no surface
++// to present to, so the view WebGPU's submit takes is always null here.
++void submit(const void *) {
++    if (g_commands.empty()) return;
++    Current gl;
++    ensure_capacity();
++    write_buffer(g_data, 0, g_arena.data(), g_arena.size() * 4);
++    write_buffer(g_params, 0, g_param_records.data(), g_param_records.size() * kParamStride);
++    bind_buffers();
++    collect_timers();
++    const int timer = g_timer_next;
++    const bool measure = g_timers[0] && !g_timer_busy[timer];
++    if (measure) {
++        glBeginQuery(GL_TIME_ELAPSED, g_timers[timer]);
++        g_timer_busy[timer] = true;
++        g_timer_next = (timer + 1) % kTimers;
++    }
++    Pipeline current = kPipelines;
++    ++g_submits;
++    ++g_total_passes;
++    for (const Command &c : g_commands) {
++        ++g_dispatches[c.pipeline];
++        if (c.pipeline != current) {
++            glUseProgram(g_programs[c.pipeline]);
++            current = c.pipeline;
++        }
++        glBindBufferRange(GL_UNIFORM_BUFFER, 2, g_params, static_cast<GLintptr>(c.param) * kParamStride, kParamStride);
++        glDispatchCompute(c.x, c.y, 1);
++        glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
++    }
++    if (measure) glEndQuery(GL_TIME_ELAPSED);
++    glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT);
++    glFlush();
++    g_commands.clear();
++    g_command_info.clear();
++    ++g_serial;
++    g_param_records.clear();
++    g_arena.clear();
++    g_decoded_used = 0;
++    g_clut_loads = 0;
++}
++
++void read_back(Buffer source, std::uint64_t bytes, void *out, std::uint64_t offset = 0) {
++    Current gl;
++    glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT);
++    glBindBuffer(GL_COPY_READ_BUFFER, source);
++    glGetBufferSubData(GL_COPY_READ_BUFFER, static_cast<GLintptr>(offset), static_cast<GLsizeiptr>(bytes), out);
++}
++
++bool compile_programs() {
++    for (int i = 0; i < kPipelines; ++i) {
++        // naga bakes the WGSL override SCALE in as a constant of 1.
++        std::string source = kGlslShaders[i];
++        const std::string one = "const uint SCALE = 1u;";
++        if (const auto at = source.find(one); at != std::string::npos) source.replace(at, one.size(), "const uint SCALE = " + std::to_string(g_scale) + "u;");
++        const char *text = source.c_str();
++        const GLuint shader = glCreateShader(GL_COMPUTE_SHADER);
++        glShaderSource(shader, 1, &text, nullptr);
++        glCompileShader(shader);
++        GLint ok = 0;
++        glGetShaderiv(shader, GL_COMPILE_STATUS, &ok);
++        if (!ok) {
++            char log[1024] = {};
++            glGetShaderInfoLog(shader, sizeof log, nullptr, log);
++            std::fprintf(stderr, "[gpu] %s: %s\n", kEntryPoints[i], log);
++            return false;
++        }
++        g_programs[i] = glCreateProgram();
++        glAttachShader(g_programs[i], shader);
++        glLinkProgram(g_programs[i]);
++        glDeleteShader(shader);
++        glGetProgramiv(g_programs[i], GL_LINK_STATUS, &ok);
++        if (!ok) {
++            char log[1024] = {};
++            glGetProgramInfoLog(g_programs[i], sizeof log, nullptr, log);
++            std::fprintf(stderr, "[gpu] %s: %s\n", kEntryPoints[i], log);
++            return false;
++        }
++    }
++    return true;
++}
++
++// A context of its own with no surface: the window keeps presenting through
++// SDL, from what display() reads back.
++bool create_context() {
++    g_egl_display = eglGetDisplay(EGL_DEFAULT_DISPLAY);
++    if (g_egl_display == EGL_NO_DISPLAY || !eglInitialize(g_egl_display, nullptr, nullptr) || !eglBindAPI(EGL_OPENGL_API)) return false;
++    const EGLint config_attributes[] = {EGL_RENDERABLE_TYPE, EGL_OPENGL_BIT, EGL_NONE};
++    EGLConfig config;
++    EGLint configs = 0;
++    if (!eglChooseConfig(g_egl_display, config_attributes, &config, 1, &configs) || !configs) return false;
++    const EGLint context_attributes[] = {EGL_CONTEXT_OPENGL_PROFILE_MASK_KHR, EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT_KHR, EGL_CONTEXT_MAJOR_VERSION_KHR, 4,
++                                         EGL_CONTEXT_MINOR_VERSION_KHR, 3, EGL_NONE};
++    g_egl_context = eglCreateContext(g_egl_display, config, EGL_NO_CONTEXT, context_attributes);
++    if (g_egl_context == EGL_NO_CONTEXT) return false;
++    Current gl;
++#define PS2_GL_LOAD(type, name)                                    \
++    name = reinterpret_cast<type>(eglGetProcAddress(#name));       \
++    if (!name) {                                                   \
++        std::fprintf(stderr, "[gpu] no %s\n", #name);              \
++        return false;                                              \
++    }
++    PS2_GL_FUNCTIONS(PS2_GL_LOAD)
++#undef PS2_GL_LOAD
++    std::fprintf(stderr, "[gpu] %s (%s)\n", reinterpret_cast<const char *>(glGetString(GL_RENDERER)), reinterpret_cast<const char *>(glGetString(GL_VERSION)));
++    glGenQueries(kTimers, g_timers);
++    return true;
++}
+diff --git a/runtime/src/gs/gpu/gl_public.inc b/runtime/src/gs/gpu/gl_public.inc
+new file mode 100644
+index 0000000..a3d81da
+--- /dev/null
++++ b/runtime/src/gs/gpu/gl_public.inc
+@@ -0,0 +1,66 @@
++// The public half of the OpenGL device (see gl_device.inc), included by gpu.cpp
++// in place of the WebGPU versions of these functions. Reads back synchronously
++// and has no surface: the window presents what display() returns.
++
++bool init(Mode m) {
++    if (m == Mode::off || !create_context()) return false;
++    Current gl;
++    if (const char *scale = std::getenv("PS2_SCALE")) g_scale = std::clamp<std::uint32_t>(static_cast<std::uint32_t>(std::atoi(scale)), 1u, 3u);
++    g_copy_words = (1u << 20) * g_scale * g_scale;
++    g_tiles_per_row = (2048 * static_cast<int>(g_scale) + 15) / 16;
++    g_tile_count.assign(static_cast<std::size_t>(g_tiles_per_row) * g_tiles_per_row, 0);
++    g_tile_fill.assign(static_cast<std::size_t>(g_tiles_per_row) * g_tiles_per_row, 0);
++    g_field_words = (1u << 19) * g_scale * g_scale;
++    g_vram = make_buffer(static_cast<std::uint64_t>(kMemorySize) * g_scale * g_scale);
++    std::vector<std::uint32_t> tables;
++    swizzle_tables(tables);
++    g_tables = make_buffer(tables.size() * 4);
++    write_buffer(g_tables, 0, tables.data(), tables.size() * 4);
++    g_clut = make_buffer(static_cast<std::uint64_t>(kClutSlots) * kClutEntries * 4);
++    g_scratch = make_buffer((static_cast<std::uint64_t>(g_copy_words) + 2ull * g_field_words) * 4);
++    g_cache = make_buffer(static_cast<std::uint64_t>(kCacheWords) * 4);
++    g_decoded = make_buffer(static_cast<std::uint64_t>(kDecodedWords) * 4);
++    if (const char *decode = std::getenv("PS2_DECODE")) g_decode = std::atoi(decode) != 0;
++    g_cache_copy.assign(kCacheWords, 0);
++    if (!compile_programs()) return false;
++    ensure_capacity();
++    g_mode = m;
++    return true;
++}
++
++void wait_idle() {
++    flush_all();
++    submit();
++    Current gl;
++    glFinish();
++}
++
++// The copy WebGPU maps later is taken right away here, so finishing it is
++// only a matter of the serial.
++std::uint32_t g_downloaded_serial = 0;
++
++bool download_async(std::uint8_t *memory, std::uint32_t offset, std::uint32_t bytes, std::uint32_t serial) {
++    download(memory, offset, bytes);
++    g_downloaded_serial = serial;
++    return true;
++}
++
++bool finish_download(std::uint32_t serial) { return serial == g_downloaded_serial; }
++
++bool attach_surface(const SurfaceTarget &) { return false; }
++
++void resize_surface(std::uint32_t, std::uint32_t) {}
++
++bool has_surface() { return false; }
++
++bool present(const DisplaySource &) { return false; }
++
++// Average GPU time of a measured submit times every submit so far, in ms.
++double busy_ms() {
++    if (!g_measured) return 0.0;
++    return static_cast<double>(g_measured_ns) / static_cast<double>(g_measured) * static_cast<double>(g_total_passes) / 1e6;
++}
++
++bool display_async(const DisplaySource &src, std::vector<std::uint32_t> &rgba, std::uint32_t &width, std::uint32_t &height) {
++    return display(src, rgba, width, height);
++}
+diff --git a/runtime/src/gs/gpu/glsl/copy_read.comp b/runtime/src/gs/gpu/glsl/copy_read.comp
+new file mode 100644
+index 0000000..5b868c8
+--- /dev/null
++++ b/runtime/src/gs/gpu/glsl/copy_read.comp
+@@ -0,0 +1,217 @@
++#version 430 core
++#extension GL_ARB_compute_shader : require
++#extension GL_ARB_shader_storage_buffer_object : require
++layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
++
++struct Params {
++    uvec4 v[16];
++};
++struct Loc {
++    uint word;
++    uint shift;
++    uint mask;
++};
++const uint PSMCT32_ = 0u;
++const uint PSMCT24_ = 1u;
++const uint PSMCT16_ = 2u;
++const uint PSMCT16S = 10u;
++const uint PSMT8_ = 19u;
++const uint PSMT4_ = 20u;
++const uint PSMT8H = 27u;
++const uint PSMT4HL = 36u;
++const uint PSMT4HH = 44u;
++const uint PSMZ32_ = 48u;
++const uint PSMZ24_ = 49u;
++const uint PSMZ16_ = 50u;
++const uint PSMZ16S = 58u;
++const uint T_OFF32_ = 0u;
++const uint T_OFFZ32_ = 2048u;
++const uint T_OFF16_ = 4096u;
++const uint T_OFF16S = 8192u;
++const uint T_OFFZ16_ = 12288u;
++const uint T_OFFZ16S = 16384u;
++const uint T_OFF8_ = 20480u;
++const uint T_OFF4_ = 28672u;
++const uint CLUT_ENTRIES = 512u;
++const uint F_IIP = 1u;
++const uint F_TME = 2u;
++const uint F_FGE = 4u;
++const uint F_ABE = 8u;
++const uint F_FST = 16u;
++const uint F_ZMSK = 32u;
++const uint F_ATE = 64u;
++const uint F_DATE = 128u;
++const uint F_DATM = 256u;
++const uint F_ZTE = 512u;
++const uint F_PABE = 1024u;
++const uint F_COLCLAMP = 2048u;
++const uint F_FBA = 4096u;
++const uint F_TCC = 8192u;
++const uint F_BILINEAR = 16384u;
++const uint F_AEM = 32768u;
++const uint PRIM_WORDS = 28u;
++const uint SETUP_WORDS = 25u;
++const uint SCALE = 1u;
++
++layout(std430, binding = 0) buffer type_4_block_0Compute { uint _group_0_binding_0_cs[]; };
++
++layout(std430, binding = 1) readonly buffer type_5_block_1Compute { uint _group_0_binding_1_cs[]; };
++
++layout(std140, binding = 2) uniform Params_block_2Compute { Params _group_0_binding_2_cs; };
++
++layout(std430, binding = 5) buffer type_5_block_3Compute { uint _group_0_binding_5_cs[]; };
++
++
++uint prm(uint i) {
++    uint _e9 = _group_0_binding_2_cs.v[(i / 4u)][(i % 4u)];
++    return _e9;
++}
++
++uint page_addr(uint bp, uint bw, uint x, uint y, uint pw, uint ph) {
++    uint per_row = max(1u, ((bw * 64u) / pw));
++    return ((bp * 256u) + (((x / pw) + ((y / ph) * per_row)) * 8192u));
++}
++
++Loc locate(uint psm, uint bp_1, uint bw_1, uint x_1, uint y_1) {
++    uint a = 0u;
++    uint shift = 0u;
++    uint mask = 4294967295u;
++    switch(psm) {
++        case 48u: {
++            uint _e13 = page_addr(bp_1, bw_1, x_1, y_1, 64u, 32u);
++            uint _e25 = _group_0_binding_1_cs[((T_OFFZ32_ + ((y_1 & 31u) * 64u)) + (x_1 & 63u))];
++            a = (_e13 + _e25);
++            break;
++        }
++        case 49u: {
++            uint _e29 = page_addr(bp_1, bw_1, x_1, y_1, 64u, 32u);
++            uint _e41 = _group_0_binding_1_cs[((T_OFFZ32_ + ((y_1 & 31u) * 64u)) + (x_1 & 63u))];
++            a = (_e29 + _e41);
++            mask = 16777215u;
++            break;
++        }
++        case 1u: {
++            uint _e46 = page_addr(bp_1, bw_1, x_1, y_1, 64u, 32u);
++            uint _e58 = _group_0_binding_1_cs[((T_OFF32_ + ((y_1 & 31u) * 64u)) + (x_1 & 63u))];
++            a = (_e46 + _e58);
++            mask = 16777215u;
++            break;
++        }
++        case 2u: {
++            uint _e63 = page_addr(bp_1, bw_1, x_1, y_1, 64u, 64u);
++            uint _e75 = _group_0_binding_1_cs[((T_OFF16_ + ((y_1 & 63u) * 64u)) + (x_1 & 63u))];
++            a = (_e63 + _e75);
++            uint _e77 = a;
++            shift = ((_e77 & 2u) * 8u);
++            mask = 65535u;
++            break;
++        }
++        case 10u: {
++            uint _e85 = page_addr(bp_1, bw_1, x_1, y_1, 64u, 64u);
++            uint _e97 = _group_0_binding_1_cs[((T_OFF16S + ((y_1 & 63u) * 64u)) + (x_1 & 63u))];
++            a = (_e85 + _e97);
++            uint _e99 = a;
++            shift = ((_e99 & 2u) * 8u);
++            mask = 65535u;
++            break;
++        }
++        case 50u: {
++            uint _e107 = page_addr(bp_1, bw_1, x_1, y_1, 64u, 64u);
++            uint _e119 = _group_0_binding_1_cs[((T_OFFZ16_ + ((y_1 & 63u) * 64u)) + (x_1 & 63u))];
++            a = (_e107 + _e119);
++            uint _e121 = a;
++            shift = ((_e121 & 2u) * 8u);
++            mask = 65535u;
++            break;
++        }
++        case 58u: {
++            uint _e129 = page_addr(bp_1, bw_1, x_1, y_1, 64u, 64u);
++            uint _e141 = _group_0_binding_1_cs[((T_OFFZ16S + ((y_1 & 63u) * 64u)) + (x_1 & 63u))];
++            a = (_e129 + _e141);
++            uint _e143 = a;
++            shift = ((_e143 & 2u) * 8u);
++            mask = 65535u;
++            break;
++        }
++        case 19u: {
++            uint _e151 = page_addr(bp_1, bw_1, x_1, y_1, 128u, 64u);
++            uint _e163 = _group_0_binding_1_cs[((T_OFF8_ + ((y_1 & 63u) * 128u)) + (x_1 & 127u))];
++            a = (_e151 + _e163);
++            uint _e165 = a;
++            shift = ((_e165 & 3u) * 8u);
++            mask = 255u;
++            break;
++        }
++        case 20u: {
++            uint n = _group_0_binding_1_cs[((T_OFF4_ + ((y_1 & 127u) * 128u)) + (x_1 & 127u))];
++            uint _e185 = page_addr(bp_1, bw_1, x_1, y_1, 128u, 128u);
++            a = (_e185 + (n / 2u));
++            uint _e189 = a;
++            shift = (((_e189 & 3u) * 8u) + ((n & 1u) * 4u));
++            mask = 15u;
++            break;
++        }
++        case 27u: {
++            uint _e202 = page_addr(bp_1, bw_1, x_1, y_1, 64u, 32u);
++            uint _e214 = _group_0_binding_1_cs[((T_OFF32_ + ((y_1 & 31u) * 64u)) + (x_1 & 63u))];
++            a = (_e202 + _e214);
++            shift = 24u;
++            mask = 255u;
++            break;
++        }
++        case 36u: {
++            uint _e220 = page_addr(bp_1, bw_1, x_1, y_1, 64u, 32u);
++            uint _e232 = _group_0_binding_1_cs[((T_OFF32_ + ((y_1 & 31u) * 64u)) + (x_1 & 63u))];
++            a = (_e220 + _e232);
++            shift = 24u;
++            mask = 15u;
++            break;
++        }
++        case 44u: {
++            uint _e238 = page_addr(bp_1, bw_1, x_1, y_1, 64u, 32u);
++            uint _e250 = _group_0_binding_1_cs[((T_OFF32_ + ((y_1 & 31u) * 64u)) + (x_1 & 63u))];
++            a = (_e238 + _e250);
++            shift = 28u;
++            mask = 15u;
++            break;
++        }
++        default: {
++            uint _e256 = page_addr(bp_1, bw_1, x_1, y_1, 64u, 32u);
++            uint _e268 = _group_0_binding_1_cs[((T_OFF32_ + ((y_1 & 31u) * 64u)) + (x_1 & 63u))];
++            a = (_e256 + _e268);
++            break;
++        }
++    }
++    uint _e270 = a;
++    uint _e275 = shift;
++    uint _e276 = mask;
++    return Loc(((_e270 & 4194303u) >> 2u), _e275, _e276);
++}
++
++uint read_sample(uint psm_1, uint bp_2, uint bw_2, uint x_2, uint y_2, uint k) {
++    Loc _e6 = locate(psm_1, bp_2, bw_2, x_2, y_2);
++    uint _e15 = _group_0_binding_0_cs[(((_e6.word * SCALE) * SCALE) + k)];
++    return ((_e15 >> _e6.shift) & _e6.mask);
++}
++
++void main() {
++    uvec3 gid = gl_GlobalInvocationID;
++    uint i_1 = (gid.x + ((gid.y * 64u) * 1024u));
++    uint _e9 = prm(5u);
++    uint _e16 = prm(6u);
++    if ((i_1 >= ((_e9 * _e16) * 1u))) {
++        return;
++    }
++    uint pixel = (i_1 / 1u);
++    uint _e22 = prm(3u);
++    uint x_3 = ((_e22 + (pixel % _e9)) & 2047u);
++    uint _e28 = prm(4u);
++    uint y_3 = ((_e28 + (pixel / _e9)) & 2047u);
++    uint _e36 = prm(2u);
++    uint _e38 = prm(0u);
++    uint _e40 = prm(1u);
++    uint _e42 = read_sample(_e36, _e38, _e40, x_3, y_3, (i_1 % 1u));
++    _group_0_binding_5_cs[i_1] = _e42;
++    return;
++}
++
+diff --git a/runtime/src/gs/gpu/glsl/copy_write.comp b/runtime/src/gs/gpu/glsl/copy_write.comp
+new file mode 100644
+index 0000000..ac9c2e0
+--- /dev/null
++++ b/runtime/src/gs/gpu/glsl/copy_write.comp
+@@ -0,0 +1,241 @@
++#version 430 core
++#extension GL_ARB_compute_shader : require
++#extension GL_ARB_shader_storage_buffer_object : require
++layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
++
++struct Params {
++    uvec4 v[16];
++};
++struct Loc {
++    uint word;
++    uint shift;
++    uint mask;
++};
++const uint PSMCT32_ = 0u;
++const uint PSMCT24_ = 1u;
++const uint PSMCT16_ = 2u;
++const uint PSMCT16S = 10u;
++const uint PSMT8_ = 19u;
++const uint PSMT4_ = 20u;
++const uint PSMT8H = 27u;
++const uint PSMT4HL = 36u;
++const uint PSMT4HH = 44u;
++const uint PSMZ32_ = 48u;
++const uint PSMZ24_ = 49u;
++const uint PSMZ16_ = 50u;
++const uint PSMZ16S = 58u;
++const uint T_OFF32_ = 0u;
++const uint T_OFFZ32_ = 2048u;
++const uint T_OFF16_ = 4096u;
++const uint T_OFF16S = 8192u;
++const uint T_OFFZ16_ = 12288u;
++const uint T_OFFZ16S = 16384u;
++const uint T_OFF8_ = 20480u;
++const uint T_OFF4_ = 28672u;
++const uint CLUT_ENTRIES = 512u;
++const uint F_IIP = 1u;
++const uint F_TME = 2u;
++const uint F_FGE = 4u;
++const uint F_ABE = 8u;
++const uint F_FST = 16u;
++const uint F_ZMSK = 32u;
++const uint F_ATE = 64u;
++const uint F_DATE = 128u;
++const uint F_DATM = 256u;
++const uint F_ZTE = 512u;
++const uint F_PABE = 1024u;
++const uint F_COLCLAMP = 2048u;
++const uint F_FBA = 4096u;
++const uint F_TCC = 8192u;
++const uint F_BILINEAR = 16384u;
++const uint F_AEM = 32768u;
++const uint PRIM_WORDS = 28u;
++const uint SETUP_WORDS = 25u;
++const uint SCALE = 1u;
++
++layout(std430, binding = 0) buffer type_4_block_0Compute { uint _group_0_binding_0_cs[]; };
++
++layout(std430, binding = 1) readonly buffer type_5_block_1Compute { uint _group_0_binding_1_cs[]; };
++
++layout(std140, binding = 2) uniform Params_block_2Compute { Params _group_0_binding_2_cs; };
++
++layout(std430, binding = 5) buffer type_5_block_3Compute { uint _group_0_binding_5_cs[]; };
++
++
++uint prm(uint i) {
++    uint _e9 = _group_0_binding_2_cs.v[(i / 4u)][(i % 4u)];
++    return _e9;
++}
++
++uint page_addr(uint bp, uint bw, uint x, uint y, uint pw, uint ph) {
++    uint per_row = max(1u, ((bw * 64u) / pw));
++    return ((bp * 256u) + (((x / pw) + ((y / ph) * per_row)) * 8192u));
++}
++
++Loc locate(uint psm, uint bp_1, uint bw_1, uint x_1, uint y_1) {
++    uint a = 0u;
++    uint shift = 0u;
++    uint mask = 4294967295u;
++    switch(psm) {
++        case 48u: {
++            uint _e13 = page_addr(bp_1, bw_1, x_1, y_1, 64u, 32u);
++            uint _e25 = _group_0_binding_1_cs[((T_OFFZ32_ + ((y_1 & 31u) * 64u)) + (x_1 & 63u))];
++            a = (_e13 + _e25);
++            break;
++        }
++        case 49u: {
++            uint _e29 = page_addr(bp_1, bw_1, x_1, y_1, 64u, 32u);
++            uint _e41 = _group_0_binding_1_cs[((T_OFFZ32_ + ((y_1 & 31u) * 64u)) + (x_1 & 63u))];
++            a = (_e29 + _e41);
++            mask = 16777215u;
++            break;
++        }
++        case 1u: {
++            uint _e46 = page_addr(bp_1, bw_1, x_1, y_1, 64u, 32u);
++            uint _e58 = _group_0_binding_1_cs[((T_OFF32_ + ((y_1 & 31u) * 64u)) + (x_1 & 63u))];
++            a = (_e46 + _e58);
++            mask = 16777215u;
++            break;
++        }
++        case 2u: {
++            uint _e63 = page_addr(bp_1, bw_1, x_1, y_1, 64u, 64u);
++            uint _e75 = _group_0_binding_1_cs[((T_OFF16_ + ((y_1 & 63u) * 64u)) + (x_1 & 63u))];
++            a = (_e63 + _e75);
++            uint _e77 = a;
++            shift = ((_e77 & 2u) * 8u);
++            mask = 65535u;
++            break;
++        }
++        case 10u: {
++            uint _e85 = page_addr(bp_1, bw_1, x_1, y_1, 64u, 64u);
++            uint _e97 = _group_0_binding_1_cs[((T_OFF16S + ((y_1 & 63u) * 64u)) + (x_1 & 63u))];
++            a = (_e85 + _e97);
++            uint _e99 = a;
++            shift = ((_e99 & 2u) * 8u);
++            mask = 65535u;
++            break;
++        }
++        case 50u: {
++            uint _e107 = page_addr(bp_1, bw_1, x_1, y_1, 64u, 64u);
++            uint _e119 = _group_0_binding_1_cs[((T_OFFZ16_ + ((y_1 & 63u) * 64u)) + (x_1 & 63u))];
++            a = (_e107 + _e119);
++            uint _e121 = a;
++            shift = ((_e121 & 2u) * 8u);
++            mask = 65535u;
++            break;
++        }
++        case 58u: {
++            uint _e129 = page_addr(bp_1, bw_1, x_1, y_1, 64u, 64u);
++            uint _e141 = _group_0_binding_1_cs[((T_OFFZ16S + ((y_1 & 63u) * 64u)) + (x_1 & 63u))];
++            a = (_e129 + _e141);
++            uint _e143 = a;
++            shift = ((_e143 & 2u) * 8u);
++            mask = 65535u;
++            break;
++        }
++        case 19u: {
++            uint _e151 = page_addr(bp_1, bw_1, x_1, y_1, 128u, 64u);
++            uint _e163 = _group_0_binding_1_cs[((T_OFF8_ + ((y_1 & 63u) * 128u)) + (x_1 & 127u))];
++            a = (_e151 + _e163);
++            uint _e165 = a;
++            shift = ((_e165 & 3u) * 8u);
++            mask = 255u;
++            break;
++        }
++        case 20u: {
++            uint n = _group_0_binding_1_cs[((T_OFF4_ + ((y_1 & 127u) * 128u)) + (x_1 & 127u))];
++            uint _e185 = page_addr(bp_1, bw_1, x_1, y_1, 128u, 128u);
++            a = (_e185 + (n / 2u));
++            uint _e189 = a;
++            shift = (((_e189 & 3u) * 8u) + ((n & 1u) * 4u));
++            mask = 15u;
++            break;
++        }
++        case 27u: {
++            uint _e202 = page_addr(bp_1, bw_1, x_1, y_1, 64u, 32u);
++            uint _e214 = _group_0_binding_1_cs[((T_OFF32_ + ((y_1 & 31u) * 64u)) + (x_1 & 63u))];
++            a = (_e202 + _e214);
++            shift = 24u;
++            mask = 255u;
++            break;
++        }
++        case 36u: {
++            uint _e220 = page_addr(bp_1, bw_1, x_1, y_1, 64u, 32u);
++            uint _e232 = _group_0_binding_1_cs[((T_OFF32_ + ((y_1 & 31u) * 64u)) + (x_1 & 63u))];
++            a = (_e220 + _e232);
++            shift = 24u;
++            mask = 15u;
++            break;
++        }
++        case 44u: {
++            uint _e238 = page_addr(bp_1, bw_1, x_1, y_1, 64u, 32u);
++            uint _e250 = _group_0_binding_1_cs[((T_OFF32_ + ((y_1 & 31u) * 64u)) + (x_1 & 63u))];
++            a = (_e238 + _e250);
++            shift = 28u;
++            mask = 15u;
++            break;
++        }
++        default: {
++            uint _e256 = page_addr(bp_1, bw_1, x_1, y_1, 64u, 32u);
++            uint _e268 = _group_0_binding_1_cs[((T_OFF32_ + ((y_1 & 31u) * 64u)) + (x_1 & 63u))];
++            a = (_e256 + _e268);
++            break;
++        }
++    }
++    uint _e270 = a;
++    uint _e275 = shift;
++    uint _e276 = mask;
++    return Loc(((_e270 & 4194303u) >> 2u), _e275, _e276);
++}
++
++void store(Loc l, uint k, uint value) {
++    uint w = (((l.word * SCALE) * SCALE) + k);
++    if ((l.mask == 4294967295u)) {
++        _group_0_binding_0_cs[w] = value;
++        return;
++    }
++    uint _e20 = atomicAnd(_group_0_binding_0_cs[w], ~((l.mask << l.shift)));
++    uint _e27 = atomicOr(_group_0_binding_0_cs[w], ((value & l.mask) << l.shift));
++    return;
++}
++
++void write_sample(uint psm_1, uint bp_2, uint bw_2, uint x_2, uint y_2, uint k_1, uint value_1) {
++    Loc _e7 = locate(psm_1, bp_2, bw_2, x_2, y_2);
++    store(_e7, k_1, value_1);
++    return;
++}
++
++void main() {
++    uvec3 gid = gl_GlobalInvocationID;
++    uint sx = 0u;
++    uint sy = 0u;
++    uint i_1 = (gid.x + ((gid.y * 64u) * 1024u));
++    uint _e9 = prm(5u);
++    uint _e11 = prm(6u);
++    if ((i_1 >= ((_e9 * _e11) * 1u))) {
++        return;
++    }
++    uint _e21 = prm(7u);
++    uint k_2 = (i_1 % 1u);
++    uint x_3 = ((i_1 / 1u) % _e9);
++    uint y_3 = ((i_1 / 1u) / _e9);
++    sx = x_3;
++    sy = y_3;
++    if (((_e21 & 1u) != 0u)) {
++        sx = ((_e9 - 1u) - x_3);
++    }
++    if (((_e21 & 2u) != 0u)) {
++        sy = ((_e11 - 1u) - y_3);
++    }
++    uint _e44 = prm(2u);
++    uint _e46 = prm(0u);
++    uint _e48 = prm(1u);
++    uint _e50 = prm(3u);
++    uint _e55 = prm(4u);
++    uint _e60 = sy;
++    uint _e62 = sx;
++    uint _e67 = _group_0_binding_5_cs[((((_e60 * _e9) + _e62) * 1u) + k_2)];
++    write_sample(_e44, _e46, _e48, ((_e50 + x_3) & 2047u), ((_e55 + y_3) & 2047u), k_2, _e67);
++    return;
++}
++
+diff --git a/runtime/src/gs/gpu/glsl/decode.comp b/runtime/src/gs/gpu/glsl/decode.comp
+new file mode 100644
+index 0000000..0a4bcd6
+--- /dev/null
++++ b/runtime/src/gs/gpu/glsl/decode.comp
+@@ -0,0 +1,429 @@
++#version 430 core
++#extension GL_ARB_compute_shader : require
++#extension GL_ARB_shader_storage_buffer_object : require
++layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
++
++struct Params {
++    uvec4 v[16];
++};
++struct Loc {
++    uint word;
++    uint shift;
++    uint mask;
++};
++struct Fmt {
++    uint base;
++    uint per_row;
++    uint table;
++    uint bits;
++    uint mask;
++};
++struct Setup {
++    uint flags;
++    uint fbp;
++    uint fbw;
++    uint fpsm;
++    uint fbmsk;
++    uint zbp;
++    uint zpsm;
++    uint modes;
++    uint aref;
++    uint fix;
++    int scax0_;
++    int scax1_;
++    int scay0_;
++    int scay1_;
++    uint tbp;
++    uint tbw;
++    uint tpsm;
++    uint tw;
++    uint th;
++    uint cpsm;
++    uint csa;
++    uint minu;
++    uint maxu;
++    uint minv;
++    uint maxv;
++    uint ta0_;
++    uint ta1_;
++    uint fogcol;
++    uint clut;
++    uint zmax;
++    uint dec;
++    Fmt tf;
++    Fmt ff;
++    Fmt zf;
++};
++const uint PSMCT32_ = 0u;
++const uint PSMCT24_ = 1u;
++const uint PSMCT16_ = 2u;
++const uint PSMCT16S = 10u;
++const uint PSMT8_ = 19u;
++const uint PSMT4_ = 20u;
++const uint PSMT8H = 27u;
++const uint PSMT4HL = 36u;
++const uint PSMT4HH = 44u;
++const uint PSMZ32_ = 48u;
++const uint PSMZ24_ = 49u;
++const uint PSMZ16_ = 50u;
++const uint PSMZ16S = 58u;
++const uint T_OFF32_ = 0u;
++const uint T_OFFZ32_ = 2048u;
++const uint T_OFF16_ = 4096u;
++const uint T_OFF16S = 8192u;
++const uint T_OFFZ16_ = 12288u;
++const uint T_OFFZ16S = 16384u;
++const uint T_OFF8_ = 20480u;
++const uint T_OFF4_ = 28672u;
++const uint CLUT_ENTRIES = 512u;
++const uint F_IIP = 1u;
++const uint F_TME = 2u;
++const uint F_FGE = 4u;
++const uint F_ABE = 8u;
++const uint F_FST = 16u;
++const uint F_ZMSK = 32u;
++const uint F_ATE = 64u;
++const uint F_DATE = 128u;
++const uint F_DATM = 256u;
++const uint F_ZTE = 512u;
++const uint F_PABE = 1024u;
++const uint F_COLCLAMP = 2048u;
++const uint F_FBA = 4096u;
++const uint F_TCC = 8192u;
++const uint F_BILINEAR = 16384u;
++const uint F_AEM = 32768u;
++const uint PRIM_WORDS = 28u;
++const uint SETUP_WORDS = 25u;
++const uint SCALE = 1u;
++
++layout(std430, binding = 0) buffer type_4_block_0Compute { uint _group_0_binding_0_cs[]; };
++
++layout(std430, binding = 1) readonly buffer type_5_block_1Compute { uint _group_0_binding_1_cs[]; };
++
++layout(std140, binding = 2) uniform Params_block_2Compute { Params _group_0_binding_2_cs; };
++
++layout(std430, binding = 3) readonly buffer type_5_block_3Compute { uint _group_0_binding_3_cs[]; };
++
++layout(std430, binding = 4) buffer type_5_block_4Compute { uint _group_0_binding_4_cs[]; };
++
++layout(std430, binding = 7) buffer type_5_block_5Compute { uint _group_0_binding_7_cs[]; };
++
++
++uint prm(uint i) {
++    uint _e9 = _group_0_binding_2_cs.v[(i / 4u)][(i % 4u)];
++    return _e9;
++}
++
++Fmt fmt_of(uint psm, uint bp, uint bw) {
++    uint pws = 6u;
++    uint phs = 5u;
++    uint table = T_OFF32_;
++    uint amask = 0u;
++    uint nbit = 0u;
++    uint fixed_ = 0u;
++    uint mask = 4294967295u;
++    switch(psm) {
++        case 48u: {
++            table = T_OFFZ32_;
++            break;
++        }
++        case 49u: {
++            table = T_OFFZ32_;
++            mask = 16777215u;
++            break;
++        }
++        case 1u: {
++            mask = 16777215u;
++            break;
++        }
++        case 2u: {
++            phs = 6u;
++            table = T_OFF16_;
++            amask = 2u;
++            mask = 65535u;
++            break;
++        }
++        case 10u: {
++            phs = 6u;
++            table = T_OFF16S;
++            amask = 2u;
++            mask = 65535u;
++            break;
++        }
++        case 50u: {
++            phs = 6u;
++            table = T_OFFZ16_;
++            amask = 2u;
++            mask = 65535u;
++            break;
++        }
++        case 58u: {
++            phs = 6u;
++            table = T_OFFZ16S;
++            amask = 2u;
++            mask = 65535u;
++            break;
++        }
++        case 19u: {
++            pws = 7u;
++            phs = 6u;
++            table = T_OFF8_;
++            amask = 3u;
++            mask = 255u;
++            break;
++        }
++        case 20u: {
++            pws = 7u;
++            phs = 7u;
++            table = T_OFF4_;
++            amask = 3u;
++            nbit = 1u;
++            mask = 15u;
++            break;
++        }
++        case 27u: {
++            fixed_ = 24u;
++            mask = 255u;
++            break;
++        }
++        case 36u: {
++            fixed_ = 24u;
++            mask = 15u;
++            break;
++        }
++        case 44u: {
++            fixed_ = 28u;
++            mask = 15u;
++            break;
++        }
++        default: {
++            break;
++        }
++    }
++    uint _e59 = pws;
++    uint _e62 = table;
++    uint _e63 = pws;
++    uint _e64 = phs;
++    uint _e68 = amask;
++    uint _e72 = nbit;
++    uint _e76 = fixed_;
++    uint _e80 = mask;
++    return Fmt((bp * 256u), max(1u, ((bw * 64u) >> _e59)), _e62, ((((_e63 | (_e64 << 4u)) | (_e68 << 8u)) | (_e72 << 10u)) | (_e76 << 11u)), _e80);
++}
++
++Loc addr(Fmt f, uint x, uint y) {
++    uint pws_1 = (f.bits & 15u);
++    uint phs_1 = ((f.bits >> 4u) & 15u);
++    uint amask_1 = ((f.bits >> 8u) & 3u);
++    uint nbit_1 = ((f.bits >> 10u) & 1u);
++    uint n = _group_0_binding_1_cs[((f.table + ((y & ((1u << phs_1) - 1u)) << pws_1)) + (x & ((1u << pws_1) - 1u)))];
++    uint a_2 = ((f.base + (((x >> pws_1) + ((y >> phs_1) * f.per_row)) * 8192u)) + (n >> nbit_1));
++    return Loc(((a_2 & 4194303u) >> 2u), (((f.bits >> 11u) + ((a_2 & amask_1) * 8u)) + ((n & nbit_1) * 4u)), f.mask);
++}
++
++uint load_at(Loc l, uint k) {
++    uint _e10 = _group_0_binding_0_cs[(((l.word * SCALE) * SCALE) + k)];
++    return ((_e10 >> l.shift) & l.mask);
++}
++
++Setup load_setup(uint at) {
++    Setup s = Setup(0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0, 0, 0, 0, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, Fmt(0u, 0u, 0u, 0u, 0u), Fmt(0u, 0u, 0u, 0u, 0u), Fmt(0u, 0u, 0u, 0u, 0u));
++    uint _e5 = _group_0_binding_3_cs[at];
++    s.flags = _e5;
++    uint _e11 = _group_0_binding_3_cs[(at + 1u)];
++    s.fbp = _e11;
++    uint _e17 = _group_0_binding_3_cs[(at + 2u)];
++    s.fbw = _e17;
++    uint _e23 = _group_0_binding_3_cs[(at + 3u)];
++    s.fpsm = _e23;
++    uint _e29 = _group_0_binding_3_cs[(at + 4u)];
++    s.fbmsk = _e29;
++    uint _e35 = _group_0_binding_3_cs[(at + 5u)];
++    s.zbp = _e35;
++    uint _e41 = _group_0_binding_3_cs[(at + 6u)];
++    s.zpsm = _e41;
++    uint _e47 = _group_0_binding_3_cs[(at + 7u)];
++    s.modes = _e47;
++    uint _e53 = _group_0_binding_3_cs[(at + 8u)];
++    s.aref = _e53;
++    uint _e59 = _group_0_binding_3_cs[(at + 9u)];
++    s.fix = _e59;
++    uint _e65 = _group_0_binding_3_cs[(at + 10u)];
++    s.scax0_ = int((_e65 & 65535u));
++    uint _e74 = _group_0_binding_3_cs[(at + 10u)];
++    s.scax1_ = int((_e74 >> 16u));
++    uint _e83 = _group_0_binding_3_cs[(at + 11u)];
++    s.scay0_ = int((_e83 & 65535u));
++    uint _e92 = _group_0_binding_3_cs[(at + 11u)];
++    s.scay1_ = int((_e92 >> 16u));
++    uint _e101 = _group_0_binding_3_cs[(at + 12u)];
++    s.tbp = _e101;
++    uint _e107 = _group_0_binding_3_cs[(at + 13u)];
++    s.tbw = _e107;
++    uint _e113 = _group_0_binding_3_cs[(at + 14u)];
++    s.tpsm = _e113;
++    uint _e119 = _group_0_binding_3_cs[(at + 15u)];
++    s.tw = (_e119 & 255u);
++    uint _e127 = _group_0_binding_3_cs[(at + 15u)];
++    s.th = (_e127 >> 8u);
++    uint _e135 = _group_0_binding_3_cs[(at + 16u)];
++    s.cpsm = _e135;
++    uint _e141 = _group_0_binding_3_cs[(at + 17u)];
++    s.csa = _e141;
++    uint _e147 = _group_0_binding_3_cs[(at + 18u)];
++    s.minu = (_e147 & 65535u);
++    uint _e155 = _group_0_binding_3_cs[(at + 18u)];
++    s.maxu = (_e155 >> 16u);
++    uint _e163 = _group_0_binding_3_cs[(at + 19u)];
++    s.minv = (_e163 & 65535u);
++    uint _e171 = _group_0_binding_3_cs[(at + 19u)];
++    s.maxv = (_e171 >> 16u);
++    uint _e179 = _group_0_binding_3_cs[(at + 20u)];
++    s.ta0_ = (_e179 & 255u);
++    uint _e187 = _group_0_binding_3_cs[(at + 20u)];
++    s.ta1_ = ((_e187 >> 8u) & 255u);
++    uint _e197 = _group_0_binding_3_cs[(at + 21u)];
++    s.fogcol = _e197;
++    uint _e203 = _group_0_binding_3_cs[(at + 22u)];
++    s.clut = _e203;
++    uint _e209 = _group_0_binding_3_cs[(at + 23u)];
++    s.zmax = _e209;
++    uint _e215 = _group_0_binding_3_cs[(at + 24u)];
++    s.dec = _e215;
++    uint _e218 = s.tpsm;
++    uint _e220 = s.tbp;
++    uint _e222 = s.tbw;
++    Fmt _e223 = fmt_of(_e218, _e220, _e222);
++    s.tf = _e223;
++    uint _e226 = s.fpsm;
++    uint _e228 = s.fbp;
++    uint _e230 = s.fbw;
++    Fmt _e231 = fmt_of(_e226, _e228, _e230);
++    s.ff = _e231;
++    uint _e234 = s.zpsm;
++    uint _e236 = s.zbp;
++    uint _e238 = s.fbw;
++    Fmt _e239 = fmt_of(_e234, _e236, _e238);
++    s.zf = _e239;
++    Setup _e240 = s;
++    return _e240;
++}
++
++bool has(Setup s_1, uint f_1) {
++    return ((s_1.flags & f_1) != 0u);
++}
++
++uint expand16_(uint c, Setup s_2) {
++    uint a = 0u;
++    bool local = false;
++    uint r = ((c & 31u) << 3u);
++    uint g = (((c >> 5u) & 31u) << 3u);
++    uint b = (((c >> 10u) & 31u) << 3u);
++    a = s_2.ta0_;
++    if (((c & 32768u) != 0u)) {
++        a = s_2.ta1_;
++    } else {
++        bool _e26 = has(s_2, F_AEM);
++        if (_e26) {
++            local = ((c & 32767u) == 0u);
++        } else {
++            local = false;
++        }
++        bool _e34 = local;
++        if (_e34) {
++            a = 0u;
++        }
++    }
++    uint _e42 = a;
++    return (((r | (g << 8u)) | (b << 16u)) | (_e42 << 24u));
++}
++
++uint convert(Setup s_3, uint raw) {
++    uint a_1 = 0u;
++    bool local_1 = false;
++    bool local_2 = false;
++    bool local_3 = false;
++    switch(s_3.tpsm) {
++        case 0u:
++        case 48u: {
++            return raw;
++        }
++        case 1u:
++        case 49u: {
++            a_1 = s_3.ta0_;
++            bool _e6 = has(s_3, F_AEM);
++            if (_e6) {
++                local_1 = ((raw & 16777215u) == 0u);
++            } else {
++                local_1 = false;
++            }
++            bool _e14 = local_1;
++            if (_e14) {
++                a_1 = 0u;
++            }
++            uint _e18 = a_1;
++            return ((raw & 16777215u) | (_e18 << 24u));
++        }
++        case 2u:
++        case 10u:
++        case 50u:
++        case 58u: {
++            uint _e22 = expand16_(raw, s_3);
++            return _e22;
++        }
++        case 19u:
++        case 27u: {
++            uint e = _group_0_binding_4_cs[((s_3.clut * CLUT_ENTRIES) + (raw & 255u))];
++            if (!((s_3.cpsm == PSMCT32_))) {
++                local_2 = (s_3.cpsm == PSMCT24_);
++            } else {
++                local_2 = true;
++            }
++            bool _e42 = local_2;
++            if (_e42) {
++                return e;
++            }
++            uint _e43 = expand16_(e, s_3);
++            return _e43;
++        }
++        case 20u:
++        case 36u:
++        case 44u: {
++            uint e_1 = _group_0_binding_4_cs[((s_3.clut * CLUT_ENTRIES) + ((((s_3.csa & 15u) * 16u) + (raw & 15u)) & 511u))];
++            if (!((s_3.cpsm == PSMCT32_))) {
++                local_3 = (s_3.cpsm == PSMCT24_);
++            } else {
++                local_3 = true;
++            }
++            bool _e71 = local_3;
++            if (_e71) {
++                return e_1;
++            }
++            uint _e72 = expand16_(e_1, s_3);
++            return _e72;
++        }
++        default: {
++            return raw;
++        }
++    }
++}
++
++void main() {
++    uvec3 gid = gl_GlobalInvocationID;
++    uint i_1 = (gid.x + ((gid.y * 64u) * 1024u));
++    uint _e9 = prm(2u);
++    if ((i_1 >= _e9)) {
++        return;
++    }
++    uint _e12 = prm(0u);
++    Setup _e13 = load_setup(_e12);
++    uint x_1 = (i_1 & ((1u << _e13.tw) - 1u));
++    uint y_1 = (i_1 >> _e13.tw);
++    uint _e24 = prm(1u);
++    Loc _e28 = addr(_e13.tf, x_1, y_1);
++    uint _e30 = load_at(_e28, 0u);
++    uint _e31 = convert(_e13, _e30);
++    _group_0_binding_7_cs[(_e24 + i_1)] = _e31;
++    return;
++}
++
+diff --git a/runtime/src/gs/gpu/glsl/display.comp b/runtime/src/gs/gpu/glsl/display.comp
+new file mode 100644
+index 0000000..dfb4aaf
+--- /dev/null
++++ b/runtime/src/gs/gpu/glsl/display.comp
+@@ -0,0 +1,247 @@
++#version 430 core
++#extension GL_ARB_compute_shader : require
++#extension GL_ARB_shader_storage_buffer_object : require
++layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
++
++struct Params {
++    uvec4 v[16];
++};
++struct Loc {
++    uint word;
++    uint shift;
++    uint mask;
++};
++const uint PSMCT32_ = 0u;
++const uint PSMCT24_ = 1u;
++const uint PSMCT16_ = 2u;
++const uint PSMCT16S = 10u;
++const uint PSMT8_ = 19u;
++const uint PSMT4_ = 20u;
++const uint PSMT8H = 27u;
++const uint PSMT4HL = 36u;
++const uint PSMT4HH = 44u;
++const uint PSMZ32_ = 48u;
++const uint PSMZ24_ = 49u;
++const uint PSMZ16_ = 50u;
++const uint PSMZ16S = 58u;
++const uint T_OFF32_ = 0u;
++const uint T_OFFZ32_ = 2048u;
++const uint T_OFF16_ = 4096u;
++const uint T_OFF16S = 8192u;
++const uint T_OFFZ16_ = 12288u;
++const uint T_OFFZ16S = 16384u;
++const uint T_OFF8_ = 20480u;
++const uint T_OFF4_ = 28672u;
++const uint CLUT_ENTRIES = 512u;
++const uint F_IIP = 1u;
++const uint F_TME = 2u;
++const uint F_FGE = 4u;
++const uint F_ABE = 8u;
++const uint F_FST = 16u;
++const uint F_ZMSK = 32u;
++const uint F_ATE = 64u;
++const uint F_DATE = 128u;
++const uint F_DATM = 256u;
++const uint F_ZTE = 512u;
++const uint F_PABE = 1024u;
++const uint F_COLCLAMP = 2048u;
++const uint F_FBA = 4096u;
++const uint F_TCC = 8192u;
++const uint F_BILINEAR = 16384u;
++const uint F_AEM = 32768u;
++const uint PRIM_WORDS = 28u;
++const uint SETUP_WORDS = 25u;
++const uint SCALE = 1u;
++
++layout(std430, binding = 0) buffer type_4_block_0Compute { uint _group_0_binding_0_cs[]; };
++
++layout(std430, binding = 1) readonly buffer type_5_block_1Compute { uint _group_0_binding_1_cs[]; };
++
++layout(std140, binding = 2) uniform Params_block_2Compute { Params _group_0_binding_2_cs; };
++
++layout(std430, binding = 5) buffer type_5_block_3Compute { uint _group_0_binding_5_cs[]; };
++
++
++uint prm(uint i) {
++    uint _e9 = _group_0_binding_2_cs.v[(i / 4u)][(i % 4u)];
++    return _e9;
++}
++
++uint page_addr(uint bp, uint bw, uint x, uint y, uint pw, uint ph) {
++    uint per_row = max(1u, ((bw * 64u) / pw));
++    return ((bp * 256u) + (((x / pw) + ((y / ph) * per_row)) * 8192u));
++}
++
++Loc locate(uint psm, uint bp_1, uint bw_1, uint x_1, uint y_1) {
++    uint a = 0u;
++    uint shift = 0u;
++    uint mask = 4294967295u;
++    switch(psm) {
++        case 48u: {
++            uint _e13 = page_addr(bp_1, bw_1, x_1, y_1, 64u, 32u);
++            uint _e25 = _group_0_binding_1_cs[((T_OFFZ32_ + ((y_1 & 31u) * 64u)) + (x_1 & 63u))];
++            a = (_e13 + _e25);
++            break;
++        }
++        case 49u: {
++            uint _e29 = page_addr(bp_1, bw_1, x_1, y_1, 64u, 32u);
++            uint _e41 = _group_0_binding_1_cs[((T_OFFZ32_ + ((y_1 & 31u) * 64u)) + (x_1 & 63u))];
++            a = (_e29 + _e41);
++            mask = 16777215u;
++            break;
++        }
++        case 1u: {
++            uint _e46 = page_addr(bp_1, bw_1, x_1, y_1, 64u, 32u);
++            uint _e58 = _group_0_binding_1_cs[((T_OFF32_ + ((y_1 & 31u) * 64u)) + (x_1 & 63u))];
++            a = (_e46 + _e58);
++            mask = 16777215u;
++            break;
++        }
++        case 2u: {
++            uint _e63 = page_addr(bp_1, bw_1, x_1, y_1, 64u, 64u);
++            uint _e75 = _group_0_binding_1_cs[((T_OFF16_ + ((y_1 & 63u) * 64u)) + (x_1 & 63u))];
++            a = (_e63 + _e75);
++            uint _e77 = a;
++            shift = ((_e77 & 2u) * 8u);
++            mask = 65535u;
++            break;
++        }
++        case 10u: {
++            uint _e85 = page_addr(bp_1, bw_1, x_1, y_1, 64u, 64u);
++            uint _e97 = _group_0_binding_1_cs[((T_OFF16S + ((y_1 & 63u) * 64u)) + (x_1 & 63u))];
++            a = (_e85 + _e97);
++            uint _e99 = a;
++            shift = ((_e99 & 2u) * 8u);
++            mask = 65535u;
++            break;
++        }
++        case 50u: {
++            uint _e107 = page_addr(bp_1, bw_1, x_1, y_1, 64u, 64u);
++            uint _e119 = _group_0_binding_1_cs[((T_OFFZ16_ + ((y_1 & 63u) * 64u)) + (x_1 & 63u))];
++            a = (_e107 + _e119);
++            uint _e121 = a;
++            shift = ((_e121 & 2u) * 8u);
++            mask = 65535u;
++            break;
++        }
++        case 58u: {
++            uint _e129 = page_addr(bp_1, bw_1, x_1, y_1, 64u, 64u);
++            uint _e141 = _group_0_binding_1_cs[((T_OFFZ16S + ((y_1 & 63u) * 64u)) + (x_1 & 63u))];
++            a = (_e129 + _e141);
++            uint _e143 = a;
++            shift = ((_e143 & 2u) * 8u);
++            mask = 65535u;
++            break;
++        }
++        case 19u: {
++            uint _e151 = page_addr(bp_1, bw_1, x_1, y_1, 128u, 64u);
++            uint _e163 = _group_0_binding_1_cs[((T_OFF8_ + ((y_1 & 63u) * 128u)) + (x_1 & 127u))];
++            a = (_e151 + _e163);
++            uint _e165 = a;
++            shift = ((_e165 & 3u) * 8u);
++            mask = 255u;
++            break;
++        }
++        case 20u: {
++            uint n = _group_0_binding_1_cs[((T_OFF4_ + ((y_1 & 127u) * 128u)) + (x_1 & 127u))];
++            uint _e185 = page_addr(bp_1, bw_1, x_1, y_1, 128u, 128u);
++            a = (_e185 + (n / 2u));
++            uint _e189 = a;
++            shift = (((_e189 & 3u) * 8u) + ((n & 1u) * 4u));
++            mask = 15u;
++            break;
++        }
++        case 27u: {
++            uint _e202 = page_addr(bp_1, bw_1, x_1, y_1, 64u, 32u);
++            uint _e214 = _group_0_binding_1_cs[((T_OFF32_ + ((y_1 & 31u) * 64u)) + (x_1 & 63u))];
++            a = (_e202 + _e214);
++            shift = 24u;
++            mask = 255u;
++            break;
++        }
++        case 36u: {
++            uint _e220 = page_addr(bp_1, bw_1, x_1, y_1, 64u, 32u);
++            uint _e232 = _group_0_binding_1_cs[((T_OFF32_ + ((y_1 & 31u) * 64u)) + (x_1 & 63u))];
++            a = (_e220 + _e232);
++            shift = 24u;
++            mask = 15u;
++            break;
++        }
++        case 44u: {
++            uint _e238 = page_addr(bp_1, bw_1, x_1, y_1, 64u, 32u);
++            uint _e250 = _group_0_binding_1_cs[((T_OFF32_ + ((y_1 & 31u) * 64u)) + (x_1 & 63u))];
++            a = (_e238 + _e250);
++            shift = 28u;
++            mask = 15u;
++            break;
++        }
++        default: {
++            uint _e256 = page_addr(bp_1, bw_1, x_1, y_1, 64u, 32u);
++            uint _e268 = _group_0_binding_1_cs[((T_OFF32_ + ((y_1 & 31u) * 64u)) + (x_1 & 63u))];
++            a = (_e256 + _e268);
++            break;
++        }
++    }
++    uint _e270 = a;
++    uint _e275 = shift;
++    uint _e276 = mask;
++    return Loc(((_e270 & 4194303u) >> 2u), _e275, _e276);
++}
++
++uint read_sample(uint psm_1, uint bp_2, uint bw_2, uint x_2, uint y_2, uint k) {
++    Loc _e6 = locate(psm_1, bp_2, bw_2, x_2, y_2);
++    uint _e15 = _group_0_binding_0_cs[(((_e6.word * SCALE) * SCALE) + k)];
++    return ((_e15 >> _e6.shift) & _e6.mask);
++}
++
++void main() {
++    uvec3 gid = gl_GlobalInvocationID;
++    bool local = false;
++    uint sy = 0u;
++    uint c = 0u;
++    bool local_1 = false;
++    uint _e2 = prm(5u);
++    uint w = (_e2 * SCALE);
++    uint _e6 = prm(6u);
++    uint h = (_e6 * SCALE);
++    if (!((gid.x >= w))) {
++        local = (gid.y >= h);
++    } else {
++        local = true;
++    }
++    bool _e17 = local;
++    if (_e17) {
++        return;
++    }
++    uint _e19 = prm(2u);
++    sy = gid.y;
++    uint _e23 = prm(7u);
++    if ((_e23 != 0u)) {
++        sy = (gid.y / 2u);
++    }
++    uint _e30 = prm(0u);
++    uint _e32 = prm(1u);
++    uint _e34 = prm(3u);
++    uint _e40 = prm(4u);
++    uint _e41 = sy;
++    uint _e45 = sy;
++    uint _e54 = read_sample(_e19, _e30, _e32, (_e34 + (gid.x / SCALE)), (_e40 + (_e41 / SCALE)), (((_e45 % SCALE) * SCALE) + (gid.x % SCALE)));
++    c = _e54;
++    if (!((_e19 == PSMCT16_))) {
++        local_1 = (_e19 == PSMCT16S);
++    } else {
++        local_1 = true;
++    }
++    bool _e64 = local_1;
++    if (_e64) {
++        uint _e65 = c;
++        uint _e70 = c;
++        uint _e76 = c;
++        c = ((((_e65 & 31u) << 3u) | ((_e70 & 992u) << 6u)) | ((_e76 & 31744u) << 9u));
++    }
++    uint _e84 = prm(8u);
++    uint _e91 = c;
++    _group_0_binding_5_cs[((_e84 + (gid.y * w)) + gid.x)] = (_e91 | 4278190080u);
++    return;
++}
++
+diff --git a/runtime/src/gs/gpu/glsl/load_clut.comp b/runtime/src/gs/gpu/glsl/load_clut.comp
+new file mode 100644
+index 0000000..27e6552
+--- /dev/null
++++ b/runtime/src/gs/gpu/glsl/load_clut.comp
+@@ -0,0 +1,279 @@
++#version 430 core
++#extension GL_ARB_compute_shader : require
++#extension GL_ARB_shader_storage_buffer_object : require
++layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
++
++struct Params {
++    uvec4 v[16];
++};
++struct Loc {
++    uint word;
++    uint shift;
++    uint mask;
++};
++const uint PSMCT32_ = 0u;
++const uint PSMCT24_ = 1u;
++const uint PSMCT16_ = 2u;
++const uint PSMCT16S = 10u;
++const uint PSMT8_ = 19u;
++const uint PSMT4_ = 20u;
++const uint PSMT8H = 27u;
++const uint PSMT4HL = 36u;
++const uint PSMT4HH = 44u;
++const uint PSMZ32_ = 48u;
++const uint PSMZ24_ = 49u;
++const uint PSMZ16_ = 50u;
++const uint PSMZ16S = 58u;
++const uint T_OFF32_ = 0u;
++const uint T_OFFZ32_ = 2048u;
++const uint T_OFF16_ = 4096u;
++const uint T_OFF16S = 8192u;
++const uint T_OFFZ16_ = 12288u;
++const uint T_OFFZ16S = 16384u;
++const uint T_OFF8_ = 20480u;
++const uint T_OFF4_ = 28672u;
++const uint CLUT_ENTRIES = 512u;
++const uint F_IIP = 1u;
++const uint F_TME = 2u;
++const uint F_FGE = 4u;
++const uint F_ABE = 8u;
++const uint F_FST = 16u;
++const uint F_ZMSK = 32u;
++const uint F_ATE = 64u;
++const uint F_DATE = 128u;
++const uint F_DATM = 256u;
++const uint F_ZTE = 512u;
++const uint F_PABE = 1024u;
++const uint F_COLCLAMP = 2048u;
++const uint F_FBA = 4096u;
++const uint F_TCC = 8192u;
++const uint F_BILINEAR = 16384u;
++const uint F_AEM = 32768u;
++const uint PRIM_WORDS = 28u;
++const uint SETUP_WORDS = 25u;
++const uint SCALE = 1u;
++
++layout(std430, binding = 0) buffer type_4_block_0Compute { uint _group_0_binding_0_cs[]; };
++
++layout(std430, binding = 1) readonly buffer type_5_block_1Compute { uint _group_0_binding_1_cs[]; };
++
++layout(std140, binding = 2) uniform Params_block_2Compute { Params _group_0_binding_2_cs; };
++
++layout(std430, binding = 3) readonly buffer type_5_block_3Compute { uint _group_0_binding_3_cs[]; };
++
++layout(std430, binding = 4) buffer type_5_block_4Compute { uint _group_0_binding_4_cs[]; };
++
++
++uint prm(uint i) {
++    uint _e9 = _group_0_binding_2_cs.v[(i / 4u)][(i % 4u)];
++    return _e9;
++}
++
++uint page_addr(uint bp, uint bw, uint x_1, uint y_1, uint pw, uint ph) {
++    uint per_row = max(1u, ((bw * 64u) / pw));
++    return ((bp * 256u) + (((x_1 / pw) + ((y_1 / ph) * per_row)) * 8192u));
++}
++
++Loc locate(uint psm, uint bp_1, uint bw_1, uint x_2, uint y_2) {
++    uint a = 0u;
++    uint shift = 0u;
++    uint mask = 4294967295u;
++    switch(psm) {
++        case 48u: {
++            uint _e13 = page_addr(bp_1, bw_1, x_2, y_2, 64u, 32u);
++            uint _e25 = _group_0_binding_1_cs[((T_OFFZ32_ + ((y_2 & 31u) * 64u)) + (x_2 & 63u))];
++            a = (_e13 + _e25);
++            break;
++        }
++        case 49u: {
++            uint _e29 = page_addr(bp_1, bw_1, x_2, y_2, 64u, 32u);
++            uint _e41 = _group_0_binding_1_cs[((T_OFFZ32_ + ((y_2 & 31u) * 64u)) + (x_2 & 63u))];
++            a = (_e29 + _e41);
++            mask = 16777215u;
++            break;
++        }
++        case 1u: {
++            uint _e46 = page_addr(bp_1, bw_1, x_2, y_2, 64u, 32u);
++            uint _e58 = _group_0_binding_1_cs[((T_OFF32_ + ((y_2 & 31u) * 64u)) + (x_2 & 63u))];
++            a = (_e46 + _e58);
++            mask = 16777215u;
++            break;
++        }
++        case 2u: {
++            uint _e63 = page_addr(bp_1, bw_1, x_2, y_2, 64u, 64u);
++            uint _e75 = _group_0_binding_1_cs[((T_OFF16_ + ((y_2 & 63u) * 64u)) + (x_2 & 63u))];
++            a = (_e63 + _e75);
++            uint _e77 = a;
++            shift = ((_e77 & 2u) * 8u);
++            mask = 65535u;
++            break;
++        }
++        case 10u: {
++            uint _e85 = page_addr(bp_1, bw_1, x_2, y_2, 64u, 64u);
++            uint _e97 = _group_0_binding_1_cs[((T_OFF16S + ((y_2 & 63u) * 64u)) + (x_2 & 63u))];
++            a = (_e85 + _e97);
++            uint _e99 = a;
++            shift = ((_e99 & 2u) * 8u);
++            mask = 65535u;
++            break;
++        }
++        case 50u: {
++            uint _e107 = page_addr(bp_1, bw_1, x_2, y_2, 64u, 64u);
++            uint _e119 = _group_0_binding_1_cs[((T_OFFZ16_ + ((y_2 & 63u) * 64u)) + (x_2 & 63u))];
++            a = (_e107 + _e119);
++            uint _e121 = a;
++            shift = ((_e121 & 2u) * 8u);
++            mask = 65535u;
++            break;
++        }
++        case 58u: {
++            uint _e129 = page_addr(bp_1, bw_1, x_2, y_2, 64u, 64u);
++            uint _e141 = _group_0_binding_1_cs[((T_OFFZ16S + ((y_2 & 63u) * 64u)) + (x_2 & 63u))];
++            a = (_e129 + _e141);
++            uint _e143 = a;
++            shift = ((_e143 & 2u) * 8u);
++            mask = 65535u;
++            break;
++        }
++        case 19u: {
++            uint _e151 = page_addr(bp_1, bw_1, x_2, y_2, 128u, 64u);
++            uint _e163 = _group_0_binding_1_cs[((T_OFF8_ + ((y_2 & 63u) * 128u)) + (x_2 & 127u))];
++            a = (_e151 + _e163);
++            uint _e165 = a;
++            shift = ((_e165 & 3u) * 8u);
++            mask = 255u;
++            break;
++        }
++        case 20u: {
++            uint n_1 = _group_0_binding_1_cs[((T_OFF4_ + ((y_2 & 127u) * 128u)) + (x_2 & 127u))];
++            uint _e185 = page_addr(bp_1, bw_1, x_2, y_2, 128u, 128u);
++            a = (_e185 + (n_1 / 2u));
++            uint _e189 = a;
++            shift = (((_e189 & 3u) * 8u) + ((n_1 & 1u) * 4u));
++            mask = 15u;
++            break;
++        }
++        case 27u: {
++            uint _e202 = page_addr(bp_1, bw_1, x_2, y_2, 64u, 32u);
++            uint _e214 = _group_0_binding_1_cs[((T_OFF32_ + ((y_2 & 31u) * 64u)) + (x_2 & 63u))];
++            a = (_e202 + _e214);
++            shift = 24u;
++            mask = 255u;
++            break;
++        }
++        case 36u: {
++            uint _e220 = page_addr(bp_1, bw_1, x_2, y_2, 64u, 32u);
++            uint _e232 = _group_0_binding_1_cs[((T_OFF32_ + ((y_2 & 31u) * 64u)) + (x_2 & 63u))];
++            a = (_e220 + _e232);
++            shift = 24u;
++            mask = 15u;
++            break;
++        }
++        case 44u: {
++            uint _e238 = page_addr(bp_1, bw_1, x_2, y_2, 64u, 32u);
++            uint _e250 = _group_0_binding_1_cs[((T_OFF32_ + ((y_2 & 31u) * 64u)) + (x_2 & 63u))];
++            a = (_e238 + _e250);
++            shift = 28u;
++            mask = 15u;
++            break;
++        }
++        default: {
++            uint _e256 = page_addr(bp_1, bw_1, x_2, y_2, 64u, 32u);
++            uint _e268 = _group_0_binding_1_cs[((T_OFF32_ + ((y_2 & 31u) * 64u)) + (x_2 & 63u))];
++            a = (_e256 + _e268);
++            break;
++        }
++    }
++    uint _e270 = a;
++    uint _e275 = shift;
++    uint _e276 = mask;
++    return Loc(((_e270 & 4194303u) >> 2u), _e275, _e276);
++}
++
++uint read_sample(uint psm_1, uint bp_2, uint bw_2, uint x_3, uint y_3, uint k_1) {
++    Loc _e6 = locate(psm_1, bp_2, bw_2, x_3, y_3);
++    uint _e15 = _group_0_binding_0_cs[(((_e6.word * SCALE) * SCALE) + k_1)];
++    return ((_e15 >> _e6.shift) & _e6.mask);
++}
++
++uint read_pixel(uint psm_2, uint bp_3, uint bw_3, uint x_4, uint y_4) {
++    uint _e6 = read_sample(psm_2, bp_3, bw_3, x_4, y_4, 0u);
++    return _e6;
++}
++
++void main() {
++    uint k = gl_LocalInvocationIndex;
++    uint n = 0u;
++    uint entries = 0u;
++    uint x = 0u;
++    uint y = 0u;
++    uint slot = 0u;
++    uint _e2 = prm(1u);
++    bool loop_init = true;
++    while(true) {
++        if (!loop_init) {
++            uint _e142 = n;
++            n = (_e142 + 1u);
++        }
++        loop_init = false;
++        uint _e5 = n;
++        if ((_e5 < _e2)) {
++        } else {
++            break;
++        }
++        {
++            uint _e8 = prm(0u);
++            uint _e9 = n;
++            uint r = (_e8 + (_e9 * 12u));
++            uint _e15 = _group_0_binding_3_cs[r];
++            uint src = (_e15 * CLUT_ENTRIES);
++            uint _e22 = _group_0_binding_3_cs[(r + 1u)];
++            uint dst = (_e22 * CLUT_ENTRIES);
++            uint _e31 = _group_0_binding_4_cs[(src + k)];
++            _group_0_binding_4_cs[(dst + k)] = _e31;
++            uint _e42 = _group_0_binding_4_cs[((src + k) + 256u)];
++            _group_0_binding_4_cs[((dst + k) + 256u)] = _e42;
++            memoryBarrierBuffer();
++            barrier();
++            uint cbp = _group_0_binding_3_cs[(r + 2u)];
++            uint cpsm = _group_0_binding_3_cs[(r + 3u)];
++            uint csm = _group_0_binding_3_cs[(r + 4u)];
++            uint csa = _group_0_binding_3_cs[(r + 5u)];
++            uint _e67 = _group_0_binding_3_cs[(r + 6u)];
++            bool eight = (_e67 != 0u);
++            entries = 16u;
++            if (eight) {
++                entries = 256u;
++            }
++            uint _e73 = entries;
++            if ((k < _e73)) {
++                if ((csm != 0u)) {
++                    uint _e89 = _group_0_binding_3_cs[(r + 7u)];
++                    uint _e94 = _group_0_binding_3_cs[(r + 8u)];
++                    uint _e102 = _group_0_binding_3_cs[(r + 9u)];
++                    uint _e103 = read_pixel(cpsm, cbp, _e89, ((_e94 * 16u) + k), _e102);
++                    _group_0_binding_4_cs[(dst + (((csa * 16u) + k) & 511u))] = _e103;
++                } else {
++                    x = (k & 7u);
++                    y = (k >> 3u);
++                    slot = ((((csa & 15u) * 16u) + k) & 255u);
++                    if (eight) {
++                        uint j = (((k & 4294967271u) | ((k & 8u) << 1u)) | ((k & 16u) >> 1u));
++                        x = (j & 15u);
++                        y = (j >> 4u);
++                        slot = k;
++                    }
++                    uint _e135 = slot;
++                    uint _e139 = x;
++                    uint _e140 = y;
++                    uint _e141 = read_pixel(cpsm, cbp, 1u, _e139, _e140);
++                    _group_0_binding_4_cs[(dst + _e135)] = _e141;
++                }
++            }
++            memoryBarrierBuffer();
++            barrier();
++        }
++    }
++    return;
++}
++
+diff --git a/runtime/src/gs/gpu/glsl/raster.comp b/runtime/src/gs/gpu/glsl/raster.comp
+new file mode 100644
+index 0000000..f1b681e
+--- /dev/null
++++ b/runtime/src/gs/gpu/glsl/raster.comp
+@@ -0,0 +1,1518 @@
++#version 430 core
++#extension GL_ARB_compute_shader : require
++#extension GL_ARB_shader_storage_buffer_object : require
++layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
++
++struct Params {
++    uvec4 v[16];
++};
++struct Loc {
++    uint word;
++    uint shift;
++    uint mask;
++};
++struct Fmt {
++    uint base;
++    uint per_row;
++    uint table;
++    uint bits;
++    uint mask;
++};
++struct Setup {
++    uint flags;
++    uint fbp;
++    uint fbw;
++    uint fpsm;
++    uint fbmsk;
++    uint zbp;
++    uint zpsm;
++    uint modes;
++    uint aref;
++    uint fix;
++    int scax0_;
++    int scax1_;
++    int scay0_;
++    int scay1_;
++    uint tbp;
++    uint tbw;
++    uint tpsm;
++    uint tw;
++    uint th;
++    uint cpsm;
++    uint csa;
++    uint minu;
++    uint maxu;
++    uint minv;
++    uint maxv;
++    uint ta0_;
++    uint ta1_;
++    uint fogcol;
++    uint clut;
++    uint zmax;
++    uint dec;
++    Fmt tf;
++    Fmt ff;
++    Fmt zf;
++};
++struct Attr {
++    float r;
++    float g;
++    float b;
++    float a;
++    float s;
++    float t;
++    float q;
++    float f;
++    uint z;
++};
++const uint PSMCT32_ = 0u;
++const uint PSMCT24_ = 1u;
++const uint PSMCT16_ = 2u;
++const uint PSMCT16S = 10u;
++const uint PSMT8_ = 19u;
++const uint PSMT4_ = 20u;
++const uint PSMT8H = 27u;
++const uint PSMT4HL = 36u;
++const uint PSMT4HH = 44u;
++const uint PSMZ32_ = 48u;
++const uint PSMZ24_ = 49u;
++const uint PSMZ16_ = 50u;
++const uint PSMZ16S = 58u;
++const uint T_OFF32_ = 0u;
++const uint T_OFFZ32_ = 2048u;
++const uint T_OFF16_ = 4096u;
++const uint T_OFF16S = 8192u;
++const uint T_OFFZ16_ = 12288u;
++const uint T_OFFZ16S = 16384u;
++const uint T_OFF8_ = 20480u;
++const uint T_OFF4_ = 28672u;
++const uint CLUT_ENTRIES = 512u;
++const uint F_IIP = 1u;
++const uint F_TME = 2u;
++const uint F_FGE = 4u;
++const uint F_ABE = 8u;
++const uint F_FST = 16u;
++const uint F_ZMSK = 32u;
++const uint F_ATE = 64u;
++const uint F_DATE = 128u;
++const uint F_DATM = 256u;
++const uint F_ZTE = 512u;
++const uint F_PABE = 1024u;
++const uint F_COLCLAMP = 2048u;
++const uint F_FBA = 4096u;
++const uint F_TCC = 8192u;
++const uint F_BILINEAR = 16384u;
++const uint F_AEM = 32768u;
++const uint PRIM_WORDS = 28u;
++const uint SETUP_WORDS = 25u;
++const uint SCALE = 1u;
++
++layout(std430, binding = 0) buffer type_4_block_0Compute { uint _group_0_binding_0_cs[]; };
++
++layout(std430, binding = 1) readonly buffer type_5_block_1Compute { uint _group_0_binding_1_cs[]; };
++
++layout(std140, binding = 2) uniform Params_block_2Compute { Params _group_0_binding_2_cs; };
++
++layout(std430, binding = 3) readonly buffer type_5_block_3Compute { uint _group_0_binding_3_cs[]; };
++
++layout(std430, binding = 4) buffer type_5_block_4Compute { uint _group_0_binding_4_cs[]; };
++
++layout(std430, binding = 5) buffer type_5_block_5Compute { uint _group_0_binding_5_cs[]; };
++
++layout(std430, binding = 7) buffer type_5_block_6Compute { uint _group_0_binding_7_cs[]; };
++
++uint snapshot_lo = 0u;
++
++uint snapshot_hi = 0u;
++
++
++uint prm(uint i_1) {
++    uint _e9 = _group_0_binding_2_cs.v[(i_1 / 4u)][(i_1 % 4u)];
++    return _e9;
++}
++
++Fmt fmt_of(uint psm, uint bp, uint bw) {
++    uint pws = 6u;
++    uint phs = 5u;
++    uint table = T_OFF32_;
++    uint amask = 0u;
++    uint nbit = 0u;
++    uint fixed_ = 0u;
++    uint mask = 4294967295u;
++    switch(psm) {
++        case 48u: {
++            table = T_OFFZ32_;
++            break;
++        }
++        case 49u: {
++            table = T_OFFZ32_;
++            mask = 16777215u;
++            break;
++        }
++        case 1u: {
++            mask = 16777215u;
++            break;
++        }
++        case 2u: {
++            phs = 6u;
++            table = T_OFF16_;
++            amask = 2u;
++            mask = 65535u;
++            break;
++        }
++        case 10u: {
++            phs = 6u;
++            table = T_OFF16S;
++            amask = 2u;
++            mask = 65535u;
++            break;
++        }
++        case 50u: {
++            phs = 6u;
++            table = T_OFFZ16_;
++            amask = 2u;
++            mask = 65535u;
++            break;
++        }
++        case 58u: {
++            phs = 6u;
++            table = T_OFFZ16S;
++            amask = 2u;
++            mask = 65535u;
++            break;
++        }
++        case 19u: {
++            pws = 7u;
++            phs = 6u;
++            table = T_OFF8_;
++            amask = 3u;
++            mask = 255u;
++            break;
++        }
++        case 20u: {
++            pws = 7u;
++            phs = 7u;
++            table = T_OFF4_;
++            amask = 3u;
++            nbit = 1u;
++            mask = 15u;
++            break;
++        }
++        case 27u: {
++            fixed_ = 24u;
++            mask = 255u;
++            break;
++        }
++        case 36u: {
++            fixed_ = 24u;
++            mask = 15u;
++            break;
++        }
++        case 44u: {
++            fixed_ = 28u;
++            mask = 15u;
++            break;
++        }
++        default: {
++            break;
++        }
++    }
++    uint _e59 = pws;
++    uint _e62 = table;
++    uint _e63 = pws;
++    uint _e64 = phs;
++    uint _e68 = amask;
++    uint _e72 = nbit;
++    uint _e76 = fixed_;
++    uint _e80 = mask;
++    return Fmt((bp * 256u), max(1u, ((bw * 64u) >> _e59)), _e62, ((((_e63 | (_e64 << 4u)) | (_e68 << 8u)) | (_e72 << 10u)) | (_e76 << 11u)), _e80);
++}
++
++Loc addr(Fmt f, uint x, uint y) {
++    uint pws_1 = (f.bits & 15u);
++    uint phs_1 = ((f.bits >> 4u) & 15u);
++    uint amask_1 = ((f.bits >> 8u) & 3u);
++    uint nbit_1 = ((f.bits >> 10u) & 1u);
++    uint n_2 = _group_0_binding_1_cs[((f.table + ((y & ((1u << phs_1) - 1u)) << pws_1)) + (x & ((1u << pws_1) - 1u)))];
++    uint a_5 = ((f.base + (((x >> pws_1) + ((y >> phs_1) * f.per_row)) * 8192u)) + (n_2 >> nbit_1));
++    return Loc(((a_5 & 4194303u) >> 2u), (((f.bits >> 11u) + ((a_5 & amask_1) * 8u)) + ((n_2 & nbit_1) * 4u)), f.mask);
++}
++
++uint load_at(Loc l, uint k) {
++    uint _e10 = _group_0_binding_0_cs[(((l.word * SCALE) * SCALE) + k)];
++    return ((_e10 >> l.shift) & l.mask);
++}
++
++void store(Loc l_1, uint k_1, uint value) {
++    uint w_1 = (((l_1.word * SCALE) * SCALE) + k_1);
++    if ((l_1.mask == 4294967295u)) {
++        _group_0_binding_0_cs[w_1] = value;
++        return;
++    }
++    uint _e20 = atomicAnd(_group_0_binding_0_cs[w_1], ~((l_1.mask << l_1.shift)));
++    uint _e27 = atomicOr(_group_0_binding_0_cs[w_1], ((value & l_1.mask) << l_1.shift));
++    return;
++}
++
++Setup load_setup(uint at) {
++    Setup s_1 = Setup(0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0, 0, 0, 0, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, Fmt(0u, 0u, 0u, 0u, 0u), Fmt(0u, 0u, 0u, 0u, 0u), Fmt(0u, 0u, 0u, 0u, 0u));
++    uint _e5 = _group_0_binding_3_cs[at];
++    s_1.flags = _e5;
++    uint _e11 = _group_0_binding_3_cs[(at + 1u)];
++    s_1.fbp = _e11;
++    uint _e17 = _group_0_binding_3_cs[(at + 2u)];
++    s_1.fbw = _e17;
++    uint _e23 = _group_0_binding_3_cs[(at + 3u)];
++    s_1.fpsm = _e23;
++    uint _e29 = _group_0_binding_3_cs[(at + 4u)];
++    s_1.fbmsk = _e29;
++    uint _e35 = _group_0_binding_3_cs[(at + 5u)];
++    s_1.zbp = _e35;
++    uint _e41 = _group_0_binding_3_cs[(at + 6u)];
++    s_1.zpsm = _e41;
++    uint _e47 = _group_0_binding_3_cs[(at + 7u)];
++    s_1.modes = _e47;
++    uint _e53 = _group_0_binding_3_cs[(at + 8u)];
++    s_1.aref = _e53;
++    uint _e59 = _group_0_binding_3_cs[(at + 9u)];
++    s_1.fix = _e59;
++    uint _e65 = _group_0_binding_3_cs[(at + 10u)];
++    s_1.scax0_ = int((_e65 & 65535u));
++    uint _e74 = _group_0_binding_3_cs[(at + 10u)];
++    s_1.scax1_ = int((_e74 >> 16u));
++    uint _e83 = _group_0_binding_3_cs[(at + 11u)];
++    s_1.scay0_ = int((_e83 & 65535u));
++    uint _e92 = _group_0_binding_3_cs[(at + 11u)];
++    s_1.scay1_ = int((_e92 >> 16u));
++    uint _e101 = _group_0_binding_3_cs[(at + 12u)];
++    s_1.tbp = _e101;
++    uint _e107 = _group_0_binding_3_cs[(at + 13u)];
++    s_1.tbw = _e107;
++    uint _e113 = _group_0_binding_3_cs[(at + 14u)];
++    s_1.tpsm = _e113;
++    uint _e119 = _group_0_binding_3_cs[(at + 15u)];
++    s_1.tw = (_e119 & 255u);
++    uint _e127 = _group_0_binding_3_cs[(at + 15u)];
++    s_1.th = (_e127 >> 8u);
++    uint _e135 = _group_0_binding_3_cs[(at + 16u)];
++    s_1.cpsm = _e135;
++    uint _e141 = _group_0_binding_3_cs[(at + 17u)];
++    s_1.csa = _e141;
++    uint _e147 = _group_0_binding_3_cs[(at + 18u)];
++    s_1.minu = (_e147 & 65535u);
++    uint _e155 = _group_0_binding_3_cs[(at + 18u)];
++    s_1.maxu = (_e155 >> 16u);
++    uint _e163 = _group_0_binding_3_cs[(at + 19u)];
++    s_1.minv = (_e163 & 65535u);
++    uint _e171 = _group_0_binding_3_cs[(at + 19u)];
++    s_1.maxv = (_e171 >> 16u);
++    uint _e179 = _group_0_binding_3_cs[(at + 20u)];
++    s_1.ta0_ = (_e179 & 255u);
++    uint _e187 = _group_0_binding_3_cs[(at + 20u)];
++    s_1.ta1_ = ((_e187 >> 8u) & 255u);
++    uint _e197 = _group_0_binding_3_cs[(at + 21u)];
++    s_1.fogcol = _e197;
++    uint _e203 = _group_0_binding_3_cs[(at + 22u)];
++    s_1.clut = _e203;
++    uint _e209 = _group_0_binding_3_cs[(at + 23u)];
++    s_1.zmax = _e209;
++    uint _e215 = _group_0_binding_3_cs[(at + 24u)];
++    s_1.dec = _e215;
++    uint _e218 = s_1.tpsm;
++    uint _e220 = s_1.tbp;
++    uint _e222 = s_1.tbw;
++    Fmt _e223 = fmt_of(_e218, _e220, _e222);
++    s_1.tf = _e223;
++    uint _e226 = s_1.fpsm;
++    uint _e228 = s_1.fbp;
++    uint _e230 = s_1.fbw;
++    Fmt _e231 = fmt_of(_e226, _e228, _e230);
++    s_1.ff = _e231;
++    uint _e234 = s_1.zpsm;
++    uint _e236 = s_1.zbp;
++    uint _e238 = s_1.fbw;
++    Fmt _e239 = fmt_of(_e234, _e236, _e238);
++    s_1.zf = _e239;
++    Setup _e240 = s_1;
++    return _e240;
++}
++
++bool has(Setup s_2, uint f_1) {
++    return ((s_2.flags & f_1) != 0u);
++}
++
++uint mode(Setup s_3, uint shift, uint bits) {
++    return ((s_3.modes >> shift) & ((1u << bits) - 1u));
++}
++
++int clamp255_(int v) {
++    return min(max(v, 0), 255);
++}
++
++uint expand16_(uint c, Setup s_4) {
++    uint a = 0u;
++    bool local_3 = false;
++    uint r_1 = ((c & 31u) << 3u);
++    uint g_1 = (((c >> 5u) & 31u) << 3u);
++    uint b_1 = (((c >> 10u) & 31u) << 3u);
++    a = s_4.ta0_;
++    if (((c & 32768u) != 0u)) {
++        a = s_4.ta1_;
++    } else {
++        bool _e26 = has(s_4, F_AEM);
++        if (_e26) {
++            local_3 = ((c & 32767u) == 0u);
++        } else {
++            local_3 = false;
++        }
++        bool _e34 = local_3;
++        if (_e34) {
++            a = 0u;
++        }
++    }
++    uint _e42 = a;
++    return (((r_1 | (g_1 << 8u)) | (b_1 << 16u)) | (_e42 << 24u));
++}
++
++int wrap_coord(int v_1, int size, uint m, uint mn, uint mx) {
++    switch(m) {
++        case 0u: {
++            return (v_1 & (size - 1));
++        }
++        case 1u: {
++            return min(max(v_1, 0), (size - 1));
++        }
++        case 2u: {
++            return min(max(v_1, int(mn)), int(mx));
++        }
++        default: {
++            return int(((uint(v_1) & mn) | mx));
++        }
++    }
++}
++
++uint texel_x(Setup s_5, int xi) {
++    uint _e7 = mode(s_5, 24u, 2u);
++    int _e10 = wrap_coord(xi, (1 << s_5.tw), _e7, s_5.minu, s_5.maxu);
++    return uint(_e10);
++}
++
++uint texel_y(Setup s_6, int yi) {
++    uint _e7 = mode(s_6, 26u, 2u);
++    int _e10 = wrap_coord(yi, (1 << s_6.th), _e7, s_6.minv, s_6.maxv);
++    return uint(_e10);
++}
++
++uint load_texel(Loc l_2, uint k_2) {
++    bool local_4 = false;
++    uint _e4 = snapshot_lo;
++    if ((l_2.word >= _e4)) {
++        uint _e10 = snapshot_hi;
++        local_4 = (l_2.word < _e10);
++    } else {
++        local_4 = false;
++    }
++    bool _e13 = local_4;
++    if (_e13) {
++        uint _e17 = snapshot_lo;
++        uint _e25 = _group_0_binding_5_cs[((((l_2.word - _e17) * SCALE) * SCALE) + k_2)];
++        return ((_e25 >> l_2.shift) & l_2.mask);
++    }
++    uint _e30 = load_at(l_2, k_2);
++    return _e30;
++}
++
++uint convert(Setup s_7, uint raw) {
++    uint a_1 = 0u;
++    bool local_5 = false;
++    bool local_6 = false;
++    bool local_7 = false;
++    switch(s_7.tpsm) {
++        case 0u:
++        case 48u: {
++            return raw;
++        }
++        case 1u:
++        case 49u: {
++            a_1 = s_7.ta0_;
++            bool _e6 = has(s_7, F_AEM);
++            if (_e6) {
++                local_5 = ((raw & 16777215u) == 0u);
++            } else {
++                local_5 = false;
++            }
++            bool _e14 = local_5;
++            if (_e14) {
++                a_1 = 0u;
++            }
++            uint _e18 = a_1;
++            return ((raw & 16777215u) | (_e18 << 24u));
++        }
++        case 2u:
++        case 10u:
++        case 50u:
++        case 58u: {
++            uint _e22 = expand16_(raw, s_7);
++            return _e22;
++        }
++        case 19u:
++        case 27u: {
++            uint e = _group_0_binding_4_cs[((s_7.clut * CLUT_ENTRIES) + (raw & 255u))];
++            if (!((s_7.cpsm == PSMCT32_))) {
++                local_6 = (s_7.cpsm == PSMCT24_);
++            } else {
++                local_6 = true;
++            }
++            bool _e42 = local_6;
++            if (_e42) {
++                return e;
++            }
++            uint _e43 = expand16_(e, s_7);
++            return _e43;
++        }
++        case 20u:
++        case 36u:
++        case 44u: {
++            uint e_1 = _group_0_binding_4_cs[((s_7.clut * CLUT_ENTRIES) + ((((s_7.csa & 15u) * 16u) + (raw & 15u)) & 511u))];
++            if (!((s_7.cpsm == PSMCT32_))) {
++                local_7 = (s_7.cpsm == PSMCT24_);
++            } else {
++                local_7 = true;
++            }
++            bool _e71 = local_7;
++            if (_e71) {
++                return e_1;
++            }
++            uint _e72 = expand16_(e_1, s_7);
++            return _e72;
++        }
++        default: {
++            return raw;
++        }
++    }
++}
++
++uint fetch(Setup s_8, int xi_1, int yi_1, uint k_3) {
++    uint _e4 = texel_x(s_8, xi_1);
++    uint _e5 = texel_y(s_8, yi_1);
++    if ((s_8.dec != 4294967295u)) {
++        uint _e16 = _group_0_binding_7_cs[((s_8.dec + (_e5 << s_8.tw)) + _e4)];
++        return _e16;
++    }
++    Loc _e18 = addr(s_8.tf, _e4, _e5);
++    uint _e19 = load_texel(_e18, k_3);
++    uint _e20 = convert(s_8, _e19);
++    return _e20;
++}
++
++uint blend4_(uint c00_, uint c10_, uint c01_, uint c11_, float fx, float fy) {
++    uint out_ = 0u;
++    uint ch = 0u;
++    bool loop_init = true;
++    while(true) {
++        if (!loop_init) {
++            uint _e52 = ch;
++            ch = (_e52 + 8u);
++        }
++        loop_init = false;
++        uint _e10 = ch;
++        if ((_e10 < 32u)) {
++        } else {
++            break;
++        }
++        {
++            uint _e13 = ch;
++            float a_6 = float(((c00_ >> _e13) & 255u));
++            uint _e18 = ch;
++            float b_2 = float(((c10_ >> _e18) & 255u));
++            uint _e23 = ch;
++            float c_2 = float(((c01_ >> _e23) & 255u));
++            uint _e28 = ch;
++            float d_1 = float(((c11_ >> _e28) & 255u));
++            float top = (a_6 + ((b_2 - a_6) * fx));
++            float bottom = (c_2 + ((d_1 - c_2) * fx));
++            uint _e39 = out_;
++            uint _e49 = ch;
++            out_ = (_e39 | (uint(clamp(((top + ((bottom - top) * fy)) + 0.5), 0.0, 255.0)) << _e49));
++        }
++    }
++    uint _e55 = out_;
++    return _e55;
++}
++
++uint sample_(Setup s_9, float uin, float vin, uint k_4) {
++    bool _e5 = has(s_9, F_BILINEAR);
++    if (!(_e5)) {
++        uint _e11 = fetch(s_9, int(floor(uin)), int(floor(vin)), k_4);
++        return _e11;
++    }
++    float u_1 = (uin - 0.5);
++    float v_5 = (vin - 0.5);
++    int x0_ = int(floor(u_1));
++    int y0_ = int(floor(v_5));
++    uint _e20 = fetch(s_9, x0_, y0_, k_4);
++    uint _e23 = fetch(s_9, (x0_ + 1), y0_, k_4);
++    uint _e26 = fetch(s_9, x0_, (y0_ + 1), k_4);
++    uint _e31 = fetch(s_9, (x0_ + 1), (y0_ + 1), k_4);
++    uint _e36 = blend4_(_e20, _e23, _e26, _e31, (u_1 - float(x0_)), (v_5 - float(y0_)));
++    return _e36;
++}
++
++uint read_frame(Setup s_10, Loc l_3, uint k_5) {
++    uint a_2 = 0u;
++    uint _e3 = load_at(l_3, k_5);
++    switch(s_10.fpsm) {
++        case 1u: {
++            return (_e3 | 2147483648u);
++        }
++        case 2u:
++        case 10u: {
++            if (((_e3 & 32768u) != 0u)) {
++                a_2 = 2147483648u;
++            }
++            uint _e32 = a_2;
++            return (((((_e3 & 31u) << 3u) | (((_e3 >> 5u) & 31u) << 11u)) | (((_e3 >> 10u) & 31u) << 19u)) | _e32);
++        }
++        default: {
++            return _e3;
++        }
++    }
++}
++
++uint pack16_(uint v_2) {
++    uint a_3 = 0u;
++    if (((v_2 & 2147483648u) != 0u)) {
++        a_3 = 32768u;
++    }
++    uint _e26 = a_3;
++    return (((((v_2 >> 3u) & 31u) | (((v_2 >> 11u) & 31u) << 5u)) | (((v_2 >> 19u) & 31u) << 10u)) | _e26);
++}
++
++void write_frame(Setup s_11, Loc l_4, uint k_6, uint c_1, uint mask_1) {
++    uint m16_ = 0u;
++    uint v_3 = 0u;
++    switch(s_11.fpsm) {
++        case 2u:
++        case 10u: {
++            uint _e6 = load_at(l_4, k_6);
++            uint _e7 = pack16_(mask_1);
++            m16_ = _e7;
++            if (((mask_1 & 2147483648u) != 0u)) {
++                uint _e13 = m16_;
++                m16_ = (_e13 | 32768u);
++            }
++            uint _e16 = pack16_(c_1);
++            uint _e17 = m16_;
++            uint _e20 = m16_;
++            store(l_4, k_6, ((_e16 & ~(_e17)) | (_e6 & _e20)));
++            return;
++        }
++        case 1u: {
++            Loc l32_ = Loc(l_4.word, 0u, 4294967295u);
++            uint _e27 = load_at(l32_, k_6);
++            uint m_1 = (mask_1 | 4278190080u);
++            store(l32_, k_6, ((c_1 & ~(m_1)) | (_e27 & m_1)));
++            return;
++        }
++        default: {
++            v_3 = c_1;
++            if ((mask_1 != 0u)) {
++                uint _e37 = load_at(l_4, k_6);
++                v_3 = ((c_1 & ~(mask_1)) | (_e37 & mask_1));
++            }
++            uint _e42 = v_3;
++            store(l_4, k_6, _e42);
++            return;
++        }
++    }
++}
++
++void plot(Setup s_12, int x_1, int y_1, uint k_7, Attr at_1) {
++    bool local_8 = false;
++    bool local_9 = false;
++    bool local_10 = false;
++    bool local_11 = false;
++    bool local_12 = false;
++    Loc zl = Loc(0u, 0u, 0u);
++    uint dst = 0u;
++    bool have_dst = false;
++    bool local_13 = false;
++    bool local_14 = false;
++    bool local_15 = false;
++    int r = 0;
++    int g = 0;
++    int b = 0;
++    int a_4 = 0;
++    float u = 0.0;
++    float v_4 = 0.0;
++    float q = 0.0;
++    bool write_fb = true;
++    bool write_z = false;
++    bool write_alpha = true;
++    bool ok = false;
++    bool local_16 = false;
++    bool local_17 = false;
++    int cc = 0;
++    ivec3 av = ivec3(0);
++    ivec3 bv = ivec3(0);
++    ivec3 dv = ivec3(0);
++    ivec3 o = ivec3(0);
++    uint out_a = 0u;
++    uint mask_2 = 0u;
++    bool local_18 = false;
++    if (!((x_1 < s_12.scax0_))) {
++        local_8 = (x_1 > s_12.scax1_);
++    } else {
++        local_8 = true;
++    }
++    bool _e13 = local_8;
++    if (!(_e13)) {
++        local_9 = (y_1 < s_12.scay0_);
++    } else {
++        local_9 = true;
++    }
++    bool _e20 = local_9;
++    if (!(_e20)) {
++        local_10 = (y_1 > s_12.scay1_);
++    } else {
++        local_10 = true;
++    }
++    bool _e27 = local_10;
++    if (_e27) {
++        return;
++    }
++    uint _e30 = mode(s_12, 28u, 2u);
++    if ((_e30 == 2u)) {
++        local_11 = ((y_1 & 1) == 0);
++    } else {
++        local_11 = false;
++    }
++    bool _e40 = local_11;
++    if (_e40) {
++        return;
++    }
++    if ((_e30 == 3u)) {
++        local_12 = ((y_1 & 1) != 0);
++    } else {
++        local_12 = false;
++    }
++    bool _e50 = local_12;
++    if (_e50) {
++        return;
++    }
++    uint ux_1 = uint(x_1);
++    uint uy_1 = uint(y_1);
++    uint z = min(at_1.z, s_12.zmax);
++    Loc _e57 = addr(s_12.ff, ux_1, uy_1);
++    bool _e68 = has(s_12, F_DATE);
++    if (_e68) {
++        uint _e69 = read_frame(s_12, _e57, k_7);
++        dst = _e69;
++        have_dst = true;
++        uint _e71 = dst;
++        bool _e77 = has(s_12, F_DATM);
++        if ((((_e71 & 2147483648u) != 0u) != _e77)) {
++            return;
++        }
++    }
++    bool _e80 = has(s_12, F_ZTE);
++    if (_e80) {
++        uint _e83 = mode(s_12, 8u, 2u);
++        if ((_e83 == 0u)) {
++            return;
++        }
++        Loc _e87 = addr(s_12.zf, ux_1, uy_1);
++        zl = _e87;
++        if ((_e83 != 1u)) {
++            Loc _e90 = zl;
++            uint _e91 = load_at(_e90, k_7);
++            uint old = (_e91 & s_12.zmax);
++            if ((_e83 == 2u)) {
++                local_13 = (z < old);
++            } else {
++                local_13 = false;
++            }
++            bool _e100 = local_13;
++            if (!(_e100)) {
++                if ((_e83 == 3u)) {
++                    local_15 = (z <= old);
++                } else {
++                    local_15 = false;
++                }
++                bool _e110 = local_15;
++                local_14 = _e110;
++            } else {
++                local_14 = true;
++            }
++            bool _e112 = local_14;
++            if (_e112) {
++                return;
++            }
++        }
++    }
++    r = int(at_1.r);
++    g = int(at_1.g);
++    b = int(at_1.b);
++    a_4 = int(at_1.a);
++    bool _e126 = has(s_12, F_TME);
++    if (_e126) {
++        bool _e130 = has(s_12, F_FST);
++        if (_e130) {
++            u = (at_1.s / 16.0);
++            v_4 = (at_1.t / 16.0);
++        } else {
++            q = at_1.q;
++            float _e139 = q;
++            if ((_e139 == 0.0)) {
++                q = 1.0;
++            }
++            float _e144 = q;
++            u = ((at_1.s / _e144) * float((1u << s_12.tw)));
++            float _e152 = q;
++            v_4 = ((at_1.t / _e152) * float((1u << s_12.th)));
++        }
++        float _e159 = u;
++        float _e160 = v_4;
++        uint _e161 = sample_(s_12, _e159, _e160, k_7);
++        int tr = int((_e161 & 255u));
++        int tg = int(((_e161 >> 8u) & 255u));
++        int tb = int(((_e161 >> 16u) & 255u));
++        int ta = int((_e161 >> 24u));
++        bool _e179 = has(s_12, F_TCC);
++        uint _e182 = mode(s_12, 20u, 2u);
++        switch(_e182) {
++            case 0u: {
++                int _e183 = r;
++                int _e187 = clamp255_(((tr * _e183) >> 7u));
++                r = _e187;
++                int _e188 = g;
++                int _e192 = clamp255_(((tg * _e188) >> 7u));
++                g = _e192;
++                int _e193 = b;
++                int _e197 = clamp255_(((tb * _e193) >> 7u));
++                b = _e197;
++                if (_e179) {
++                    int _e198 = a_4;
++                    int _e202 = clamp255_(((ta * _e198) >> 7u));
++                    a_4 = _e202;
++                }
++                break;
++            }
++            case 1u: {
++                r = tr;
++                g = tg;
++                b = tb;
++                if (_e179) {
++                    a_4 = ta;
++                }
++                break;
++            }
++            case 2u: {
++                int _e203 = r;
++                int _e207 = a_4;
++                int _e209 = clamp255_((((tr * _e203) >> 7u) + _e207));
++                r = _e209;
++                int _e210 = g;
++                int _e214 = a_4;
++                int _e216 = clamp255_((((tg * _e210) >> 7u) + _e214));
++                g = _e216;
++                int _e217 = b;
++                int _e221 = a_4;
++                int _e223 = clamp255_((((tb * _e217) >> 7u) + _e221));
++                b = _e223;
++                if (_e179) {
++                    int _e224 = a_4;
++                    int _e226 = clamp255_((ta + _e224));
++                    a_4 = _e226;
++                }
++                break;
++            }
++            default: {
++                int _e227 = r;
++                int _e231 = a_4;
++                int _e233 = clamp255_((((tr * _e227) >> 7u) + _e231));
++                r = _e233;
++                int _e234 = g;
++                int _e238 = a_4;
++                int _e240 = clamp255_((((tg * _e234) >> 7u) + _e238));
++                g = _e240;
++                int _e241 = b;
++                int _e245 = a_4;
++                int _e247 = clamp255_((((tb * _e241) >> 7u) + _e245));
++                b = _e247;
++                if (_e179) {
++                    a_4 = ta;
++                }
++                break;
++            }
++        }
++    }
++    bool _e249 = has(s_12, F_FGE);
++    if (_e249) {
++        int f_2 = int(at_1.f);
++        int fr = int((s_12.fogcol & 255u));
++        int fg = int(((s_12.fogcol >> 8u) & 255u));
++        int fb = int(((s_12.fogcol >> 16u) & 255u));
++        int _e268 = r;
++        r = (((f_2 * _e268) + ((255 - f_2) * fr)) >> 8u);
++        int _e276 = g;
++        g = (((f_2 * _e276) + ((255 - f_2) * fg)) >> 8u);
++        int _e284 = b;
++        b = (((f_2 * _e284) + ((255 - f_2) * fb)) >> 8u);
++    }
++    bool _e295 = has(s_12, F_ZMSK);
++    write_z = !(_e295);
++    bool _e301 = has(s_12, F_ATE);
++    if (_e301) {
++        int _e302 = a_4;
++        uint av_1 = uint(_e302);
++        uint _e308 = mode(s_12, 0u, 3u);
++        switch(_e308) {
++            case 0u: {
++                ok = false;
++                break;
++            }
++            case 1u: {
++                ok = true;
++                break;
++            }
++            case 2u: {
++                ok = (av_1 < s_12.aref);
++                break;
++            }
++            case 3u: {
++                ok = (av_1 <= s_12.aref);
++                break;
++            }
++            case 4u: {
++                ok = (av_1 == s_12.aref);
++                break;
++            }
++            case 5u: {
++                ok = (av_1 >= s_12.aref);
++                break;
++            }
++            case 6u: {
++                ok = (av_1 > s_12.aref);
++                break;
++            }
++            default: {
++                ok = (av_1 != s_12.aref);
++                break;
++            }
++        }
++        bool _e323 = ok;
++        if (!(_e323)) {
++            uint _e327 = mode(s_12, 4u, 2u);
++            switch(_e327) {
++                case 0u: {
++                    return;
++                }
++                case 1u: {
++                    write_z = false;
++                    break;
++                }
++                case 2u: {
++                    write_fb = false;
++                    break;
++                }
++                default: {
++                    write_z = false;
++                    write_alpha = false;
++                    break;
++                }
++            }
++        }
++    }
++    bool _e332 = write_fb;
++    if (_e332) {
++        bool _e334 = has(s_12, F_COLCLAMP);
++        bool _e336 = has(s_12, F_ABE);
++        if (_e336) {
++            bool _e340 = has(s_12, F_PABE);
++            if (!(!(_e340))) {
++                int _e345 = a_4;
++                local_17 = ((_e345 & 128) != 0);
++            } else {
++                local_17 = true;
++            }
++            bool _e351 = local_17;
++            local_16 = _e351;
++        } else {
++            local_16 = false;
++        }
++        bool _e353 = local_16;
++        if (_e353) {
++            bool _e354 = have_dst;
++            if (!(_e354)) {
++                uint _e356 = read_frame(s_12, _e57, k_7);
++                dst = _e356;
++            }
++            uint _e357 = dst;
++            uint _e361 = dst;
++            uint _e367 = dst;
++            ivec3 cd = ivec3(int((_e357 & 255u)), int(((_e361 >> 8u) & 255u)), int(((_e367 >> 16u) & 255u)));
++            int _e374 = r;
++            int _e375 = g;
++            int _e376 = b;
++            ivec3 cs = ivec3(_e374, _e375, _e376);
++            uint _e378 = dst;
++            int ad = int((_e378 >> 24u));
++            uint _e384 = mode(s_12, 12u, 2u);
++            uint _e387 = mode(s_12, 14u, 2u);
++            uint _e390 = mode(s_12, 16u, 2u);
++            uint _e393 = mode(s_12, 18u, 2u);
++            cc = int(s_12.fix);
++            if ((_e390 == 0u)) {
++                int _e399 = a_4;
++                cc = _e399;
++            } else {
++                if ((_e390 == 1u)) {
++                    cc = ad;
++                }
++            }
++            if ((_e384 == 0u)) {
++                av = cs;
++            } else {
++                if ((_e384 == 1u)) {
++                    av = cd;
++                }
++            }
++            if ((_e387 == 0u)) {
++                bv = cs;
++            } else {
++                if ((_e387 == 1u)) {
++                    bv = cd;
++                }
++            }
++            if ((_e393 == 0u)) {
++                dv = cs;
++            } else {
++                if ((_e393 == 1u)) {
++                    dv = cd;
++                }
++            }
++            ivec3 _e423 = av;
++            ivec3 _e424 = bv;
++            int _e426 = cc;
++            ivec3 _e431 = dv;
++            o = ((((_e423 - _e424) * _e426) >> uvec3(7u)) + _e431);
++            if (_e334) {
++                ivec3 _e434 = o;
++                o = min(max(_e434, ivec3(0)), ivec3(255));
++            } else {
++                ivec3 _e440 = o;
++                o = (_e440 & ivec3(255));
++            }
++            int _e445 = o.x;
++            r = _e445;
++            int _e447 = o.y;
++            g = _e447;
++            int _e449 = o.z;
++            b = _e449;
++        } else {
++            if (!(_e334)) {
++                int _e451 = r;
++                r = (_e451 & 255);
++                int _e454 = g;
++                g = (_e454 & 255);
++                int _e457 = b;
++                b = (_e457 & 255);
++            }
++        }
++        int _e460 = a_4;
++        out_a = uint((_e460 & 255));
++        bool _e466 = has(s_12, F_FBA);
++        if (_e466) {
++            uint _e467 = out_a;
++            out_a = (_e467 | 128u);
++        }
++        mask_2 = s_12.fbmsk;
++        bool _e472 = write_alpha;
++        if (!(_e472)) {
++            uint _e474 = mask_2;
++            mask_2 = (_e474 | 4278190080u);
++        }
++        int _e477 = r;
++        int _e479 = g;
++        int _e484 = b;
++        uint _e489 = out_a;
++        uint _e493 = mask_2;
++        write_frame(s_12, _e57, k_7, (((uint(_e477) | (uint(_e479) << 8u)) | (uint(_e484) << 16u)) | (_e489 << 24u)), _e493);
++    }
++    bool _e494 = write_z;
++    if (_e494) {
++        local_18 = _e80;
++    } else {
++        local_18 = false;
++    }
++    bool _e498 = local_18;
++    if (_e498) {
++        Loc _e499 = zl;
++        store(_e499, k_7, z);
++        return;
++    } else {
++        return;
++    }
++}
++
++float fat(uint i_2) {
++    uint _e3 = _group_0_binding_3_cs[i_2];
++    return uintBitsToFloat(_e3);
++}
++
++vec4 vertex_attr(uint p, uint n) {
++    uint c_3 = _group_0_binding_3_cs[((p + 12u) + n)];
++    return vec4(float((c_3 & 255u)), float(((c_3 >> 8u) & 255u)), float(((c_3 >> 16u) & 255u)), float((c_3 >> 24u)));
++}
++
++vec4 vertex_tex(uint p_1, uint n_1) {
++    float _e7 = fat(((p_1 + 15u) + (n_1 * 3u)));
++    float _e13 = fat(((p_1 + 16u) + (n_1 * 3u)));
++    float _e19 = fat(((p_1 + 17u) + (n_1 * 3u)));
++    uint _e24 = _group_0_binding_3_cs[(p_1 + 11u)];
++    return vec4(_e7, _e13, _e19, float(((_e24 >> (n_1 * 8u)) & 255u)));
++}
++
++uint z_at(uint p_2, float d) {
++    uint z0_ = _group_0_binding_3_cs[(p_2 + 24u)];
++    float step_ = floor(d);
++    if ((step_ >= 0.0)) {
++        return (z0_ + uint(min(step_, float((4294967295u - z0_)))));
++    }
++    return (z0_ - uint(min(-(step_), float(z0_))));
++}
++
++bool edge_in(float w, uint inclusive) {
++    bool local_19 = false;
++    bool local_20 = false;
++    if (!((w > 0.0))) {
++        if ((w == 0.0)) {
++            local_20 = (inclusive != 0u);
++        } else {
++            local_20 = false;
++        }
++        bool _e14 = local_20;
++        local_19 = _e14;
++    } else {
++        local_19 = true;
++    }
++    bool _e16 = local_19;
++    return _e16;
++}
++
++void shade_at(uint p_3, Setup s_13, int x_2, int y_2, uint k_8, float px, float py) {
++    Attr at_2 = Attr(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0u);
++    bool local_21 = false;
++    bool local_22 = false;
++    float du = 0.0;
++    float dv_1 = 0.0;
++    float q_1 = 0.0;
++    float ux = 0.0;
++    float uy = 0.0;
++    bool local_23 = false;
++    bool local_24 = false;
++    bool local_25 = false;
++    bool local_26 = false;
++    bool local_27 = false;
++    bool local_28 = false;
++    bool local_29 = false;
++    bool local_30 = false;
++    bool local_31 = false;
++    bool local_32 = false;
++    bool local_33 = false;
++    bool local_34 = false;
++    float tx = 0.0;
++    float ty = 0.0;
++    int guess = 0;
++    int hit = -1;
++    int k_9 = 0;
++    bool local_35 = false;
++    bool local_36 = false;
++    float t = 0.0;
++    bool local_37 = false;
++    float t_1 = 0.0;
++    bool local_38 = false;
++    uint kind = _group_0_binding_3_cs[(p_3 + 1u)];
++    switch(kind) {
++        case 0u: {
++            float _e15 = fat((p_3 + 4u));
++            float _e18 = fat((p_3 + 5u));
++            float _e21 = fat((p_3 + 6u));
++            float _e24 = fat((p_3 + 7u));
++            float _e27 = fat((p_3 + 8u));
++            float _e30 = fat((p_3 + 9u));
++            float _e33 = fat((p_3 + 10u));
++            float w0_ = ((((_e21 - px) * (_e30 - py)) - ((_e27 - px) * (_e24 - py))) * _e33);
++            float w1_ = ((((_e27 - px) * (_e18 - py)) - ((_e15 - px) * (_e30 - py))) * _e33);
++            float c2_ = ((((_e15 - px) * (_e24 - py)) - ((_e21 - px) * (_e18 - py))) * _e33);
++            uint inclusive_1 = _group_0_binding_3_cs[(p_3 + 27u)];
++            bool _e65 = edge_in(w0_, (inclusive_1 & 1u));
++            if (!(!(_e65))) {
++                bool _e72 = edge_in(w1_, (inclusive_1 & 2u));
++                local_21 = !(_e72);
++            } else {
++                local_21 = true;
++            }
++            bool _e75 = local_21;
++            if (!(_e75)) {
++                bool _e81 = edge_in(c2_, (inclusive_1 & 4u));
++                local_22 = !(_e81);
++            } else {
++                local_22 = true;
++            }
++            bool _e84 = local_22;
++            if (_e84) {
++                return;
++            }
++            float w2_ = ((1.0 - w0_) - w1_);
++            vec4 _e89 = vertex_attr(p_3, 0u);
++            vec4 _e92 = vertex_attr(p_3, 1u);
++            vec4 _e96 = vertex_attr(p_3, 2u);
++            vec4 c_4 = (((_e89 * w0_) + (_e92 * w1_)) + (_e96 * w2_));
++            vec4 _e100 = vertex_tex(p_3, 0u);
++            vec4 _e103 = vertex_tex(p_3, 1u);
++            vec4 _e107 = vertex_tex(p_3, 2u);
++            vec4 t_2 = (((_e100 * w0_) + (_e103 * w1_)) + (_e107 * w2_));
++            float _e120 = fat((p_3 + 25u));
++            float _e124 = fat((p_3 + 26u));
++            uint _e127 = z_at(p_3, ((_e120 * w1_) + (_e124 * w2_)));
++            at_2 = Attr(c_4.x, c_4.y, c_4.z, c_4.w, t_2.x, t_2.y, t_2.z, t_2.w, _e127);
++            break;
++        }
++        case 1u: {
++            float _e131 = fat((p_3 + 4u));
++            float _e134 = fat((p_3 + 5u));
++            float _e137 = fat((p_3 + 6u));
++            float _e140 = fat((p_3 + 7u));
++            vec4 _e142 = vertex_tex(p_3, 0u);
++            vec4 _e144 = vertex_tex(p_3, 1u);
++            du = (_e144.x - _e142.x);
++            dv_1 = (_e144.y - _e142.y);
++            bool _e154 = has(s_13, F_FST);
++            if (_e154) {
++                float _e155 = du;
++                du = (_e155 / 16.0);
++                float _e158 = dv_1;
++                dv_1 = (_e158 / 16.0);
++            } else {
++                q_1 = _e144.z;
++                float _e163 = q_1;
++                if ((_e163 == 0.0)) {
++                    q_1 = 1.0;
++                }
++                float _e167 = du;
++                float _e168 = q_1;
++                du = ((_e167 / _e168) * float((1u << s_13.tw)));
++                float _e175 = dv_1;
++                float _e176 = q_1;
++                dv_1 = ((_e175 / _e176) * float((1u << s_13.th)));
++            }
++            ux = px;
++            uy = py;
++            if (!((s_13.tpsm == 0u))) {
++                local_23 = (s_13.tpsm == 1u);
++            } else {
++                local_23 = true;
++            }
++            bool _e195 = local_23;
++            if (!(_e195)) {
++                local_24 = (s_13.tpsm == 2u);
++            } else {
++                local_24 = true;
++            }
++            bool _e203 = local_24;
++            if (!(_e203)) {
++                local_25 = (s_13.tpsm == 10u);
++            } else {
++                local_25 = true;
++            }
++            bool _e211 = local_25;
++            if (!(_e211)) {
++                local_26 = (s_13.tpsm >= 48u);
++            } else {
++                local_26 = true;
++            }
++            bool direct = local_26;
++            bool _e221 = has(s_13, F_TME);
++            if (_e221) {
++                bool _e225 = has(s_13, F_BILINEAR);
++                if (!(!(_e225))) {
++                    local_28 = direct;
++                } else {
++                    local_28 = true;
++                }
++                bool _e231 = local_28;
++                local_27 = _e231;
++            } else {
++                local_27 = false;
++            }
++            bool point = local_27;
++            if (point) {
++                float _e236 = du;
++                local_29 = (abs(_e236) >= (abs(_e137) * 0.999));
++            } else {
++                local_29 = false;
++            }
++            bool _e243 = local_29;
++            if (_e243) {
++                ux = float(x_2);
++            }
++            if (point) {
++                float _e247 = dv_1;
++                local_30 = (abs(_e247) >= (abs(_e140) * 0.999));
++            } else {
++                local_30 = false;
++            }
++            bool _e254 = local_30;
++            if (_e254) {
++                uy = float(y_2);
++            }
++            float cx = float(x_2);
++            float cy = float(y_2);
++            if (false) {
++                if (!((cx < min(_e131, (_e131 + _e137))))) {
++                    local_32 = (cx >= max(_e131, (_e131 + _e137)));
++                } else {
++                    local_32 = true;
++                }
++                bool _e274 = local_32;
++                if (!(_e274)) {
++                    local_33 = (cy < min(_e134, (_e134 + _e140)));
++                } else {
++                    local_33 = true;
++                }
++                bool _e282 = local_33;
++                if (!(_e282)) {
++                    local_34 = (cy >= max(_e134, (_e134 + _e140)));
++                } else {
++                    local_34 = true;
++                }
++                bool _e290 = local_34;
++                local_31 = _e290;
++            } else {
++                local_31 = false;
++            }
++            bool _e292 = local_31;
++            if (_e292) {
++                return;
++            }
++            if ((_e137 != 0.0)) {
++                float _e299 = ux;
++                tx = ((_e299 - _e131) / _e137);
++            }
++            if ((_e140 != 0.0)) {
++                float _e304 = uy;
++                ty = ((_e304 - _e134) / _e140);
++            }
++            vec4 _e308 = vertex_attr(p_3, 1u);
++            float _e317 = tx;
++            float _e324 = ty;
++            uint _e333 = _group_0_binding_3_cs[(p_3 + 24u)];
++            at_2 = Attr(_e308.x, _e308.y, _e308.z, _e308.w, (_e142.x + ((_e144.x - _e142.x) * _e317)), (_e142.y + ((_e144.y - _e142.y) * _e324)), _e144.z, _e144.w, _e333);
++            break;
++        }
++        case 2u: {
++            float _e337 = fat((p_3 + 4u));
++            float _e340 = fat((p_3 + 5u));
++            float _e343 = fat((p_3 + 6u));
++            float _e346 = fat((p_3 + 7u));
++            uint _e351 = _group_0_binding_3_cs[(p_3 + 8u)];
++            int steps = int(_e351);
++            int count = max(steps, 1);
++            if ((abs((_e343 - _e337)) >= abs((_e346 - _e340)))) {
++                if ((_e343 != _e337)) {
++                    guess = int(roundEven((((px - _e337) / (_e343 - _e337)) * float(steps))));
++                }
++            } else {
++                guess = int(roundEven((((py - _e340) / (_e346 - _e340)) * float(steps))));
++            }
++            int _e379 = guess;
++            k_9 = (_e379 - 1);
++            bool loop_init_1 = true;
++            while(true) {
++                if (!loop_init_1) {
++                    int _e433 = k_9;
++                    k_9 = (_e433 + 1);
++                }
++                loop_init_1 = false;
++                int _e383 = k_9;
++                int _e384 = guess;
++                if ((_e383 <= (_e384 + 1))) {
++                } else {
++                    break;
++                }
++                {
++                    int _e388 = k_9;
++                    if (!((_e388 < 0))) {
++                        int _e394 = k_9;
++                        local_35 = (_e394 >= count);
++                    } else {
++                        local_35 = true;
++                    }
++                    bool _e397 = local_35;
++                    if (!(_e397)) {
++                        int _e401 = hit;
++                        local_36 = (_e401 >= 0);
++                    } else {
++                        local_36 = true;
++                    }
++                    bool _e405 = local_36;
++                    if (_e405) {
++                        continue;
++                    }
++                    t = 0.0;
++                    if ((steps != 0)) {
++                        int _e410 = k_9;
++                        t = (float(_e410) / float(steps));
++                    }
++                    float _e415 = t;
++                    if ((int(roundEven((_e337 + ((_e343 - _e337) * _e415)))) == x_2)) {
++                        float _e424 = t;
++                        local_37 = (int(roundEven((_e340 + ((_e346 - _e340) * _e424)))) == y_2);
++                    } else {
++                        local_37 = false;
++                    }
++                    bool _e431 = local_37;
++                    if (_e431) {
++                        int _e432 = k_9;
++                        hit = _e432;
++                    }
++                }
++            }
++            int _e436 = hit;
++            if ((_e436 < 0)) {
++                return;
++            }
++            if ((steps != 0)) {
++                int _e443 = hit;
++                t_1 = (float(_e443) / float(steps));
++            }
++            vec4 _e448 = vertex_attr(p_3, 0u);
++            float _e449 = t_1;
++            vec4 _e454 = vertex_attr(p_3, 1u);
++            float _e455 = t_1;
++            vec4 c_5 = ((_e448 * (1.0 - _e449)) + (_e454 * _e455));
++            vec4 _e459 = vertex_tex(p_3, 0u);
++            float _e460 = t_1;
++            vec4 _e465 = vertex_tex(p_3, 1u);
++            float _e466 = t_1;
++            vec4 tex = ((_e459 * (1.0 - _e460)) + (_e465 * _e466));
++            float _e479 = fat((p_3 + 25u));
++            float _e480 = t_1;
++            uint _e482 = z_at(p_3, (_e479 * _e480));
++            at_2 = Attr(c_5.x, c_5.y, c_5.z, c_5.w, tex.x, tex.y, tex.z, tex.w, _e482);
++            break;
++        }
++        default: {
++            uint _e488 = _group_0_binding_3_cs[(p_3 + 4u)];
++            if (!((x_2 != int(_e488)))) {
++                uint _e498 = _group_0_binding_3_cs[(p_3 + 5u)];
++                local_38 = (y_2 != int(_e498));
++            } else {
++                local_38 = true;
++            }
++            bool _e502 = local_38;
++            if (_e502) {
++                return;
++            }
++            vec4 _e504 = vertex_attr(p_3, 0u);
++            vec4 _e506 = vertex_tex(p_3, 0u);
++            uint _e519 = _group_0_binding_3_cs[(p_3 + 24u)];
++            at_2 = Attr(_e504.x, _e504.y, _e504.z, _e504.w, _e506.x, _e506.y, _e506.z, _e506.w, _e519);
++            break;
++        }
++    }
++    Attr _e521 = at_2;
++    plot(s_13, x_2, y_2, k_8, _e521);
++    return;
++}
++
++void main() {
++    uvec3 wid = gl_WorkGroupID;
++    uvec3 lid = gl_LocalInvocationID;
++    uint last_setup = 4294967295u;
++    Setup s = Setup(0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0, 0, 0, 0, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, Fmt(0u, 0u, 0u, 0u, 0u), Fmt(0u, 0u, 0u, 0u, 0u), Fmt(0u, 0u, 0u, 0u, 0u));
++    uint i = 0u;
++    bool local = false;
++    bool local_1 = false;
++    bool local_2 = false;
++    uint index = (wid.x + (wid.y * 1024u));
++    uint _e8 = prm(3u);
++    if ((index >= _e8)) {
++        return;
++    }
++    uint _e11 = prm(0u);
++    uint tile = (_e11 + (index * 2u));
++    uint origin = _group_0_binding_3_cs[tile];
++    uint sx = (((origin & 65535u) * 16u) + lid.x);
++    uint sy = (((origin >> 16u) * 16u) + lid.y);
++    int x_3 = int((sx / SCALE));
++    int y_3 = int((sy / SCALE));
++    uint k_10 = (((sy % SCALE) * SCALE) + (sx % SCALE));
++    float px_1 = (float(x_3) + (float((sx % SCALE)) / 1.0));
++    float py_1 = (float(y_3) + (float((sy % SCALE)) / 1.0));
++    uint first = _group_0_binding_3_cs[(tile + 1u)];
++    uint _e70 = _group_0_binding_3_cs[(tile + 3u)];
++    uint count_1 = (_e70 - first);
++    uint _e73 = prm(4u);
++    uint _e75 = prm(1u);
++    uint _e77 = prm(2u);
++    uint _e80 = prm(5u);
++    snapshot_lo = _e80;
++    uint _e83 = prm(6u);
++    snapshot_hi = _e83;
++    bool loop_init_2 = true;
++    while(true) {
++        if (!loop_init_2) {
++            uint _e160 = i;
++            i = (_e160 + 1u);
++        }
++        loop_init_2 = false;
++        uint _e89 = i;
++        if ((_e89 < count_1)) {
++        } else {
++            break;
++        }
++        {
++            uint _e91 = i;
++            uint h = (first + _e91);
++            uint _e98 = _group_0_binding_3_cs[(_e73 + (h >> 1u))];
++            uint p_4 = (_e75 + (((_e98 >> ((h & 1u) * 16u)) & 65535u) * PRIM_WORDS));
++            uint si = _group_0_binding_3_cs[p_4];
++            uint _e112 = last_setup;
++            if ((si != _e112)) {
++                Setup _e117 = load_setup((_e77 + (si * SETUP_WORDS)));
++                s = _e117;
++                last_setup = si;
++            }
++            uint lo = _group_0_binding_3_cs[(p_4 + 2u)];
++            uint hi = _group_0_binding_3_cs[(p_4 + 3u)];
++            if (!((x_3 < int((lo & 65535u))))) {
++                local = (y_3 < int((lo >> 16u)));
++            } else {
++                local = true;
++            }
++            bool _e140 = local;
++            if (!(_e140)) {
++                local_1 = (x_3 > int((hi & 65535u)));
++            } else {
++                local_1 = true;
++            }
++            bool _e149 = local_1;
++            if (!(_e149)) {
++                local_2 = (y_3 > int((hi >> 16u)));
++            } else {
++                local_2 = true;
++            }
++            bool _e158 = local_2;
++            if (_e158) {
++                continue;
++            }
++            Setup _e159 = s;
++            shade_at(p_4, _e159, x_3, y_3, k_10, px_1, py_1);
++        }
++    }
++    return;
++}
++
+diff --git a/runtime/src/gs/gpu/glsl/resolve.comp b/runtime/src/gs/gpu/glsl/resolve.comp
+new file mode 100644
+index 0000000..ede7d70
+--- /dev/null
++++ b/runtime/src/gs/gpu/glsl/resolve.comp
+@@ -0,0 +1,74 @@
++#version 430 core
++#extension GL_ARB_compute_shader : require
++#extension GL_ARB_shader_storage_buffer_object : require
++layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
++
++struct Params {
++    uvec4 v[16];
++};
++const uint PSMCT32_ = 0u;
++const uint PSMCT24_ = 1u;
++const uint PSMCT16_ = 2u;
++const uint PSMCT16S = 10u;
++const uint PSMT8_ = 19u;
++const uint PSMT4_ = 20u;
++const uint PSMT8H = 27u;
++const uint PSMT4HL = 36u;
++const uint PSMT4HH = 44u;
++const uint PSMZ32_ = 48u;
++const uint PSMZ24_ = 49u;
++const uint PSMZ16_ = 50u;
++const uint PSMZ16S = 58u;
++const uint T_OFF32_ = 0u;
++const uint T_OFFZ32_ = 2048u;
++const uint T_OFF16_ = 4096u;
++const uint T_OFF16S = 8192u;
++const uint T_OFFZ16_ = 12288u;
++const uint T_OFFZ16S = 16384u;
++const uint T_OFF8_ = 20480u;
++const uint T_OFF4_ = 28672u;
++const uint CLUT_ENTRIES = 512u;
++const uint F_IIP = 1u;
++const uint F_TME = 2u;
++const uint F_FGE = 4u;
++const uint F_ABE = 8u;
++const uint F_FST = 16u;
++const uint F_ZMSK = 32u;
++const uint F_ATE = 64u;
++const uint F_DATE = 128u;
++const uint F_DATM = 256u;
++const uint F_ZTE = 512u;
++const uint F_PABE = 1024u;
++const uint F_COLCLAMP = 2048u;
++const uint F_FBA = 4096u;
++const uint F_TCC = 8192u;
++const uint F_BILINEAR = 16384u;
++const uint F_AEM = 32768u;
++const uint PRIM_WORDS = 28u;
++const uint SETUP_WORDS = 25u;
++const uint SCALE = 1u;
++
++layout(std430, binding = 0) buffer type_4_block_0Compute { uint _group_0_binding_0_cs[]; };
++
++layout(std140, binding = 2) uniform Params_block_1Compute { Params _group_0_binding_2_cs; };
++
++layout(std430, binding = 5) buffer type_5_block_2Compute { uint _group_0_binding_5_cs[]; };
++
++
++uint prm(uint i) {
++    uint _e9 = _group_0_binding_2_cs.v[(i / 4u)][(i % 4u)];
++    return _e9;
++}
++
++void main() {
++    uvec3 gid = gl_GlobalInvocationID;
++    uint _e2 = prm(0u);
++    uint i_1 = ((_e2 + gid.x) + ((gid.y * 64u) * 1024u));
++    if ((i_1 >= 1048576u)) {
++        return;
++    }
++    uint _e21 = _group_0_binding_0_cs[((i_1 * SCALE) * SCALE)];
++    _group_0_binding_5_cs[i_1] = _e21;
++    return;
++}
++
+diff --git a/runtime/src/gs/gpu/glsl/snapshot.comp b/runtime/src/gs/gpu/glsl/snapshot.comp
+new file mode 100644
+index 0000000..7090869
+--- /dev/null
++++ b/runtime/src/gs/gpu/glsl/snapshot.comp
+@@ -0,0 +1,75 @@
++#version 430 core
++#extension GL_ARB_compute_shader : require
++#extension GL_ARB_shader_storage_buffer_object : require
++layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
++
++struct Params {
++    uvec4 v[16];
++};
++const uint PSMCT32_ = 0u;
++const uint PSMCT24_ = 1u;
++const uint PSMCT16_ = 2u;
++const uint PSMCT16S = 10u;
++const uint PSMT8_ = 19u;
++const uint PSMT4_ = 20u;
++const uint PSMT8H = 27u;
++const uint PSMT4HL = 36u;
++const uint PSMT4HH = 44u;
++const uint PSMZ32_ = 48u;
++const uint PSMZ24_ = 49u;
++const uint PSMZ16_ = 50u;
++const uint PSMZ16S = 58u;
++const uint T_OFF32_ = 0u;
++const uint T_OFFZ32_ = 2048u;
++const uint T_OFF16_ = 4096u;
++const uint T_OFF16S = 8192u;
++const uint T_OFFZ16_ = 12288u;
++const uint T_OFFZ16S = 16384u;
++const uint T_OFF8_ = 20480u;
++const uint T_OFF4_ = 28672u;
++const uint CLUT_ENTRIES = 512u;
++const uint F_IIP = 1u;
++const uint F_TME = 2u;
++const uint F_FGE = 4u;
++const uint F_ABE = 8u;
++const uint F_FST = 16u;
++const uint F_ZMSK = 32u;
++const uint F_ATE = 64u;
++const uint F_DATE = 128u;
++const uint F_DATM = 256u;
++const uint F_ZTE = 512u;
++const uint F_PABE = 1024u;
++const uint F_COLCLAMP = 2048u;
++const uint F_FBA = 4096u;
++const uint F_TCC = 8192u;
++const uint F_BILINEAR = 16384u;
++const uint F_AEM = 32768u;
++const uint PRIM_WORDS = 28u;
++const uint SETUP_WORDS = 25u;
++const uint SCALE = 1u;
++
++layout(std430, binding = 0) buffer type_4_block_0Compute { uint _group_0_binding_0_cs[]; };
++
++layout(std140, binding = 2) uniform Params_block_1Compute { Params _group_0_binding_2_cs; };
++
++layout(std430, binding = 5) buffer type_5_block_2Compute { uint _group_0_binding_5_cs[]; };
++
++
++uint prm(uint i) {
++    uint _e9 = _group_0_binding_2_cs.v[(i / 4u)][(i % 4u)];
++    return _e9;
++}
++
++void main() {
++    uvec3 gid = gl_GlobalInvocationID;
++    uint i_1 = (gid.x + ((gid.y * 64u) * 1024u));
++    uint _e9 = prm(1u);
++    if ((i_1 >= _e9)) {
++        return;
++    }
++    uint _e15 = prm(0u);
++    uint _e22 = _group_0_binding_0_cs[(((_e15 * SCALE) * SCALE) + i_1)];
++    _group_0_binding_5_cs[i_1] = _e22;
++    return;
++}
++
+diff --git a/runtime/src/gs/gpu/glsl/upload.comp b/runtime/src/gs/gpu/glsl/upload.comp
+new file mode 100644
+index 0000000..31ecbaf
+--- /dev/null
++++ b/runtime/src/gs/gpu/glsl/upload.comp
+@@ -0,0 +1,329 @@
++#version 430 core
++#extension GL_ARB_compute_shader : require
++#extension GL_ARB_shader_storage_buffer_object : require
++layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
++
++struct Params {
++    uvec4 v[16];
++};
++struct Loc {
++    uint word;
++    uint shift;
++    uint mask;
++};
++const uint PSMCT32_ = 0u;
++const uint PSMCT24_ = 1u;
++const uint PSMCT16_ = 2u;
++const uint PSMCT16S = 10u;
++const uint PSMT8_ = 19u;
++const uint PSMT4_ = 20u;
++const uint PSMT8H = 27u;
++const uint PSMT4HL = 36u;
++const uint PSMT4HH = 44u;
++const uint PSMZ32_ = 48u;
++const uint PSMZ24_ = 49u;
++const uint PSMZ16_ = 50u;
++const uint PSMZ16S = 58u;
++const uint T_OFF32_ = 0u;
++const uint T_OFFZ32_ = 2048u;
++const uint T_OFF16_ = 4096u;
++const uint T_OFF16S = 8192u;
++const uint T_OFFZ16_ = 12288u;
++const uint T_OFFZ16S = 16384u;
++const uint T_OFF8_ = 20480u;
++const uint T_OFF4_ = 28672u;
++const uint CLUT_ENTRIES = 512u;
++const uint F_IIP = 1u;
++const uint F_TME = 2u;
++const uint F_FGE = 4u;
++const uint F_ABE = 8u;
++const uint F_FST = 16u;
++const uint F_ZMSK = 32u;
++const uint F_ATE = 64u;
++const uint F_DATE = 128u;
++const uint F_DATM = 256u;
++const uint F_ZTE = 512u;
++const uint F_PABE = 1024u;
++const uint F_COLCLAMP = 2048u;
++const uint F_FBA = 4096u;
++const uint F_TCC = 8192u;
++const uint F_BILINEAR = 16384u;
++const uint F_AEM = 32768u;
++const uint PRIM_WORDS = 28u;
++const uint SETUP_WORDS = 25u;
++const uint SCALE = 1u;
++
++layout(std430, binding = 0) buffer type_4_block_0Compute { uint _group_0_binding_0_cs[]; };
++
++layout(std430, binding = 1) readonly buffer type_5_block_1Compute { uint _group_0_binding_1_cs[]; };
++
++layout(std140, binding = 2) uniform Params_block_2Compute { Params _group_0_binding_2_cs; };
++
++layout(std430, binding = 3) readonly buffer type_5_block_3Compute { uint _group_0_binding_3_cs[]; };
++
++layout(std430, binding = 6) readonly buffer type_5_block_4Compute { uint _group_0_binding_6_cs[]; };
++
++
++uint prm(uint i) {
++    uint _e9 = _group_0_binding_2_cs.v[(i / 4u)][(i % 4u)];
++    return _e9;
++}
++
++uint page_addr(uint bp, uint bw, uint x, uint y, uint pw, uint ph) {
++    uint per_row = max(1u, ((bw * 64u) / pw));
++    return ((bp * 256u) + (((x / pw) + ((y / ph) * per_row)) * 8192u));
++}
++
++Loc locate(uint psm, uint bp_1, uint bw_1, uint x_1, uint y_1) {
++    uint a = 0u;
++    uint shift = 0u;
++    uint mask = 4294967295u;
++    switch(psm) {
++        case 48u: {
++            uint _e13 = page_addr(bp_1, bw_1, x_1, y_1, 64u, 32u);
++            uint _e25 = _group_0_binding_1_cs[((T_OFFZ32_ + ((y_1 & 31u) * 64u)) + (x_1 & 63u))];
++            a = (_e13 + _e25);
++            break;
++        }
++        case 49u: {
++            uint _e29 = page_addr(bp_1, bw_1, x_1, y_1, 64u, 32u);
++            uint _e41 = _group_0_binding_1_cs[((T_OFFZ32_ + ((y_1 & 31u) * 64u)) + (x_1 & 63u))];
++            a = (_e29 + _e41);
++            mask = 16777215u;
++            break;
++        }
++        case 1u: {
++            uint _e46 = page_addr(bp_1, bw_1, x_1, y_1, 64u, 32u);
++            uint _e58 = _group_0_binding_1_cs[((T_OFF32_ + ((y_1 & 31u) * 64u)) + (x_1 & 63u))];
++            a = (_e46 + _e58);
++            mask = 16777215u;
++            break;
++        }
++        case 2u: {
++            uint _e63 = page_addr(bp_1, bw_1, x_1, y_1, 64u, 64u);
++            uint _e75 = _group_0_binding_1_cs[((T_OFF16_ + ((y_1 & 63u) * 64u)) + (x_1 & 63u))];
++            a = (_e63 + _e75);
++            uint _e77 = a;
++            shift = ((_e77 & 2u) * 8u);
++            mask = 65535u;
++            break;
++        }
++        case 10u: {
++            uint _e85 = page_addr(bp_1, bw_1, x_1, y_1, 64u, 64u);
++            uint _e97 = _group_0_binding_1_cs[((T_OFF16S + ((y_1 & 63u) * 64u)) + (x_1 & 63u))];
++            a = (_e85 + _e97);
++            uint _e99 = a;
++            shift = ((_e99 & 2u) * 8u);
++            mask = 65535u;
++            break;
++        }
++        case 50u: {
++            uint _e107 = page_addr(bp_1, bw_1, x_1, y_1, 64u, 64u);
++            uint _e119 = _group_0_binding_1_cs[((T_OFFZ16_ + ((y_1 & 63u) * 64u)) + (x_1 & 63u))];
++            a = (_e107 + _e119);
++            uint _e121 = a;
++            shift = ((_e121 & 2u) * 8u);
++            mask = 65535u;
++            break;
++        }
++        case 58u: {
++            uint _e129 = page_addr(bp_1, bw_1, x_1, y_1, 64u, 64u);
++            uint _e141 = _group_0_binding_1_cs[((T_OFFZ16S + ((y_1 & 63u) * 64u)) + (x_1 & 63u))];
++            a = (_e129 + _e141);
++            uint _e143 = a;
++            shift = ((_e143 & 2u) * 8u);
++            mask = 65535u;
++            break;
++        }
++        case 19u: {
++            uint _e151 = page_addr(bp_1, bw_1, x_1, y_1, 128u, 64u);
++            uint _e163 = _group_0_binding_1_cs[((T_OFF8_ + ((y_1 & 63u) * 128u)) + (x_1 & 127u))];
++            a = (_e151 + _e163);
++            uint _e165 = a;
++            shift = ((_e165 & 3u) * 8u);
++            mask = 255u;
++            break;
++        }
++        case 20u: {
++            uint n = _group_0_binding_1_cs[((T_OFF4_ + ((y_1 & 127u) * 128u)) + (x_1 & 127u))];
++            uint _e185 = page_addr(bp_1, bw_1, x_1, y_1, 128u, 128u);
++            a = (_e185 + (n / 2u));
++            uint _e189 = a;
++            shift = (((_e189 & 3u) * 8u) + ((n & 1u) * 4u));
++            mask = 15u;
++            break;
++        }
++        case 27u: {
++            uint _e202 = page_addr(bp_1, bw_1, x_1, y_1, 64u, 32u);
++            uint _e214 = _group_0_binding_1_cs[((T_OFF32_ + ((y_1 & 31u) * 64u)) + (x_1 & 63u))];
++            a = (_e202 + _e214);
++            shift = 24u;
++            mask = 255u;
++            break;
++        }
++        case 36u: {
++            uint _e220 = page_addr(bp_1, bw_1, x_1, y_1, 64u, 32u);
++            uint _e232 = _group_0_binding_1_cs[((T_OFF32_ + ((y_1 & 31u) * 64u)) + (x_1 & 63u))];
++            a = (_e220 + _e232);
++            shift = 24u;
++            mask = 15u;
++            break;
++        }
++        case 44u: {
++            uint _e238 = page_addr(bp_1, bw_1, x_1, y_1, 64u, 32u);
++            uint _e250 = _group_0_binding_1_cs[((T_OFF32_ + ((y_1 & 31u) * 64u)) + (x_1 & 63u))];
++            a = (_e238 + _e250);
++            shift = 28u;
++            mask = 15u;
++            break;
++        }
++        default: {
++            uint _e256 = page_addr(bp_1, bw_1, x_1, y_1, 64u, 32u);
++            uint _e268 = _group_0_binding_1_cs[((T_OFF32_ + ((y_1 & 31u) * 64u)) + (x_1 & 63u))];
++            a = (_e256 + _e268);
++            break;
++        }
++    }
++    uint _e270 = a;
++    uint _e275 = shift;
++    uint _e276 = mask;
++    return Loc(((_e270 & 4194303u) >> 2u), _e275, _e276);
++}
++
++void store(Loc l, uint k, uint value) {
++    uint w = (((l.word * SCALE) * SCALE) + k);
++    if ((l.mask == 4294967295u)) {
++        _group_0_binding_0_cs[w] = value;
++        return;
++    }
++    uint _e20 = atomicAnd(_group_0_binding_0_cs[w], ~((l.mask << l.shift)));
++    uint _e27 = atomicOr(_group_0_binding_0_cs[w], ((value & l.mask) << l.shift));
++    return;
++}
++
++void write_pixel(uint psm_1, uint bp_2, uint bw_2, uint x_2, uint y_2, uint value_1) {
++    uint k_1 = 0u;
++    Loc _e6 = locate(psm_1, bp_2, bw_2, x_2, y_2);
++    bool loop_init = true;
++    while(true) {
++        if (!loop_init) {
++            uint _e17 = k_1;
++            k_1 = (_e17 + 1u);
++        }
++        loop_init = false;
++        uint _e9 = k_1;
++        if ((_e9 < 1u)) {
++        } else {
++            break;
++        }
++        {
++            uint _e16 = k_1;
++            store(_e6, _e16, value_1);
++        }
++    }
++    return;
++}
++
++uint bits_at(uint offset, uint bit, uint count) {
++    uint v_1 = 0u;
++    uint w_1 = (offset + (bit / 32u));
++    uint s = (bit % 32u);
++    uint _e10 = _group_0_binding_3_cs[w_1];
++    v_1 = (_e10 >> s);
++    if (((s + count) > 32u)) {
++        uint _e16 = v_1;
++        uint _e21 = _group_0_binding_3_cs[(w_1 + 1u)];
++        v_1 = (_e16 | (_e21 << (32u - s)));
++    }
++    if ((count == 32u)) {
++        uint _e28 = v_1;
++        return _e28;
++    }
++    uint _e29 = v_1;
++    return (_e29 & ((1u << count) - 1u));
++}
++
++uint cache_bits_at(uint offset_1, uint bit_1, uint count_1) {
++    uint v_2 = 0u;
++    uint w_2 = (offset_1 + (bit_1 / 32u));
++    uint s_1 = (bit_1 % 32u);
++    uint _e10 = _group_0_binding_6_cs[w_2];
++    v_2 = (_e10 >> s_1);
++    if (((s_1 + count_1) > 32u)) {
++        uint _e16 = v_2;
++        uint _e21 = _group_0_binding_6_cs[(w_2 + 1u)];
++        v_2 = (_e16 | (_e21 << (32u - s_1)));
++    }
++    if ((count_1 == 32u)) {
++        uint _e28 = v_2;
++        return _e28;
++    }
++    uint _e29 = v_2;
++    return (_e29 & ((1u << count_1) - 1u));
++}
++
++void main() {
++    uvec3 gid = gl_GlobalInvocationID;
++    uint lo = 0u;
++    uint hi = 0u;
++    uint v = 0u;
++    uint i_1 = (gid.x + ((gid.y * 64u) * 1024u));
++    uint _e9 = prm(2u);
++    if ((i_1 >= _e9)) {
++        return;
++    }
++    uint _e12 = prm(0u);
++    uint _e16 = prm(1u);
++    hi = _e16;
++    while(true) {
++        uint _e18 = hi;
++        uint _e19 = lo;
++        if (((_e18 - _e19) > 1u)) {
++        } else {
++            break;
++        }
++        {
++            uint _e23 = lo;
++            uint _e24 = hi;
++            uint mid = ((_e23 + _e24) / 2u);
++            uint _e35 = _group_0_binding_3_cs[((_e12 + (mid * 12u)) + 11u)];
++            if ((_e35 <= i_1)) {
++                lo = mid;
++            } else {
++                hi = mid;
++            }
++        }
++    }
++    uint _e37 = lo;
++    uint r = (_e12 + (_e37 * 12u));
++    uint _e45 = _group_0_binding_3_cs[(r + 11u)];
++    uint k_2 = (i_1 - _e45);
++    uint rrw = _group_0_binding_3_cs[(r + 5u)];
++    uint _e56 = _group_0_binding_3_cs[(r + 6u)];
++    uint p = (_e56 + k_2);
++    uint _e62 = _group_0_binding_3_cs[(r + 3u)];
++    uint x_3 = ((_e62 + (p % rrw)) & 2047u);
++    uint _e71 = _group_0_binding_3_cs[(r + 4u)];
++    uint y_3 = ((_e71 + (p / rrw)) & 2047u);
++    uint _e80 = _group_0_binding_3_cs[(r + 10u)];
++    uint bpp = (_e80 & 255u);
++    uint _e89 = _group_0_binding_3_cs[(r + 10u)];
++    if (((_e89 & 2147483648u) != 0u)) {
++        uint _e98 = _group_0_binding_3_cs[(r + 8u)];
++        uint _e103 = _group_0_binding_3_cs[(r + 9u)];
++        uint _e106 = cache_bits_at(_e98, (_e103 + (k_2 * bpp)), bpp);
++        v = _e106;
++    } else {
++        uint _e111 = _group_0_binding_3_cs[(r + 8u)];
++        uint _e116 = _group_0_binding_3_cs[(r + 9u)];
++        uint _e119 = bits_at(_e111, (_e116 + (k_2 * bpp)), bpp);
++        v = _e119;
++    }
++    uint _e124 = _group_0_binding_3_cs[(r + 2u)];
++    uint _e127 = _group_0_binding_3_cs[r];
++    uint _e132 = _group_0_binding_3_cs[(r + 1u)];
++    uint _e133 = v;
++    write_pixel(_e124, _e127, _e132, x_3, y_3, _e133);
++    return;
++}
++
+diff --git a/runtime/src/gs/gpu/gpu.cpp b/runtime/src/gs/gpu/gpu.cpp
+index d94cedd..21a9daf 100644
+--- a/runtime/src/gs/gpu/gpu.cpp
++++ b/runtime/src/gs/gpu/gpu.cpp
+@@ -2,10 +2,16 @@
+ #include "ps2/system.hpp"
+ #include "ps2/video.hpp"
+ 
++#ifdef PS2_GL
++#include <EGL/egl.h>
++#include <EGL/eglext.h>
++#include <GL/glcorearb.h>
++#else
+ #include <webgpu/webgpu.h>
+ #ifndef __EMSCRIPTEN__
+ #include <webgpu/wgpu.h>
+ #endif
++#endif
+ 
+ #include <algorithm>
+ #include <array>
+@@ -18,8 +24,13 @@
+ #include <string>
+ #include <unordered_map>
+ 
++#ifdef PS2_GL
++extern const char kGlsl_upload[], kGlsl_copy_read[], kGlsl_copy_write[], kGlsl_load_clut[], kGlsl_display[], kGlsl_raster[], kGlsl_resolve[], kGlsl_snapshot[],
++    kGlsl_decode[];
++#else
+ extern const char kGsShader[];
+ extern const char kBlitShader[];
++#endif
+ 
+ namespace ps2::gs {
+ void swizzle_tables(std::vector<std::uint32_t> &out);
+@@ -31,6 +42,12 @@ namespace {
+ 
+ enum Pipeline { kUpload, kCopyRead, kCopyWrite, kLoadClut, kDisplay, kRaster, kResolve, kSnapshot, kDecode, kPipelines };
+ const char *const kEntryPoints[kPipelines] = {"upload", "copy_read", "copy_write", "load_clut", "display", "raster", "resolve", "snapshot", "decode"};
++#ifdef PS2_GL
++const char *const kGlslShaders[kPipelines] = {kGlsl_upload, kGlsl_copy_read, kGlsl_copy_write, kGlsl_load_clut, kGlsl_display, kGlsl_raster, kGlsl_resolve, kGlsl_snapshot, kGlsl_decode};
++using Buffer = GLuint;
++#else
++using Buffer = WGPUBuffer;
++#endif
+ 
+ constexpr std::uint32_t kParamStride = 256;
+ constexpr std::uint32_t kClutSlots = 2048;
+@@ -43,6 +60,7 @@ constexpr std::uint32_t kDecodePrims = 64;
+ Mode g_mode = Mode::off;
+ std::uint64_t g_dispatches[kPipelines] = {}, g_submits = 0;
+ 
++#ifndef PS2_GL
+ WGPUInstance g_instance = nullptr;
+ WGPUAdapter g_adapter = nullptr;
+ WGPUSurface g_surface = nullptr;
+@@ -52,6 +70,7 @@ std::uint32_t g_surface_width = 0, g_surface_height = 0;
+ WGPURenderPipeline g_blit = nullptr;
+ WGPUBindGroup g_blit_group = nullptr;
+ WGPUBuffer g_blit_params = nullptr;
++#endif
+ std::uint32_t g_field = 0, g_last_width = 0, g_last_height = 0;
+ bool g_have_previous = false;
+ std::uint32_t g_scale = 1, g_copy_words = 1u << 20, g_field_words = 1u << 19;
+@@ -59,21 +78,27 @@ std::uint32_t g_scale = 1, g_copy_words = 1u << 20, g_field_words = 1u << 19;
+ std::uint32_t field_base(std::uint32_t field) { return g_copy_words + (field & 1u) * g_field_words; }
+ 
+ bool g_timestamps = false;
++#ifndef PS2_GL
+ WGPUQuerySet g_queries = nullptr;
+ WGPUBuffer g_query_resolve = nullptr, g_query_read = nullptr;
+ bool g_query_pending = false, g_query_ready = false;
++#endif
+ std::uint64_t g_measured_ns = 0, g_measured = 0, g_total_passes = 0;
++#ifndef PS2_GL
+ WGPUDevice g_device = nullptr;
+ WGPUQueue g_queue = nullptr;
+-WGPUBuffer g_vram = nullptr, g_tables = nullptr, g_params = nullptr, g_data = nullptr, g_clut = nullptr, g_scratch = nullptr, g_readback = nullptr, g_decoded = nullptr;
++#endif
++Buffer g_vram = {}, g_tables = {}, g_params = {}, g_data = {}, g_clut = {}, g_scratch = {}, g_readback = {}, g_decoded = {};
+ std::uint32_t g_decoded_used = 0;
+ bool g_rendered[512] = {};
+ bool g_decode = true;
+ std::uint64_t g_params_size = 0, g_data_size = 0;
++#ifndef PS2_GL
+ WGPUBindGroupLayout g_layout = nullptr;
+ WGPUPipelineLayout g_pipeline_layout = nullptr;
+ WGPUBindGroup g_group = nullptr;
+ WGPUComputePipeline g_pipelines[kPipelines] = {};
++#endif
+ 
+ struct Command {
+     Pipeline pipeline;
+@@ -88,8 +113,10 @@ struct CommandInfo {
+ std::vector<CommandInfo> g_command_info;
+ std::FILE *g_profile_out = nullptr;
+ std::uint64_t g_profile_from = 0, g_profile_to = 0;
++#ifndef PS2_GL
+ WGPUQuerySet g_profile_queries = nullptr;
+ WGPUBuffer g_profile_resolve = nullptr, g_profile_read = nullptr;
++#endif
+ 
+ std::vector<Command> g_commands;
+ std::vector<std::array<std::uint32_t, kParamStride / 4>> g_param_records;
+@@ -178,7 +205,9 @@ int g_tiles_per_row = 128;
+ std::vector<std::uint32_t> g_tile_count(128 * 128), g_tile_fill(128 * 128);
+ std::vector<std::uint32_t> g_touched;
+ 
++#ifndef PS2_GL
+ WGPUStringView view(const char *s) { return WGPUStringView{s, WGPU_STRLEN}; }
++#endif
+ 
+ std::uint32_t bits_per_pixel(std::uint32_t psm) {
+     switch (psm) {
+@@ -249,7 +278,8 @@ struct CacheEntry {
+     std::uint64_t used;
+ };
+ 
+-WGPUBuffer g_cache = nullptr;
++Buffer g_cache = {};
++void write_buffer(Buffer b, std::uint64_t offset, const void *data, std::uint64_t size);
+ std::vector<std::uint32_t> g_cache_copy;
+ std::deque<CacheEntry> g_cache_ring;
+ std::unordered_multimap<std::uint64_t, CacheEntry *> g_cache_index;
+@@ -314,7 +344,7 @@ bool cache_insert(std::uint64_t key, const std::uint8_t *bytes, std::size_t n, s
+     to[words - 1] = 0;
+     to[words - 2] = 0;
+     std::memcpy(to, bytes, n);
+-    wgpuQueueWriteBuffer(g_queue, g_cache, static_cast<std::uint64_t>(offset) * 4, to, static_cast<std::uint64_t>(words) * 4);
++    write_buffer(g_cache, static_cast<std::uint64_t>(offset) * 4, to, static_cast<std::uint64_t>(words) * 4);
+     g_cache_ring.push_back({key, offset, words, n, g_serial});
+     g_cache_index.emplace(key, &g_cache_ring.back());
+     g_cache_head += words;
+@@ -654,7 +684,11 @@ void queue_pre(const PreOp &op) {
+     g_pre.push_back(op);
+ }
+ 
++#ifdef PS2_GL
++void submit(const void *present_view = nullptr);
++#else
+ void submit(WGPUTextureView present_view);
++#endif
+ 
+ std::uint64_t queue_upload(const std::uint8_t *bytes, std::size_t size, std::uint32_t lead_bits) {
+     Image &im = g_image;
+@@ -729,6 +763,11 @@ void flush_all() {
+     emit_all();
+ }
+ 
++#ifdef PS2_GL
++#include "gl_device.inc"
++#else
++void write_buffer(Buffer b, std::uint64_t offset, const void *data, std::uint64_t size) { wgpuQueueWriteBuffer(g_queue, b, offset, data, size); }
++
+ void on_error(WGPUDevice const *, WGPUErrorType type, WGPUStringView message, void *, void *) {
+     std::fprintf(stderr, "[gpu] error %d: %.*s\n", static_cast<int>(type), static_cast<int>(message.length == WGPU_STRLEN ? std::strlen(message.data) : message.length), message.data);
+ }
+@@ -978,6 +1017,7 @@ void read_back(WGPUBuffer source, std::uint64_t bytes, void *out, std::uint64_t
+     if (mapped) std::memcpy(out, mapped, bytes);
+     wgpuBufferUnmap(g_readback);
+ }
++#endif
+ 
+ std::uint32_t make_setup(const State &st, std::uint64_t attr, std::uint32_t *w) {
+     const Context &c = st.ctx[(attr >> 9) & 1u];
+@@ -1111,6 +1151,9 @@ void attrs(std::uint32_t *rec, int n, const Vertex &v, bool fst, const Vertex *c
+ 
+ Mode mode() { return g_mode; }
+ 
++#ifdef PS2_GL
++#include "gl_public.inc"
++#else
+ bool init(Mode m) {
+     if (m == Mode::off) return false;
+ #ifdef __EMSCRIPTEN__
+@@ -1258,6 +1301,7 @@ bool init(Mode m) {
+     g_mode = m;
+     return true;
+ }
++#endif
+ 
+ void draw(const State &st, const Vertex *v, int count) {
+     if (g_image.active && !g_image.pending.empty()) flush_image();
+@@ -1519,6 +1563,7 @@ void flush() {
+     submit();
+ }
+ 
++#ifndef PS2_GL
+ void wait_idle() {
+     flush_all();
+     submit();
+@@ -1530,7 +1575,9 @@ void wait_idle() {
+     wgpuQueueOnSubmittedWorkDone(g_queue, cb);
+     wait_until(done);
+ }
++#endif
+ 
++#ifndef PS2_GL
+ struct PendingDownload {
+     WGPUBuffer buffer = nullptr;
+     std::uint64_t capacity = 0;
+@@ -1586,6 +1633,7 @@ bool finish_download(std::uint32_t serial) {
+     collect_download();
+     return done;
+ }
++#endif
+ 
+ void download(std::uint8_t *memory, std::uint32_t offset, std::uint32_t bytes) {
+     flush_all();
+@@ -1615,14 +1663,14 @@ void write_state(const std::vector<std::uint32_t> &vram, std::uint32_t scale, co
+     const std::uint32_t from = scale * scale, to = g_scale * g_scale;
+     std::fill(std::begin(g_rendered), std::end(g_rendered), from == to && to > 1);
+     if (from == to && vram.size() == words * to) {
+-        wgpuQueueWriteBuffer(g_queue, g_vram, 0, vram.data(), vram.size() * 4);
++        write_buffer(g_vram, 0, vram.data(), vram.size() * 4);
+     } else {
+         std::vector<std::uint32_t> layers(words * to);
+         for (std::size_t w = 0; w < words; ++w)
+             for (std::uint32_t k = 0; k < to; ++k) layers[w * to + k] = vram[w * from];
+-        wgpuQueueWriteBuffer(g_queue, g_vram, 0, layers.data(), layers.size() * 4);
++        write_buffer(g_vram, 0, layers.data(), layers.size() * 4);
+     }
+-    if (clut.size() >= kClutEntries) wgpuQueueWriteBuffer(g_queue, g_clut, static_cast<std::uint64_t>(g_clut_slot) * kClutEntries * 4, clut.data(), kClutEntries * 4);
++    if (clut.size() >= kClutEntries) write_buffer(g_clut, static_cast<std::uint64_t>(g_clut_slot) * kClutEntries * 4, clut.data(), kClutEntries * 4);
+     wait_idle();
+ }
+ 
+@@ -1633,6 +1681,7 @@ void stats() {
+     std::fprintf(stderr, "\n");
+ }
+ 
++#ifndef PS2_GL
+ void configure_surface() {
+     WGPUSurfaceConfiguration config = WGPU_SURFACE_CONFIGURATION_INIT;
+     config.device = g_device;
+@@ -1861,6 +1910,7 @@ bool display_async(const DisplaySource &src, std::vector<std::uint32_t> &rgba, s
+     }
+     return newest != nullptr;
+ }
++#endif
+ 
+ bool display(const DisplaySource &src, std::vector<std::uint32_t> &rgba, std::uint32_t &width, std::uint32_t &height) {
+     flush_all();
+-- 
+2.54.0 (Apple Git-157)
+
