@@ -132,9 +132,27 @@ GL renderer (PCSX2-style) is the way to full speed.
   not be `Surfaceless` (PCSX2 then skips every present), SetGsCrt must set
   SMODE1 (patch 0013; with it 0 PCSX2 thinks the screen is VESA).
 - Shaders are read from `sdmc:/switch/un5-nx/resources/shaders/{opengl,common}`.
-  Mesa here has no program binaries, so every new shader is compiled when
-  first used (374 in a session through intro, battle and Master Mode): a
-  likely source of stutter until they are warmed up or baked.
+- **Speed on a Switch (2026-10-27 night, CPU 1785 / GPU 921 / mem 1600 MHz,
+  the clocks the game is judged at; 1224 is not playable).** Every 5 s the
+  log prints fps, the share of time the render thread spends in the GS, new
+  shaders and the time spent getting programs, and PCSX2's per-frame draws,
+  draw calls, uploads, copies, readbacks and barriers. Menus run at 50 fps;
+  the intro movie at 26-28; battle at 31-44 with the GS thread 92-98% busy
+  on 2 000 to 25 000 GL draw calls a frame: the CPU side of the driver, not
+  the GPU, limits it. `mesa_glthread` (on) gains ~10%; lighter GS settings
+  (`UN5GS_PRELOAD/BLEND/MIPMAP/DITHER`) and presenting without vsync did not
+  help. Next: why the GS splits UN5's frames into so many draws.
+- **Shader cache.** A new shader costs ~12 ms to compile, ~22 ms with its
+  binary saved; jutsu bursts spent up to 1.6 s of every 5 s compiling.
+  devkitPro's Mesa (horizon) has no disk cache and so reports no program
+  binary format, which turns PCSX2's GLShaderCache off. `patches/switch-mesa/`
+  rebuilds Mesa with a format reported and a fixed driver sha1 (the stub left
+  it unset, so every binary was rejected on load). With it a cached program
+  loads in ~2 ms: boot shaders 3.4 s to 0.6 s, a 70-shader burst 1.3 s to
+  0.14 s. The cache is `sdmc:/switch/un5-nx/cache/gl_programs.{idx,bin}`.
+- **Stripes and ghosting (fixed, patch 0014).** The present read the field
+  and the display registers when the lagging render thread got to it, so
+  PCSX2 deinterlaced with the wrong field and showed another frame's buffer.
 
 ## Open
 

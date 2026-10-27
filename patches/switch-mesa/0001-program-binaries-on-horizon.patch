@@ -1,0 +1,56 @@
+--- a/include/c11/threads.h	2026-10-28 00:02:57
++++ b/include/c11/threads.h	2026-10-27 23:42:23
+@@ -43,7 +43,8 @@
+ 
+ /*-------------------- 7.25.7 Time functions --------------------*/
+ // 7.25.6.1
+-#ifndef HAVE_TIMESPEC_GET
++/* un5-nx: devkitA64's newlib now has timespec_get. */
++#if !defined(HAVE_TIMESPEC_GET) && !defined(__SWITCH__)
+ #include <sys/time.h>
+ 
+ static inline int
+--- a/src/mesa/state_tracker/st_extensions.c	2020-05-14 00:41:15
++++ b/src/mesa/state_tracker/st_extensions.c	2026-10-27 23:41:14
+@@ -466,6 +466,13 @@
+    /* GL_ARB_get_program_binary */
+    if (screen->get_disk_shader_cache && screen->get_disk_shader_cache(screen))
+       c->NumProgramBinaryFormats = 1;
++#ifdef __SWITCH__
++   /* un5-nx: Horizon builds have no disk cache, but program binaries only
++    * need the TGSI serialisation, which they keep. Lets the application keep
++    * its own cache of linked programs.
++    */
++   c->NumProgramBinaryFormats = 1;
++#endif
+ 
+    c->MaxAtomicBufferBindings =
+       c->Program[MESA_SHADER_FRAGMENT].MaxAtomicBuffers;
+--- a/src/mesa/state_tracker/st_shader_cache.c	2026-10-28 00:02:57
++++ b/src/mesa/state_tracker/st_shader_cache.c	2026-10-28 00:02:33
+@@ -25,6 +25,7 @@
+ #include "st_debug.h"
+ #include "st_program.h"
+ #include "st_shader_cache.h"
++#include "util/mesa-sha1.h"
+ #include "st_util.h"
+ #include "compiler/glsl/program.h"
+ #include "compiler/nir/nir.h"
+@@ -37,7 +38,17 @@
+ void
+ st_get_program_binary_driver_sha1(struct gl_context *ctx, uint8_t *sha1)
+ {
++#ifdef __SWITCH__
++   /* un5-nx: without a disk cache, disk_cache_compute_key is a stub that
++    * leaves sha1 unset, so no binary would ever load again. Identify the
++    * driver build by its version instead; bump the tag when the driver's
++    * output changes.
++    */
++   static const char id[] = "mesa " PACKAGE_VERSION " nouveau tgsi horizon un5-nx-1";
++   _mesa_sha1_compute(id, sizeof(id) - 1, sha1);
++#else
+    disk_cache_compute_key(ctx->Cache, NULL, 0, sha1);
++#endif
+ }
+ 
+ static void

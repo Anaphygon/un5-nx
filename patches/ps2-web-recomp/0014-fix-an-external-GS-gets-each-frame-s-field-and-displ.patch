@@ -1,0 +1,102 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 28 Oct 2026 00:12:04 +0700
+Subject: [PATCH 14/15] fix: an external GS gets each frame's field and display
+ registers with its present
+
+The render thread can run frames behind the CPU thread. Reading the odd-field
+flag and the display registers when the present is handled gave the external
+GS values from a later frame: wrong deinterlacing (stripes) and a buffer from
+another frame (ghosting). The present now carries both.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ runtime/src/gs/gs.cpp | 35 ++++++++++++++++++++++++++++-------
+ 1 file changed, 28 insertions(+), 7 deletions(-)
+
+diff --git a/runtime/src/gs/gs.cpp b/runtime/src/gs/gs.cpp
+index adf8fab..959eba2 100644
+--- a/runtime/src/gs/gs.cpp
++++ b/runtime/src/gs/gs.cpp
+@@ -788,6 +788,12 @@ std::uint64_t read_privileged(std::uint32_t address) {
+     }
+ }
+ 
++// PMODE, SMODE2, DISPFB1/2 and DISPLAY1/2: what present() snapshots.
++bool is_display_register(std::uint32_t address) {
++    const std::uint32_t offset = address & 0x1FF8u;
++    return offset == 0x00 || offset == 0x20 || (offset >= 0x70 && offset <= 0xA0);
++}
++
+ void write_privileged(std::uint32_t address, std::uint64_t value) {
+     switch (address & 0x1FF0u) {
+     case 0x0000:
+@@ -830,13 +836,28 @@ void write_privileged(std::uint32_t address, std::uint64_t value) {
+     case 0x1080: g_siglblid = value; break;
+     default: break;
+     }
+-    // The CPU thread writes while the render thread reads, as on a PS2.
++    // The CPU thread writes while the render thread reads, as on a PS2. The
++    // display registers are the exception: the render thread can run frames
++    // behind, so they reach the external GS with the field they belong to,
++    // from present_external().
+     if (const ExternalGs *external = external_gs()) {
+         if ((address & 0x1FF0u) == 0x1000) external->write_csr(static_cast<std::uint32_t>(value));
+-        else std::memcpy(external->privileged() + (address & 0x1FF8u), &value, sizeof value);
++        else if (!is_display_register(address)) std::memcpy(external->privileged() + (address & 0x1FF8u), &value, sizeof value);
+     }
+ }
+ 
++void present_external(const ExternalGs &external, const DisplayRegs &r, std::uint32_t field) {
++    std::uint8_t *regs = external.privileged();
++    const auto put = [regs](std::uint32_t offset, std::uint64_t value) { std::memcpy(regs + offset, &value, sizeof value); };
++    put(0x00, r.pmode);
++    put(0x20, r.smode2);
++    put(0x70, r.dispfb[0]);
++    put(0x80, r.display[0]);
++    put(0x90, r.dispfb[1]);
++    put(0xA0, r.display[1]);
++    external.vsync(field);
++}
++
+ void vblank(bool start) {
+     if (start) {
+         g_odd_field = !g_odd_field;
+@@ -883,7 +904,7 @@ bool present() { return present(display_regs()); }
+ 
+ bool present(const DisplayRegs &r) {
+     if (const ExternalGs *external = external_gs()) {
+-        external->vsync(g_odd_field ? 1u : 0u);
++        present_external(*external, r, g_odd_field ? 1u : 0u);
+         return true;
+     }
+ #ifdef PS2_GPU
+@@ -999,7 +1020,7 @@ void start_thread() { queue::render().start(32u << 20); }
+ 
+ void post_present() {
+     const DisplayRegs regs = display_regs();
+-    queue::post(queue::kPresent, 0, 0, &regs, sizeof regs);
++    queue::post(queue::kPresent, g_odd_field ? 1u : 0u, 0, &regs, sizeof regs);
+     ++g_posted_presents;
+     for (std::uint32_t done = g_presented.load(); g_posted_presents - done > 2; done = g_presented.load()) queue::wait(g_presented, done);
+ }
+@@ -1023,13 +1044,13 @@ Rendered render_pending(const std::function<void(const DisplayRegs &)> &on_prese
+ #endif
+             break;
+         case queue::kPresent: {
++            DisplayRegs regs;
++            std::memcpy(&regs, payload, sizeof regs);
+             if (const ExternalGs *external = external_gs()) {
+-                external->vsync(g_odd_field ? 1u : 0u);
++                present_external(*external, regs, h.arg0);
+                 presented = true;
+                 break;
+             }
+-            DisplayRegs regs;
+-            std::memcpy(&regs, payload, sizeof regs);
+             on_present(regs);
+             presented = true;
+             break;
+-- 
+2.54.0 (Apple Git-157)
+

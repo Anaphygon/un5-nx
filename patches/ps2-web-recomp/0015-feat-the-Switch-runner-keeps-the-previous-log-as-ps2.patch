@@ -1,0 +1,29 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 28 Oct 2026 00:12:04 +0700
+Subject: [PATCH 15/15] feat: the Switch runner keeps the previous log as
+ ps2run-prev.log
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ host/main.cpp | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/host/main.cpp b/host/main.cpp
+index 6ebf6bb..ed4cb41 100644
+--- a/host/main.cpp
++++ b/host/main.cpp
+@@ -41,6 +41,10 @@ int main(int argc, char **argv) {
+     if (argc < 2) {
+         std::string dir = argc > 0 && argv[0] && std::strchr(argv[0], '/') ? argv[0] : PS2_NRO_DIR;
+         dir = dir.substr(0, dir.find_last_of('/') + 1);
++        // The previous run's log is kept as ps2run-prev.log, so two runs in a
++        // row (a cold and a warm shader cache, say) can be read together.
++        std::remove((dir + "ps2run-prev.log").c_str());
++        std::rename((dir + "ps2run.log").c_str(), (dir + "ps2run-prev.log").c_str());
+         std::freopen((dir + "ps2run.log").c_str(), "w", stderr);
+         std::setvbuf(stderr, nullptr, _IONBF, 0);
+         defaults = {"ps2run", dir + "game.elf", "--disc", dir + "disc.iso", "--memcard", dir + "memcard.ps2", "--window", "--fullscreen"};
+-- 
+2.54.0 (Apple Git-157)
+

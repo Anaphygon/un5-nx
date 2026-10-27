@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Tue, 27 Oct 2026 11:37:56 +0700
-Subject: [PATCH 03/13] fix: size code windows from the executable's segments
+Subject: [PATCH 03/15] fix: size code windows from the executable's segments
 
 A window was one 16 KiB unit rounded down from each empty segment, so an overlay larger than that was captured in pieces and its code past the first unit was never translated. UN5 loads three overlays of up to 2.2 MB at 0x6C6D00 and five more at 0x8F3D00, where the first ends. A window now starts at its segments' address, reaches the largest of them, and a capture keeps empty units inside the image.
 

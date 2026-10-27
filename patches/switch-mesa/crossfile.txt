@@ -1,0 +1,18 @@
+[binaries]
+c = '/opt/devkitpro/devkitA64/bin/aarch64-none-elf-gcc'
+cpp = '/opt/devkitpro/devkitA64/bin/aarch64-none-elf-g++'
+ar = '/opt/devkitpro/devkitA64/bin/aarch64-none-elf-gcc-ar'
+strip = '/opt/devkitpro/devkitA64/bin/aarch64-none-elf-strip'
+pkgconfig = '/opt/devkitpro/portlibs/switch/bin/aarch64-none-elf-pkg-config'
+
+[properties]
+c_args = ['-march=armv8-a+crc+crypto','-mtune=cortex-a57','-mtp=soft','-fPIC','-ftls-model=local-exec','-O2','-ffunction-sections','-fdata-sections','-D__SWITCH__','-I/opt/devkitpro/portlibs/switch/include','-isystem','/opt/devkitpro/libnx/include','-Wno-error=incompatible-pointer-types','-Wno-error=int-conversion','-Wno-error=implicit-function-declaration']
+c_link_args = ['-march=armv8-a+crc+crypto','-mtune=cortex-a57','-mtp=soft','-fPIC','-ftls-model=local-exec','-L/opt/devkitpro/portlibs/switch/lib','-L/opt/devkitpro/libnx/lib','-lnx']
+cpp_args = ['-march=armv8-a+crc+crypto','-mtune=cortex-a57','-mtp=soft','-fPIC','-ftls-model=local-exec','-O2','-ffunction-sections','-fdata-sections','-D__SWITCH__','-I/opt/devkitpro/portlibs/switch/include','-isystem','/opt/devkitpro/libnx/include','-Wno-error=incompatible-pointer-types','-Wno-error=int-conversion','-Wno-error=implicit-function-declaration']
+cpp_link_args = ['-march=armv8-a+crc+crypto','-mtune=cortex-a57','-mtp=soft','-fPIC','-ftls-model=local-exec','-L/opt/devkitpro/portlibs/switch/lib','-L/opt/devkitpro/libnx/lib','-lnx']
+
+[host_machine]
+system = 'horizon'
+cpu_family = 'aarch64'
+cpu = 'cortex-a57'
+endian = 'little'
