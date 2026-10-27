@@ -423,6 +423,7 @@ extern "C" int posix_memalign(void** out, size_t alignment, size_t size)
 const char* Pcsx2Config::GSOptions::DEFAULT_CAPTURE_CONTAINER = "mp4";
 
 void GSDumpBase::Transfer(int, const u8*, size_t) {}
+void GSDumpBase::ReadFIFO(u32) {}
 bool GSDumpBase::VSync(int, bool, const GSPrivRegSet*)
 {
 	return false;
