@@ -46,6 +46,7 @@ capture a battle and replay it headless with both GS renderers.
 | 0002 | IOP `close` answers with the closed descriptor | none, as above; checked in battles and Master Mode |
 | 0003 | Code windows sized from the ELF segments; captures keep empty units inside an image | `tests/windows_segments.py`, fails without the change |
 | 0004 | F5/F9 quick save/load in the native window | manual |
+| 0005 | Native frames paced by the wall clock, the audio queue only nudging the period | measured: frames over 1.5 periods in battles went from 700 in 10,507 to 33 in 7,800 |
 
 ## Open
 
@@ -53,8 +54,13 @@ capture a battle and replay it headless with both GS renderers.
   sometimes turns striped and ghosted while the game runs on. Not reproduced
   yet; a quick save taken while it shows will let the GPU and software GS
   renderers be compared on it.
-- Frame rate drops now and then, with the laptop cool. Not measured yet;
-  `PS2_GPU_PROFILE` and `PS2_TIME` in the runtime are the first things to try.
+- Stutter in heavy scenes (spamming Guy's jutsu). Most of it was frame
+  pacing, fixed by patch 0005; some remains and is not measured yet.
+  `PS2_GPU_PROFILE` and `PS2_TIME` in the runtime are the next things to try.
+- `--ntsc` runs at 60 Hz. The game advances per frame (a battle replayed at
+  50 and 60 Hz matches frame for frame), so it plays 20% faster than PAL.
+  Whether that is the Japanese release's speed is not checked. No public
+  60 fps patch for this release was found.
 - The game writes data next to its overlay code, so a later capture of the
   same overlay can differ in words the translation counts as code and become
   a new image to translate. `tools/un5_play.sh` handles it by capturing again;

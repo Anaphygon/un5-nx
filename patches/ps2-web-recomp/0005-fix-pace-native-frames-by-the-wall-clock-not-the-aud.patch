@@ -1,0 +1,50 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 27 Oct 2026 12:04:57 +0700
+Subject: [PATCH] fix: pace native frames by the wall clock, not the audio
+ queue
+
+Waiting while more than 80 ms of sound was queued paced frames by the audio device's 1024-sample pulls: two quick frames, then one of 25 ms, which shows as stutter at a full frame rate. In UN5 battles 700 of 10,507 frames took over 1.5 periods; with frames on the wall clock and the queue only nudging the period, 33 of 7,800 did, two of them disc loads. Some stutter remains in heavy scenes.
+
+Measured with a temporary frame-time log; no automated test.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ host/window.cpp | 19 ++++++++++++++-----
+ 1 file changed, 14 insertions(+), 5 deletions(-)
+
+diff --git a/host/window.cpp b/host/window.cpp
+index a61f154..59d55bb 100644
+--- a/host/window.cpp
++++ b/host/window.cpp
+@@ -249,13 +249,22 @@ void present() {
+ constexpr Uint32 kAudioBytesPerMs = 48 * 4;
+ 
+ void pace() {
++    const std::uint64_t frequency = SDL_GetPerformanceFrequency();
++    std::uint64_t period = frequency / (ps2::g_options.pal ? 50 : 60);
+     if (g_audio) {
+-        // The audio device clock paces emulation: wait while more than ~80 ms of sound is queued.
+-        while (SDL_GetQueuedAudioSize(g_audio) > 80 * kAudioBytesPerMs) SDL_Delay(1);
+-        return;
++        // Frames follow the wall clock, and the queued sound only nudges the
++        // period: waiting for the queue to drain paced frames by the device's
++        // 1024-sample pulls, two quick frames then one of 25 ms, which shows
++        // as stutter at a full frame rate. Below ~40 ms the frame is not held.
++        const Uint32 queued = SDL_GetQueuedAudioSize(g_audio) / kAudioBytesPerMs;
++        if (queued < 40) {
++            g_last = 0;
++            return;
++        }
++        if (queued > 120) period += period / 20;
++        else if (queued > 90) period += period / 100;
++        else if (queued < 60) period -= period / 100;
+     }
+-    const std::uint64_t frequency = SDL_GetPerformanceFrequency();
+-    const std::uint64_t period = frequency / (ps2::g_options.pal ? 50 : 60);
+     const std::uint64_t now = SDL_GetPerformanceCounter();
+     if (g_last && now - g_last < period) {
+         SDL_Delay(static_cast<Uint32>((period - (now - g_last)) * 1000 / frequency));
+-- 
+2.54.0 (Apple Git-157)
+

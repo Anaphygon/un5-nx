@@ -61,7 +61,12 @@ tools/setup_ps2webrecomp.sh "/path/to/your/Naruto Shippuden - Ultimate Ninja 5.i
 # and asks you to play again from there
 tools/un5_play.sh
 PS2_SCALE=2 tools/un5_play.sh   # 2x internal resolution (up to 3)
+tools/un5_play.sh --ntsc        # 60 Hz instead of PAL's 50
 ```
+
+The game counts everything in frames, so at 60 Hz it also runs 20% faster
+than the PAL release; that may be the original Japanese speed, which is not
+checked yet.
 
 Keyboard: Z cross, X circle, A square, S triangle, Enter start, arrows for
 the D-pad; gamepads work too. F5 saves a quick state and F9 loads it.
@@ -90,6 +95,8 @@ In `patches/ps2-web-recomp/`, to be sent upstream (details in
 - Code windows were cut into 16 KiB pieces instead of following the
   executable's segments, so large overlays were never fully translated.
 - The native window gets F5/F9 quick save and load.
+- Native frames were paced by the audio queue and came in bursts, which
+  showed as stutter at a full frame rate.
 
 ## Fixes to PS2Recomp (phases 1 and 2)
 
