@@ -69,7 +69,8 @@ alignas(16) u8 s_privileged[0x2000];
 //   UN5GS_DITHER    dithering 0 off .. 2 (default 2)
 //   UN5GS_DOWNLOAD  GS-to-EE readbacks, PCSX2's GSHardwareDownloadMode: 0 enabled
 //                   (default), 1 enabled and full, 2 no readbacks, 3 unsynchronized, 4 disabled
-//   UN5GS_UPSCALE   internal resolution, 1 native .. 3 (default 1)
+//   UN5GS_UPSCALE   internal resolution, 1 native .. 3 (default 2: sharper, and the
+//                   sharp filter costs ~6 ms a frame at native, next to nothing at 2x)
 //   UN5GS_FILTER    screen filter: 0 off (sharp pixels), 1 smooth (PCSX2's
 //                   default, soft on an OLED), 2 sharp bilinear (default 2)
 //   UN5GS_VSYNC     wait for the display's vertical blank when presenting (default 0:
@@ -88,7 +89,7 @@ void apply_environment()
 	GSConfig.Dithering = static_cast<u8>(std::clamp(number("UN5GS_DITHER", GSConfig.Dithering), 0, 2));
 	GSConfig.HWDownloadMode = static_cast<GSHardwareDownloadMode>(
 		std::clamp(number("UN5GS_DOWNLOAD", static_cast<int>(GSConfig.HWDownloadMode)), 0, 4));
-	GSConfig.UpscaleMultiplier = static_cast<float>(std::clamp(number("UN5GS_UPSCALE", 1), 1, 3));
+	GSConfig.UpscaleMultiplier = static_cast<float>(std::clamp(number("UN5GS_UPSCALE", 2), 1, 3));
 	GSConfig.LinearPresent = static_cast<GSPostBilinearMode>(std::clamp(number("UN5GS_FILTER", 2), 0, 2));
 	Console.WriteLn("un5gs: texture preloading %d, blending %d, mipmap %d, dithering %d, download %d, upscale %.0fx, filter %d",
 		static_cast<int>(GSConfig.TexturePreloading), static_cast<int>(GSConfig.AccurateBlendingUnit), GSConfig.HWMipmap ? 1 : 0,

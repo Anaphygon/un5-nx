@@ -9,7 +9,7 @@
 struct Un5Settings
 {
 	int preset = 0;      // index into the performance presets; 0 leaves the clocks alone
-	int upscale = 1;     // internal resolution, 1 native .. 3
+	int upscale = 2;     // internal resolution, 1 native .. 3 (2x: sharper, and Sharp is cheap there)
 	int filter = 2;      // screen filter: 0 off, 1 smooth, 2 sharp
 	bool min_blending = true;
 	bool audio_stretch = true;

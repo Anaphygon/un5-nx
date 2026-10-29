@@ -158,7 +158,9 @@ Un5RowText un5_row_text(const Un5Settings& s, int row, bool in_game)
 		case kRowFilter:
 			return {"Screen filter", kFilters[s.filter],
 				s.filter == 0 ? "No smoothing: the sharpest, blocky edges." :
-				s.filter == 1 ? "PCSX2's default smoothing: soft." : "Bilinear sharp: smooth scaling, crisper than Smooth."};
+				s.filter == 1 ? "PCSX2's default smoothing: soft." :
+				s.upscale == 1 ? "Bilinear sharp: crisp, but at Native it costs about 6 ms a frame; use it with 2x or more." :
+								 "Bilinear sharp: smooth scaling, crisper than Smooth."};
 		case kRowFps:
 			return {"FPS counter", s.show_fps ? "On" : "Off",
 				s.show_fps ? "Frames per second in a corner of the screen; costs well under a millisecond." :
