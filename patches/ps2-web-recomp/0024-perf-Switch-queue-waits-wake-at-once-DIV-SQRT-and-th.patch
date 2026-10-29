@@ -1,0 +1,154 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 29 Oct 2026 14:42:58 +0700
+Subject: [PATCH 24/24] perf: Switch queue waits wake at once; DIV/SQRT and the
+ thread role inline
+
+On the Switch a thread waiting on a ring queue slept a whole millisecond at a time (std::this_thread::sleep_for); it now waits on the ring's counter with Horizon's address arbitration (svcWaitForAddress / svcSignalToAddress), as Linux does with futexes. fp::div and fp::sqrt keep their double paths out of line so the single-precision paths inline into translated VU code, and the thread-role lookup on hot paths is an inline thread-local read. Same results: a UN5 battle replay is byte-identical.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ runtime/include/ps2/fpu.hpp | 13 +++++++++----
+ runtime/src/gs/queue.cpp    | 27 +++++++++++++++++++++------
+ runtime/src/gs/queue.hpp    |  5 ++++-
+ 3 files changed, 34 insertions(+), 11 deletions(-)
+
+diff --git a/runtime/include/ps2/fpu.hpp b/runtime/include/ps2/fpu.hpp
+index 829af93..2c7fefb 100644
+--- a/runtime/include/ps2/fpu.hpp
++++ b/runtime/include/ps2/fpu.hpp
+@@ -98,7 +98,12 @@ struct Result {
+ // exponent 255 take the double path.
+ inline bool fast_range(std::uint32_t x) { return exponent(x) >= 64 && exponent(x) != 255; }
+ 
+-inline Result div(std::uint32_t a, std::uint32_t b) {
++// The double paths, kept out of line so div and sqrt stay small enough for
++// the compiler to inline into translated VU code.
++[[gnu::noinline]] inline std::uint32_t div_slow(std::uint32_t a, std::uint32_t b) { return from_double(to_double(a) / to_double(b)); }
++[[gnu::noinline]] inline std::uint32_t sqrt_slow(std::uint32_t a) { return from_double(std::sqrt(to_double(a))); }
++
++[[gnu::always_inline]] inline Result div(std::uint32_t a, std::uint32_t b) {
+     a = flush(a);
+     b = flush(b);
+     const std::uint32_t sign = (a ^ b) & kSign;
+@@ -116,10 +121,10 @@ inline Result div(std::uint32_t a, std::uint32_t b) {
+             return {past ? qb - 1u : qb, false};
+         }
+     }
+-    return {from_double(to_double(a) / to_double(b)), false};
++    return {div_slow(a, b), false};
+ }
+ 
+-inline std::uint32_t sqrt(std::uint32_t a) {
++[[gnu::always_inline]] inline std::uint32_t sqrt(std::uint32_t a) {
+     a = flush(a) & kAbs;
+     if (!a) return 0;
+     if (fast_range(a)) {
+@@ -127,7 +132,7 @@ inline std::uint32_t sqrt(std::uint32_t a) {
+         const std::uint32_t rb = std::bit_cast<std::uint32_t>(r);
+         return std::fma(-r, r, x) < 0.0f ? rb - 1u : rb;
+     }
+-    return from_double(std::sqrt(to_double(a)));
++    return sqrt_slow(a);
+ }
+ 
+ inline Result rsqrt(std::uint32_t a, std::uint32_t b) {
+diff --git a/runtime/src/gs/queue.cpp b/runtime/src/gs/queue.cpp
+index 316ff9c..d78eb0d 100644
+--- a/runtime/src/gs/queue.cpp
++++ b/runtime/src/gs/queue.cpp
+@@ -13,6 +13,12 @@
+ #include <linux/futex.h>
+ #include <sys/syscall.h>
+ #include <unistd.h>
++#elif defined(__SWITCH__)
++#include <cstdint>
++// Horizon's address arbitration, the futex of the Switch (libnx svc.h; not
++// included here, its u128 clashes with other headers).
++extern "C" std::uint32_t svcWaitForAddress(void *address, std::uint32_t arb_type, std::int64_t value, std::int64_t timeout);
++extern "C" std::uint32_t svcSignalToAddress(void *address, std::uint32_t signal_type, std::int32_t value, std::int32_t count);
+ #else
+ #include <chrono>
+ #include <thread>
+@@ -25,15 +31,24 @@ namespace {
+ constexpr std::uint64_t align16(std::uint64_t n) { return (n + 15) & ~15ull; }
+ 
+ Ring g_render, g_vu;
+-thread_local Role g_role = Role::Emulation;
+ 
+-#if defined(__linux__) && !defined(__EMSCRIPTEN__)
++#if (defined(__linux__) && !defined(__EMSCRIPTEN__))
+ void futex_wait(std::atomic<std::uint32_t> &word, std::uint32_t seen, int timeout_ms) {
+     timespec limit{timeout_ms / 1000, static_cast<long>(timeout_ms % 1000) * 1000000L};
+     syscall(SYS_futex, reinterpret_cast<std::uint32_t *>(&word), FUTEX_WAIT_PRIVATE, seen, timeout_ms < 0 ? nullptr : &limit, nullptr, 0);
+ }
+ 
+ void futex_wake(std::atomic<std::uint32_t> &word) { syscall(SYS_futex, reinterpret_cast<std::uint32_t *>(&word), FUTEX_WAKE_PRIVATE, INT_MAX, nullptr, nullptr, 0); }
++#elif defined(__SWITCH__)
++// Without these a waiting thread on the Switch slept a whole millisecond at a
++// time (std::this_thread::sleep_for), so work posted meanwhile sat idle.
++constexpr std::uint32_t kWaitIfEqual = 2, kSignal = 0;
++
++void futex_wait(std::atomic<std::uint32_t> &word, std::uint32_t seen, int timeout_ms) {
++    svcWaitForAddress(&word, kWaitIfEqual, static_cast<std::int32_t>(seen), timeout_ms < 0 ? -1 : static_cast<std::int64_t>(timeout_ms) * 1000000);
++}
++
++void futex_wake(std::atomic<std::uint32_t> &word) { svcSignalToAddress(&word, kSignal, 0, -1); }
+ #endif
+ 
+ }
+@@ -48,7 +63,7 @@ EM_ASYNC_JS(void, ps2_wait_async, (std::atomic<std::uint32_t> *word, std::uint32
+ void wait(std::atomic<std::uint32_t> &value, std::uint32_t seen) {
+ #ifdef __EMSCRIPTEN__
+     emscripten_futex_wait(&value, seen, INFINITY);
+-#elif defined(__linux__)
++#elif defined(__linux__) || defined(__SWITCH__)
+     futex_wait(value, seen, -1);
+ #else
+     value.wait(seen);
+@@ -58,7 +73,7 @@ void wait(std::atomic<std::uint32_t> &value, std::uint32_t seen) {
+ void notify(std::atomic<std::uint32_t> &value) {
+ #ifdef __EMSCRIPTEN__
+     emscripten_futex_wake(&value, INT_MAX);
+-#elif defined(__linux__)
++#elif defined(__linux__) || defined(__SWITCH__)
+     futex_wake(value);
+ #else
+     value.notify_all();
+@@ -67,7 +82,7 @@ void notify(std::atomic<std::uint32_t> &value) {
+ 
+ Ring &render() { return g_render; }
+ Ring &vu() { return g_vu; }
+-Role &role() { return g_role; }
++thread_local Role g_role = Role::Emulation;
+ 
+ Ring &outbox() {
+     if (g_role == Role::Emulation && g_vu.active()) return g_vu;
+@@ -148,7 +163,7 @@ void Ring::wait_for_work(int timeout_ms) {
+ #ifdef __EMSCRIPTEN__
+     if (emscripten_is_main_browser_thread()) ps2_wait_async(&posted_, seen, timeout_ms);
+     else emscripten_futex_wait(&posted_, seen, timeout_ms);
+-#elif defined(__linux__)
++#elif defined(__linux__) || defined(__SWITCH__)
+     futex_wait(posted_, seen, timeout_ms);
+ #else
+     (void)seen;
+diff --git a/runtime/src/gs/queue.hpp b/runtime/src/gs/queue.hpp
+index 127c151..dbc1a1a 100644
+--- a/runtime/src/gs/queue.hpp
++++ b/runtime/src/gs/queue.hpp
+@@ -37,7 +37,10 @@ private:
+ 
+ Ring &render();
+ Ring &vu();
+-Role &role();
++// Which of the runner's threads this is; read on hot paths, so inline (a
++// thread-local read is a call on the Switch, -mtp=soft).
++extern thread_local Role g_role;
++inline Role &role() { return g_role; }
+ Ring &outbox();
+ 
+ bool active();
+-- 
+2.54.0 (Apple Git-157)
+

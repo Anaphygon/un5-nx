@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Tue, 27 Oct 2026 22:43:38 +0700
-Subject: [PATCH 13/23] fix: SetGsCrt programs SMODE1 and SMODE2 as the BIOS
+Subject: [PATCH 13/24] fix: SetGsCrt programs SMODE1 and SMODE2 as the BIOS
  does
 
 The HLE SetGsCrt only noted the mode. A GS that reads the video mode from SMODE1's CMOD field (PCSX2's does: 2 NTSC, 3 PAL) found 0 and treated the screen as VESA, which on a Switch with PCSX2's GS plugged in left it black. SetGsCrt now writes SMODE1 with the BIOS's values for the two SDTV modes and SMODE2 from the interlace and field arguments. A loaded state also hands the privileged registers to an external GS, which otherwise only sees them as the game writes them.

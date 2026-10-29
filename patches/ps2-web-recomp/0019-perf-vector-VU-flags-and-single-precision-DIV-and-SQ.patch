@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Thu, 29 Oct 2026 13:14:10 +0700
-Subject: [PATCH 19/23] perf: vector VU flags and single-precision DIV and
+Subject: [PATCH 19/24] perf: vector VU flags and single-precision DIV and
  SQRT, same results
 
 flags() builds the MAC word from all four lanes at once (identical to the per-lane loop on 50M random inputs). fp::div and fp::sqrt compute in float and step back one unit when an FMA residual shows the correctly rounded result went past the exact one: the truncated exact result, bit for bit what the double path gives (0 mismatches in 800M random cases). Operands with exponents below 64 or of 255 keep the double path. A UN5 battle replay stays byte-identical.

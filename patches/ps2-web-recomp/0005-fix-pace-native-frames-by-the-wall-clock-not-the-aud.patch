@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Tue, 27 Oct 2026 12:04:57 +0700
-Subject: [PATCH 05/23] fix: pace native frames by the wall clock, not the
+Subject: [PATCH 05/24] fix: pace native frames by the wall clock, not the
  audio queue
 
 Waiting while more than 80 ms of sound was queued paced frames by the audio device's 1024-sample pulls: two quick frames, then one of 25 ms, which shows as stutter at a full frame rate. In UN5 battles 700 of 10,507 frames took over 1.5 periods; with frames on the wall clock and the queue only nudging the period, 33 of 7,800 did, two of them disc loads. Some stutter remains in heavy scenes.
