@@ -3,6 +3,8 @@
 
 #include "common/Console.h"
 
+#include "fmt/format.h"
+
 #include <cstdio>
 #include <cstdlib>
 #include <algorithm>
@@ -15,6 +17,10 @@ namespace dk
 		void DebugCallback(void*, const char* context, DkResult result, const char* message)
 		{
 			Console.Error("deko3d: %s: %s (result %d)", context ? context : "?", message ? message : "?", static_cast<int>(result));
+			unsigned long long addr = 0;
+			if (message && std::sscanf(message, " Address: 0x%llx", &addr) == 1 && Context::s_instance)
+				Context::s_instance->ExplainAddress(addr);
+			std::fflush(stderr);
 		}
 
 		DkMemBlock MakeBlock(DkDevice device, u32 size, u32 flags)
@@ -43,14 +49,68 @@ namespace dk
 		}
 	} // namespace
 
+	Context* Context::s_instance = nullptr;
+
+	void Context::Track(DkMemBlock block, std::string tag)
+	{
+		if (!block)
+			return;
+		if (m_blocks.size() > 16384)
+		{
+			// Forget the oldest freed blocks.
+			m_blocks.erase(std::remove_if(m_blocks.begin(), m_blocks.begin() + 4096, [](const BlockInfo& b) { return b.freed != 0; }),
+				m_blocks.begin() + 4096);
+		}
+		m_blocks.push_back({block, dkMemBlockGetGpuAddr(block), dkMemBlockGetSize(block), std::move(tag), m_current_batch, 0});
+	}
+
+	void Context::FreeBlock(DkMemBlock block)
+	{
+		if (!block)
+			return;
+		const u64 gpu = dkMemBlockGetGpuAddr(block);
+		for (auto it = m_blocks.rbegin(); it != m_blocks.rend(); ++it)
+		{
+			if (it->gpu == gpu && it->freed == 0)
+			{
+				it->freed = m_current_batch;
+				break;
+			}
+		}
+		Defer([block]() { dkMemBlockDestroy(block); });
+	}
+
+	void Context::ExplainAddress(u64 addr)
+	{
+		bool any = false;
+		for (const BlockInfo& b : m_blocks)
+		{
+			if (addr >= b.gpu && addr < b.gpu + b.size)
+			{
+				any = true;
+				Console.Error("deko3d: fault address is in %s (made in batch %llu, %s, offset 0x%llx)", b.tag.c_str(),
+					static_cast<unsigned long long>(b.made),
+					b.freed ? fmt::format("freed after batch {}", b.freed).c_str() : "still live",
+					static_cast<unsigned long long>(addr - b.gpu));
+			}
+		}
+		if (!any)
+			Console.Error("deko3d: fault address 0x%llx is in no block the device made", static_cast<unsigned long long>(addr));
+		std::fflush(stderr);
+	}
+
 	bool Context::Create()
 	{
+		s_instance = this;
 		DkDeviceMaker device_maker;
 		dkDeviceMakerDefaults(&device_maker);
 		device_maker.cbDebug = DebugCallback;
-		// GL's depth range with clip control, and memory row 0 at NDC -1 (as a
-		// GL framebuffer object); only the swapchain is flipped, by the device.
-		device_maker.flags = DkDeviceFlags_DepthZeroToOne | DkDeviceFlags_OriginUpperLeft;
+		// GL's conventions, which PCSX2's OpenGL paths assume: depth 0..1 (clip
+		// control) and a lower-left origin, so NDC -1 lands on memory row 0 as
+		// in a GL framebuffer object. (Upper-left put it on the last row: render
+		// targets came out flipped against copies and readbacks, measured on
+		// hardware 2026-10-29.)
+		device_maker.flags = DkDeviceFlags_DepthZeroToOne | DkDeviceFlags_OriginLowerLeft;
 		m_device = dkDeviceCreate(&device_maker);
 		if (!m_device)
 			return false;
@@ -81,6 +141,7 @@ namespace dk
 		m_stream = MakeBlock(m_device, STREAM_SIZE, DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached);
 		if (!m_stream)
 			return false;
+		Track(m_stream, "the streaming ring");
 		m_stream_cpu = static_cast<u8*>(dkMemBlockGetCpuAddr(m_stream));
 		m_stream_gpu = dkMemBlockGetGpuAddr(m_stream);
 
@@ -89,6 +150,7 @@ namespace dk
 		m_descriptors = MakeBlock(m_device, image_bytes + sampler_bytes, DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached);
 		if (!m_descriptors)
 			return false;
+		Track(m_descriptors, "the descriptor sets");
 		u8* desc_cpu = static_cast<u8*>(dkMemBlockGetCpuAddr(m_descriptors));
 		std::memset(desc_cpu, 0, image_bytes + sampler_bytes);
 		m_image_descs = reinterpret_cast<DkImageDescriptor*>(desc_cpu);
@@ -102,6 +164,9 @@ namespace dk
 		m_code = MakeBlock(m_device, CODE_SIZE, DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached | DkMemBlockFlags_Code);
 		if (!m_code)
 			return false;
+		Track(m_code, "shader code");
+		for (u32 i = 0; i < NUM_CMD_CHUNKS; i++)
+			Track(m_cmd_chunks[i].block, fmt::format("command chunk {}", i));
 
 		BeginBatch();
 		return true;
@@ -115,6 +180,19 @@ namespace dk
 		{
 			m_deferred.front().second();
 			m_deferred.pop_front();
+		}
+		// Anything the GS still holds (ImGui's textures, say) goes too: deko3d
+		// will not destroy a device with blocks left.
+		for (BlockInfo& b : m_blocks)
+		{
+			const bool own = b.block == m_stream || b.block == m_descriptors || b.block == m_code ||
+							 std::any_of(m_cmd_chunks.begin(), m_cmd_chunks.end(), [&b](const CmdChunk& c) { return c.block == b.block; });
+			if (b.freed == 0 && !own)
+			{
+				Console.WriteLn("deko3d: freeing %s at shutdown", b.tag.c_str());
+				dkMemBlockDestroy(b.block);
+				b.freed = m_current_batch;
+			}
 		}
 		if (m_cmd)
 			dkCmdBufDestroy(m_cmd);
@@ -357,9 +435,11 @@ namespace dk
 		m_deferred.emplace_back(m_current_batch, std::move(fn));
 	}
 
-	DkMemBlock Context::AllocImageMemory(u32 size)
+	DkMemBlock Context::AllocImageMemory(u32 size, std::string tag)
 	{
-		return MakeBlock(m_device, size, DkMemBlockFlags_GpuCached | DkMemBlockFlags_Image);
+		DkMemBlock block = MakeBlock(m_device, size, DkMemBlockFlags_GpuCached | DkMemBlockFlags_Image);
+		Track(block, std::move(tag));
+		return block;
 	}
 
 	bool Context::AllocCode(u32 size, DkMemBlock* block, u32* offset, void** cpu)

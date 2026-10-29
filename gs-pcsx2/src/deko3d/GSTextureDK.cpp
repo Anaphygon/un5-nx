@@ -6,6 +6,8 @@
 #include "common/Console.h"
 #include "common/StringUtil.h"
 
+#include "fmt/format.h"
+
 #include <cstring>
 
 namespace
@@ -78,7 +80,8 @@ GSTextureDK::GSTextureDK(Usage usage, int width, int height, int levels, Format 
 	dkImageLayoutInitialize(&m_layout, &maker);
 
 	const u32 size = static_cast<u32>(dkImageLayoutGetSize(&m_layout));
-	m_memory = ctx.AllocImageMemory(size);
+	m_memory = ctx.AllocImageMemory(size, fmt::format("a {}x{} texture (format {}, usage {})", m_size.x, m_size.y,
+		static_cast<int>(format), static_cast<int>(usage)));
 	if (!m_memory)
 	{
 		Console.Error("deko3d: failed to allocate %u bytes for a %dx%d texture", size, m_size.x, m_size.y);
@@ -110,8 +113,7 @@ GSTextureDK::~GSTextureDK()
 	dev->UnbindTexture(this);
 	dk::Context& ctx = dev->Ctx();
 	ctx.FreeImageDescriptor(m_descriptor);
-	DkMemBlock memory = m_memory;
-	ctx.Defer([memory]() { dkMemBlockDestroy(memory); });
+	ctx.FreeBlock(m_memory);
 }
 
 void* GSTextureDK::GetNativeHandle() const
@@ -205,8 +207,7 @@ GSDownloadTextureDK::~GSDownloadTextureDK()
 {
 	if (!m_memory)
 		return;
-	DkMemBlock memory = m_memory;
-	GSDeviceDK::GetInstance()->Ctx().Defer([memory]() { dkMemBlockDestroy(memory); });
+	GSDeviceDK::GetInstance()->Ctx().FreeBlock(m_memory);
 }
 
 std::unique_ptr<GSDownloadTextureDK> GSDownloadTextureDK::Create(u32 width, u32 height, GSTexture::Format format)
@@ -220,6 +221,7 @@ std::unique_ptr<GSDownloadTextureDK> GSDownloadTextureDK::Create(u32 width, u32 
 	DkMemBlock memory = dkMemBlockCreate(&maker);
 	if (!memory)
 		return {};
+	GSDeviceDK::GetInstance()->Ctx().Track(memory, fmt::format("a {}x{} download buffer", width, height));
 	std::unique_ptr<GSDownloadTextureDK> ret(new GSDownloadTextureDK(width, height, format));
 	ret->m_memory = memory;
 	ret->m_cpu = static_cast<u8*>(dkMemBlockGetCpuAddr(memory));

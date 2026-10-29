@@ -181,6 +181,7 @@ private:
 
 	void RenderImGui();
 	void SelfTest();
+	void OrientationProbe();
 
 	dk::Context m_ctx;
 

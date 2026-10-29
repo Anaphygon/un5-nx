@@ -170,7 +170,7 @@ bool GSDeviceDK::Create(GSVSyncMode vsync_mode, bool allow_present_throttle)
 		std::array<const DkImage*, NUM_SWAPCHAIN_IMAGES> images;
 		for (u32 i = 0; i < NUM_SWAPCHAIN_IMAGES; i++)
 		{
-			m_swap_memory[i] = m_ctx.AllocImageMemory(size);
+			m_swap_memory[i] = m_ctx.AllocImageMemory(size, fmt::format("swapchain image {}", i));
 			if (!m_swap_memory[i])
 				return false;
 			dkImageInitialize(&m_swap_images[i], &layout, m_swap_memory[i], 0);
@@ -201,6 +201,7 @@ bool GSDeviceDK::Create(GSVSyncMode vsync_mode, bool allow_present_throttle)
 		m_expand_ib = dkMemBlockCreate(&maker);
 		if (!m_expand_ib)
 			return false;
+		m_ctx.Track(m_expand_ib, "the expansion index buffer");
 		GenerateExpansionIndexBuffer(dkMemBlockGetCpuAddr(m_expand_ib));
 		m_expand_ib_gpu = dkMemBlockGetGpuAddr(m_expand_ib);
 	}
@@ -243,12 +244,10 @@ void GSDeviceDK::Destroy()
 	m_swapchain = nullptr;
 	for (DkMemBlock& block : m_swap_memory)
 	{
-		if (block)
-			dkMemBlockDestroy(block);
+		m_ctx.FreeBlock(block);
 		block = nullptr;
 	}
-	if (m_expand_ib)
-		dkMemBlockDestroy(m_expand_ib);
+	m_ctx.FreeBlock(m_expand_ib);
 	m_expand_ib = nullptr;
 	m_ctx.Destroy();
 }
@@ -305,6 +304,44 @@ void GSDeviceDK::SelfTest()
 		return;
 	dkQueuePresentImage(m_ctx.Queue(), m_swapchain, slot);
 	step("present");
+	OrientationProbe();
+}
+
+// Which memory rows a draw at NDC y -1..0 and a scissor at window y 0..1 land
+// on, read back from a 4x4 target. OpenGL (what PCSX2's paths assume) puts
+// both on the first rows.
+void GSDeviceDK::OrientationProbe()
+{
+	GSTextureDK* const rt = static_cast<GSTextureDK*>(CreateSurface(GSTexture::Usage::RenderTarget, 4, 4, 1, GSTexture::Format::Color));
+	std::unique_ptr<GSDownloadTextureDK> dl = GSDownloadTextureDK::Create(4, 4, GSTexture::Format::Color);
+	if (!rt || !dl || !m_convert[ShaderConvertSelector(ShaderConvert::COPY).Index()].Valid())
+		return;
+	const auto clear_target = [this](GSTextureDK* t, float v) {
+		OMSetRenderTargets(t, nullptr, nullptr);
+		FlushState();
+		dkCmdBufClearColorFloat(m_ctx.Cmd(), 0, DkColorMask_RGBA, v, v, v, 1.0f);
+		NoteDrawWrites();
+	};
+	clear_target(m_dummy, 1.0f);
+	clear_target(rt, 0.0f);
+	rt->SetState(GSTexture::State::Dirty);
+	m_dummy->SetState(GSTexture::State::Dirty);
+	DoStretchRect(m_dummy, GSVector4(0, 0, 1, 1), rt, GSVector4(0, 0, 4, 2), m_convert[ShaderConvertSelector(ShaderConvert::COPY).Index()],
+		false, OMColorMaskSelector(), Nearest);
+	OMSetRenderTargets(rt, nullptr, nullptr, nullptr);
+	SetScissor(GSVector4i(0, 0, 4, 1));
+	FlushState();
+	dkCmdBufClearColorFloat(m_ctx.Cmd(), 0, DkColorMask_RGBA, 0.5f, 0.5f, 0.5f, 1.0f);
+	NoteDrawWrites();
+	dl->CopyFromTexture(GSVector4i(0, 0, 4, 4), rt, GSVector4i(0, 0, 4, 4), 0, true);
+	dl->Flush();
+	std::string rows;
+	for (u32 y = 0; y < 4; y++)
+		rows += fmt::format(" row{}={:02x}", y, dl->GetMapPointer()[y * dl->GetMapPitch()]);
+	Console.WriteLn("deko3d probe: draw at NDC y -1..0 and scissor at window y 0..1 give%s"
+					" (OpenGL: rows 0-1 bright, row 0 grey 7f)", rows.c_str());
+	std::fflush(stderr);
+	delete rt;
 }
 
 GSTexture* GSDeviceDK::CreateSurface(GSTexture::Usage usage, int width, int height, int levels, GSTexture::Format format)
@@ -1397,9 +1434,9 @@ void GSDeviceDK::PresentRect(GSTexture* sTex, const GSVector4& sRect, GSTexture*
 	ClearTextureUnits();
 	PSSetShaderResource(TEXTURE_TEXTURE, sTex);
 	PSSetSampler(filter == Biln ? m_sampler_linear : SAMPLER_POINT);
-	// OpenGL's window has row 0 at the bottom and flips the source; the
-	// swapchain image has row 0 at the top, so the source goes in as it is.
-	DrawStretchRect(dTex ? GSVector4(sRect.xwzy()) : sRect, dRect, ds);
+	// As OpenGL: the window shows memory row 0 at the bottom (measured with
+	// the orientation probe), so the source is flipped.
+	DrawStretchRect(GSVector4(sRect.xwzy()), dRect, ds);
 }
 
 void GSDeviceDK::UpdateCLUTTexture(GSTexture* sTex, float sScale, u32 offsetX, u32 offsetY, GSTexture* dTex, u32 dOffset, u32 dSize)
@@ -2014,14 +2051,15 @@ void GSDeviceDK::RenderImGui()
 		return;
 	UpdateImGuiTextures();
 
-	// ImGui's y runs down from the top, as the swapchain's rows do.
+	// OpenGL's projection: ImGui's y runs down from the top, the window's
+	// row 0 is at the bottom.
 	const float W = static_cast<float>(m_window_info.surface_width);
 	const float H = static_cast<float>(m_window_info.surface_height);
 	const float ortho_projection[4][4] = {
 		{2.0f / W, 0.0f, 0.0f, 0.0f},
-		{0.0f, 2.0f / H, 0.0f, 0.0f},
+		{0.0f, -2.0f / H, 0.0f, 0.0f},
 		{0.0f, 0.0f, -1.0f, 0.0f},
-		{-1.0f, -1.0f, 0.0f, 1.0f},
+		{-1.0f, 1.0f, 0.0f, 1.0f},
 	};
 	SetLooseUniforms(ortho_projection, sizeof(ortho_projection));
 	BindSwapchainTarget();
@@ -2046,7 +2084,8 @@ void GSDeviceDK::RenderImGui()
 			const GSVector4 clip = GSVector4::load<false>(&pcmd->ClipRect);
 			if ((clip.zwzw() <= clip.xyxy()).mask() != 0)
 				continue;
-			SetScissor(GSVector4i(clip));
+			const GSVector4i iclip(clip);
+			SetScissor(GSVector4i(iclip.x, static_cast<int>(H) - iclip.w, iclip.z, static_cast<int>(H) - iclip.y));
 			PSSetShaderResource(TEXTURE_TEXTURE, reinterpret_cast<GSTextureDK*>(pcmd->GetTexID()));
 			FlushState();
 			dkCmdBufBindVtxBuffer(cmd, 0, m_vertex.addr, m_vertex.count * m_vertex.stride);

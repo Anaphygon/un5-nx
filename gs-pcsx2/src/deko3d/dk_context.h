@@ -16,6 +16,7 @@
 #include <array>
 #include <deque>
 #include <functional>
+#include <string>
 #include <vector>
 
 namespace dk
@@ -70,7 +71,15 @@ namespace dk
 		void Defer(std::function<void()> fn);
 
 		// Memory for images: one block per image, rounded to the block alignment.
-		DkMemBlock AllocImageMemory(u32 size);
+		// The tag names it in the log when the GPU faults inside it.
+		DkMemBlock AllocImageMemory(u32 size, std::string tag);
+		// Destroys a block once the current batch is complete.
+		void FreeBlock(DkMemBlock block);
+		// Every block made, live or freed, by GPU address; logs the ones that
+		// contain addr (called from the debug callback on a page fault).
+		void Track(DkMemBlock block, std::string tag);
+		void ExplainAddress(u64 addr);
+		static Context* s_instance;
 		// Code memory for shaders, never freed (the pack is small).
 		bool AllocCode(u32 size, DkMemBlock* block, u32* offset, void** cpu);
 
@@ -102,6 +111,15 @@ namespace dk
 		BatchId m_current_batch = 1;
 		BatchId m_completed_batch = 0;
 		bool m_reported_error = false;
+		struct BlockInfo
+		{
+			DkMemBlock block;
+			u64 gpu;
+			u32 size;
+			std::string tag;
+			BatchId made, freed;
+		};
+		std::vector<BlockInfo> m_blocks;
 
 		// Streaming ring.
 		static constexpr u32 STREAM_SIZE = 96 * 1024 * 1024;
