@@ -54,3 +54,24 @@ Other options considered, and why they are not first:
 
 - **VIF unpack on another core.** The ceiling is 13% of the VU thread, and the work needs exact synchronisation with VU memory double-buffering.
 - **VU1 on the GPU** (as DBT-NX does with Tenkaichi 3). PCSX2's GS consumes GIF packets and has no path for geometry that the GPU has already transformed, so this would need a renderer of its own. It is left for the deko3d work.
+
+## Stage 1: what the measurements said, and what was done
+
+PS2_VU_BENCH timed DC7A on its first battle call, on a Mac, in three versions. Two of them are wrong on purpose and only show how much could be gained:
+
+| Version | µs per call | Speed |
+|---|---|---|
+| Compiled, as vurecomp makes it | 2.24 | 1.00x |
+| Same, with no flag work at all | 2.08 | 1.08x |
+| Same, also without the per-result `vfix` | 0.94 | 2.39x |
+
+Flags cost little. The cost is `vfix`, which runs after every operation to give PS2 float behaviour: no infinities and no denormals.
+
+**Done:** `vurecomp --rz` (engine patch 0023).
+- Compiled programs run with the host set to round-toward-zero and flush-to-zero. The runtime switches FPCR (or MXCSR on x86-64) around each compiled program.
+- In that mode the hardware does what `vfix` did to results, and round-toward-zero is the VU's own rounding. Loads still go through `vfix`.
+- Checked against the interpreter in the same mode: only the unread flags differ, as before. A battle replay changes by at most 24/255 per channel, in a few pixels, and was confirmed clean on the Switch (no spiky polygons).
+
+**Result** on a Switch at stock clocks (1785/768/1600): a battle went from ~37 to **~43 fps**, and DC7A from 25.7 to 22.2 µs per call. The VU thread is still the limit.
+
+**A native family-A rewrite is not done for now.** Flags were the only overhead left to remove, and removing them is worth about 1.08x. The next lever is the GPU or deko3d work.

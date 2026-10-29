@@ -37,7 +37,7 @@ fi
 vu_after=$(ls "$G/vu1" | wc -l)
 if [ "$vu_after" -gt "$vu_before" ]; then
     echo "== $((vu_after - vu_before)) new VU1 programs; translating them"
-    build/tools/vurecomp "$G/vu1" generated/un5 | tail -1
+    build/tools/vurecomp --rz "$G/vu1" generated/un5 | tail -1
     rebuild=1
 fi
 [ "$rebuild" = 1 ] || exit 0

@@ -182,6 +182,7 @@ GL renderer (PCSX2-style) is the way to full speed.
   flags built from all lanes at once) and do DIV/SQRT in single precision
   with an exact round-toward-zero fix-up (same bits; the Mac replay stays
   byte-identical): about +1 fps. Battle now **~38 fps**, sometimes 41.
+- **VU1 in round-toward-zero mode (2026-10-29).** Compiled VU1 programs now run with the host in round-toward-zero, flush-to-zero mode (`vurecomp --rz`, engine patch 0023): the hardware does the clamping that took a `vfix` after every operation. Battle at stock clocks (1785/768/1600): ~37 to **~43 fps**; with memory at 1996 the user found it smoother still. No visible change on screen (checked on the Switch). See `docs/VU1-NATIVE.md`.
 - **Next limit: the VU thread**, now ~100% busy running the 39 compiled VU1
   programs (0 interpreted) and VIF unpack; the GS thread waits on it ~28%
   of the time. Hottest: flag computation (`vuops::flags`) and DIV/SQRT via

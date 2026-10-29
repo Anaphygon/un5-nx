@@ -1,0 +1,270 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 29 Oct 2026 14:12:55 +0700
+Subject: [PATCH 23/23] perf: VU1 programs in round-toward-zero mode (vurecomp
+ --rz), and a bench for them
+
+With --rz, compiled programs leave arithmetic results to the host, which the runtime switches to round-toward-zero and flush-to-zero around each compiled program (FPCR on ARM64, MXCSR on x86-64) and restores afterwards. A finite result then never overflows to infinity and a tiny one becomes a signed zero, which is what vfix did after every operation, and it is the VU's own rounding. Multiply-add products are kept from being fused into one FMA. Operands loaded from memory still go through vfix.
+
+UN5 battle on a Switch at 1785/768/1600 MHz: ~37 to ~43 fps; the hottest program 25.7 to 22.2 us per call. PS2_VU_CHECK (both sides in the same mode) still differs from the interpreter only in unread flags. Results differ from round-to-nearest in the last bit, e.g. no pixel of a battle replay frame moved by more than 24 of 255.
+
+PS2_VU_BENCH=<key> times a program from the state of its first run and compares it with stand-ins registered through register_native; PS2_VU_BENCH_RUNS sets the count.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ recomp/vurecomp.cpp            |  25 +++++---
+ runtime/include/ps2/vu_ops.hpp |  27 ++++++++-
+ runtime/src/vu_micro.cpp       | 108 ++++++++++++++++++++++++++++++++-
+ 3 files changed, 150 insertions(+), 10 deletions(-)
+
+diff --git a/recomp/vurecomp.cpp b/recomp/vurecomp.cpp
+index c0464f8..ced762e 100644
+--- a/recomp/vurecomp.cpp
++++ b/recomp/vurecomp.cpp
+@@ -62,6 +62,12 @@ std::string lane_mask(unsigned d) {
+     return mask + "}";
+ }
+ 
++// --rz: arithmetic results are left to the host, which the runtime runs
++// with round-toward-zero and flush-to-zero while compiled programs execute
++// (see vu_micro.cpp). That is the VU's own rounding, and it gives what vfix
++// does to a result (no infinities, no denormals) for free.
++bool g_rz = false;
++
+ Upper upper(std::uint32_t hi, bool flags_live) {
+     Upper u;
+     const unsigned dest = (hi >> 21) & 15u, ft = (hi >> 16) & 31u, fs = (hi >> 11) & 31u, fd = (hi >> 6) & 31u, bc = hi & 3u;
+@@ -184,11 +190,11 @@ Upper upper(std::uint32_t hi, bool flags_live) {
+         const std::string ns = operand(fs);
+         if (kind == Madd || kind == Msub) u.shadow_reads.push_back(kAcc);
+         switch (kind) {
+-        case Add: u.pre += std::format("const v4u uv = vaddn({}, {}); ", ns, nb); break;
+-        case Sub: u.pre += std::format("const v4u uv = vsubn({}, {}); ", ns, nb); break;
+-        case Mul: u.pre += std::format("const v4u uv = vmuln({}, {}); ", ns, nb); break;
+-        case Madd: u.pre += std::format("const v4u uv = vmaddn(nacc, {}, {}); ", ns, nb); break;
+-        default: u.pre += std::format("const v4u uv = vmsubn(nacc, {}, {}); ", ns, nb); break;
++        case Add: u.pre += std::format("const v4u uv = vadd{}({}, {}); ", g_rz ? "z" : "n", ns, nb); break;
++        case Sub: u.pre += std::format("const v4u uv = vsub{}({}, {}); ", g_rz ? "z" : "n", ns, nb); break;
++        case Mul: u.pre += std::format("const v4u uv = vmul{}({}, {}); ", g_rz ? "z" : "n", ns, nb); break;
++        case Madd: u.pre += std::format("const v4u uv = vmadd{}(nacc, {}, {}); ", g_rz ? "z" : "n", ns, nb); break;
++        default: u.pre += std::format("const v4u uv = vmsub{}(nacc, {}, {}); ", g_rz ? "z" : "n", ns, nb); break;
+         }
+     }
+     if (vector) {
+@@ -666,8 +672,13 @@ std::string generate(const Program &p, std::string &name, bool sticky_live) {
+ }
+ 
+ int main(int argc, char **argv) {
++    if (argc > 1 && std::string(argv[1]) == "--rz") {
++        g_rz = true;
++        --argc;
++        ++argv;
++    }
+     if (argc < 3) {
+-        std::fprintf(stderr, "usage: vurecomp <recorded programs dir> <out dir>\n");
++        std::fprintf(stderr, "usage: vurecomp [--rz] <recorded programs dir> <out dir>\n");
+         return 1;
+     }
+     const fs::path in_dir = argv[1], out_dir = argv[2];
+@@ -738,7 +749,7 @@ int main(int argc, char **argv) {
+     table += "\nconst ps2::vu::Program kVuPrograms[] = {\n";
+     for (std::size_t i = 0; i < programs.size(); ++i) table += std::format("    {{0x{:016X}ull, {}}},\n", programs[i].key, names[i]);
+     if (programs.empty()) table += "    {0, nullptr},\n";
+-    table += std::format("}};\n\n}}\n\nvoid register_generated_vu() {{ ps2::vu::register_programs(gen::kVuPrograms, {}u); }}\n", programs.size());
++    table += std::format("}};\n\n}}\n\nvoid register_generated_vu() {{ ps2::vu::register_programs(gen::kVuPrograms, {}u, {}); }}\n", programs.size(), g_rz ? "true" : "false");
+     std::ofstream(out_dir / "vu1_table.cpp") << table;
+     std::printf("%zu VU1 programs, %zu of them jump targets\n", programs.size(), programs.size() - recorded);
+     return 0;
+diff --git a/runtime/include/ps2/vu_ops.hpp b/runtime/include/ps2/vu_ops.hpp
+index a81564d..28ce9b3 100644
+--- a/runtime/include/ps2/vu_ops.hpp
++++ b/runtime/include/ps2/vu_ops.hpp
+@@ -26,7 +26,13 @@ struct Program {
+     ProgramFn function;
+ };
+ 
+-void register_programs(const Program *programs, std::uint32_t count);
++// round_to_zero: the programs were translated with vurecomp --rz and must
++// run with the host in round-toward-zero, flush-to-zero mode.
++void register_programs(const Program *programs, std::uint32_t count, bool round_to_zero = false);
++// A hand-written stand-in for the compiled program with this key, compared
++// with it by PS2_VU_BENCH. Several may be registered; they are timed in the
++// order they were registered.
++void register_native(std::uint64_t key, ProgramFn function);
+ 
+ inline std::uint32_t lower_major(std::uint32_t lo) { return lo >> 25; }
+ // Flag reads bypass the one-instruction VI delay seen by branch operands.
+@@ -390,6 +396,25 @@ PS2_VU_INLINE v4u vsubn(v4u a, v4u b) { return vout((v4f)a - (v4f)b); }
+ PS2_VU_INLINE v4u vmuln(v4u a, v4u b) { return vout((v4f)a * (v4f)b); }
+ PS2_VU_INLINE v4u vmaddn(v4u acc, v4u a, v4u b) { return vout((v4f)acc + vnorm((v4f)a * (v4f)b)); }
+ PS2_VU_INLINE v4u vmsubn(v4u acc, v4u a, v4u b) { return vout((v4f)acc - vnorm((v4f)a * (v4f)b)); }
++// The z variants (vurecomp --rz) leave the result to the host, running in
++// round-toward-zero and flush-to-zero mode: a finite result then never
++// becomes infinite and a tiny one becomes a signed zero, which is what vfix
++// does, and it is the VU's own rounding. The product of a multiply-add is
++// kept apart so the compiler does not fuse it into one FMA, which would
++// round once instead of twice.
++PS2_VU_INLINE v4f vapart(v4f x) {
++#if defined(__aarch64__)
++    asm("" : "+w"(x));
++#elif defined(__x86_64__)
++    asm("" : "+x"(x));
++#endif
++    return x;
++}
++PS2_VU_INLINE v4u vaddz(v4u a, v4u b) { return (v4u)((v4f)a + (v4f)b); }
++PS2_VU_INLINE v4u vsubz(v4u a, v4u b) { return (v4u)((v4f)a - (v4f)b); }
++PS2_VU_INLINE v4u vmulz(v4u a, v4u b) { return (v4u)((v4f)a * (v4f)b); }
++PS2_VU_INLINE v4u vmaddz(v4u acc, v4u a, v4u b) { return (v4u)((v4f)acc + vapart((v4f)a * (v4f)b)); }
++PS2_VU_INLINE v4u vmsubz(v4u acc, v4u a, v4u b) { return (v4u)((v4f)acc - vapart((v4f)a * (v4f)b)); }
+ PS2_VU_INLINE v4u vadd(v4u a, v4u b) { return vaddn(vfix(a), vfix(b)); }
+ PS2_VU_INLINE v4u vsub(v4u a, v4u b) { return vsubn(vfix(a), vfix(b)); }
+ PS2_VU_INLINE v4u vmul(v4u a, v4u b) { return vmuln(vfix(a), vfix(b)); }
+diff --git a/runtime/src/vu_micro.cpp b/runtime/src/vu_micro.cpp
+index 6000376..6812322 100644
+--- a/runtime/src/vu_micro.cpp
++++ b/runtime/src/vu_micro.cpp
+@@ -12,6 +12,9 @@
+ #include "ps2/state.hpp"
+ 
+ #include <atomic>
++#if defined(__x86_64__)
++#include <xmmintrin.h>
++#endif
+ #include <vector>
+ #include <format>
+ #include <chrono>
+@@ -732,7 +735,103 @@ using Clock = std::chrono::steady_clock;
+ 
+ double ms_since(Clock::time_point t) { return std::chrono::duration<double, std::milli>(Clock::now() - t).count(); }
+ 
++// Compiled programs translated with vurecomp --rz run with the host in
++// round-toward-zero, flush-to-zero mode; the mode is restored afterwards, for
++// the interpreter and everything else on the thread. Nested runs (a program
++// handing over to the interpreter, which calls another) keep it.
++bool g_round_to_zero = false;
++
++struct RoundToZero {
++    std::uint64_t saved = 0;
++    bool set = false;
++    RoundToZero() {
++        if (!g_round_to_zero) return;
++#if defined(__aarch64__)
++        asm volatile("mrs %0, fpcr" : "=r"(saved));
++        const std::uint64_t mode = saved | (3ull << 22) | (1ull << 24);  // RMode RZ, FZ
++        asm volatile("msr fpcr, %0" : : "r"(mode));
++        set = true;
++#elif defined(__x86_64__)
++        saved = _mm_getcsr();
++        _mm_setcsr(static_cast<unsigned>(saved) | 0x6000u | 0x8000u | 0x40u);  // RC toward zero, FTZ, DAZ
++        set = true;
++#else
++        std::fprintf(stderr, "[vu] programs translated with --rz need an ARM64 or x86-64 host\n");
++        std::abort();
++#endif
++    }
++    ~RoundToZero() {
++        if (!set) return;
++#if defined(__aarch64__)
++        asm volatile("msr fpcr, %0" : : "r"(saved));
++#elif defined(__x86_64__)
++        _mm_setcsr(static_cast<unsigned>(saved));
++#endif
++    }
++};
++
++// Native stand-ins for hot compiled programs, by program key (see
++// register_native). PS2_VU_BENCH=<key in hex> times that program, from the
++// state of its first run, compiled and native, and compares what both leave
++// in the registers and VU memory; XGKICK is muted while it runs.
++// A function-local map: natives register from static initialisers in other
++// translation units, which may run before this one's.
++std::unordered_map<std::uint64_t, std::vector<ProgramFn>> &natives() {
++    static std::unordered_map<std::uint64_t, std::vector<ProgramFn>> map;
++    return map;
++}
++
++std::uint64_t key_of(ProgramFn fn) {
++    for (const auto &[k, f] : g_programs)
++        if (f == fn) return k;
++    return 0;
++}
++
++void bench(ProgramFn fn) {
++    static const char *want = std::getenv("PS2_VU_BENCH");
++    static bool done = false;
++    if (!want || done) return;
++    if (key_of(fn) != std::strtoull(want, nullptr, 16)) return;
++    done = true;
++    const auto native = natives().find(key_of(fn));
++    static Vu0Regs start, after_c, after_n;
++    static std::uint8_t start_mem[16384], mem_c[16384], mem_n[16384];
++    start = g_vu1;
++    std::memcpy(start_mem, g_vu1_mem, sizeof start_mem);
++    g_reference_dry = true;
++    const auto time = [&](ProgramFn f, Vu0Regs &regs_out, std::uint8_t *mem_out) {
++        static const int kRuns = std::getenv("PS2_VU_BENCH_RUNS") ? std::atoi(std::getenv("PS2_VU_BENCH_RUNS")) : 2000;
++        const auto t = Clock::now();
++        const RoundToZero rz;
++        for (int i = 0; i < kRuns; ++i) {
++            g_vu1 = start;
++            std::memcpy(g_vu1_mem, start_mem, sizeof start_mem);
++            f(g_vu1, g_vu1_mem);
++        }
++        regs_out = g_vu1;
++        std::memcpy(mem_out, g_vu1_mem, 16384);
++        return ms_since(t) * 1000.0 / kRuns;
++    };
++    const double us_c = time(fn, after_c, mem_c);
++    std::fprintf(stderr, "[vu-bench] %s compiled: %.2f us per run\n", want, us_c);
++    for (std::size_t v = 0; native != natives().end() && v < native->second.size(); ++v) {
++        const double us_n = time(native->second[v], after_n, mem_n);
++        const bool same_mem = std::memcmp(mem_c, mem_n, sizeof mem_c) == 0;
++        const bool same_vf = std::memcmp(after_c.vf, after_n.vf, sizeof after_c.vf) == 0;
++        const bool same_vi = std::memcmp(after_c.vi, after_n.vi, sizeof after_c.vi) == 0;
++        std::fprintf(stderr, "[vu-bench] %s native %zu: %.2f us per run (%.2fx); same memory %d, vf %d, vi %d, q %d, acc %d, mac %d, status %d, clip %d, tpc %d\n",
++                     want, v, us_n, us_c / us_n, same_mem, same_vf, same_vi, after_c.q == after_n.q,
++                     std::memcmp(&after_c.acc, &after_n.acc, 16) == 0, after_c.mac == after_n.mac,
++                     after_c.status == after_n.status, after_c.clip == after_n.clip, after_c.tpc == after_n.tpc);
++    }
++    g_reference_dry = false;
++    g_vu1 = start;
++    std::memcpy(g_vu1_mem, start_mem, sizeof start_mem);
++}
++
+ void run_profiled(ProgramFn fn) {
++    bench(fn);
++    const RoundToZero rz;
+     if (!profile_on()) {
+         fn(g_vu1, g_vu1_mem);
+         return;
+@@ -801,11 +900,14 @@ void code_changed(int unit) {
+     ++g_generation[unit & 1];
+ }
+ 
+-void register_programs(const Program *programs, std::uint32_t count) {
++void register_programs(const Program *programs, std::uint32_t count, bool round_to_zero) {
++    g_round_to_zero = round_to_zero;
+     for (std::uint32_t i = 0; i < count; ++i)
+         if (programs[i].function) g_programs[programs[i].key] = programs[i].function;
+ }
+ 
++void register_native(std::uint64_t key, ProgramFn function) { natives()[key].push_back(function); }
++
+ void kick(int unit, std::uint32_t address) {
+     if (g_kick_log && unit == 1) g_kick_log->push_back(address);
+     Unit u = unit_of(unit);
+@@ -938,7 +1040,9 @@ void run_entry(int unit, std::uint32_t pc) {
+             if (check_vs_interpreter && !checking && ++sampled % 64 == 0) {
+                 // The interpreter is the reference: run the compiled function
+                 // and, from the same state, the interpreter, and report the
+-                // first registers or memory they disagree on.
++                // first registers or memory they disagree on. Both run in
++                // the compiled programs' rounding mode.
++                const RoundToZero rz;
+                 static std::uint64_t checked = 0, mismatches = 0;
+                 static std::uint8_t before_mem[16384], run_mem[16384];
+                 const Vu0Regs before = g_vu1;
+-- 
+2.54.0 (Apple Git-157)
+
