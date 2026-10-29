@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Thu, 29 Oct 2026 14:42:58 +0700
-Subject: [PATCH 24/24] perf: Switch queue waits wake at once; DIV/SQRT and the
+Subject: [PATCH 24/25] perf: Switch queue waits wake at once; DIV/SQRT and the
  thread role inline
 
 On the Switch a thread waiting on a ring queue slept a whole millisecond at a time (std::this_thread::sleep_for); it now waits on the ring's counter with Horizon's address arbitration (svcWaitForAddress / svcSignalToAddress), as Linux does with futexes. fp::div and fp::sqrt keep their double paths out of line so the single-precision paths inline into translated VU code, and the thread-role lookup on hot paths is an inline thread-local read. Same results: a UN5 battle replay is byte-identical.

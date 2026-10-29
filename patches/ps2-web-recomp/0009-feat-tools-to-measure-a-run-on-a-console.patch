@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Tue, 27 Oct 2026 16:55:40 +0700
-Subject: [PATCH 09/24] feat: tools to measure a run on a console
+Subject: [PATCH 09/25] feat: tools to measure a run on a console
 
 PS2_TIME=from,count now reports every window of count frames, with the slowest frame in it, instead of one window. PS2_GS_NULL drops every primitive, to time the rest of the machine alone. On the Switch, args.txt next to the NRO replaces the default options, one per line, with NAME=value lines setting environment variables and $DIR/ standing for the NRO's folder, so a measurement needs no rebuild.
 

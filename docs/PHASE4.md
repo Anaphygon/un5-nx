@@ -183,6 +183,23 @@ GL renderer (PCSX2-style) is the way to full speed.
   with an exact round-toward-zero fix-up (same bits; the Mac replay stays
   byte-identical): about +1 fps. Battle now **~38 fps**, sometimes 41.
 - **VU1 in round-toward-zero mode (2026-10-29).** Compiled VU1 programs now run with the host in round-toward-zero, flush-to-zero mode (`vurecomp --rz`, engine patch 0023): the hardware does the clamping that took a `vfix` after every operation. Battle at stock clocks (1785/768/1600): ~37 to **~43 fps**; with memory at 1996 the user found it smoother still. No visible change on screen (checked on the Switch). See `docs/VU1-NATIVE.md`.
+- **Clocks and settings, measured on the Switch (2026-10-29).**
+  `UN5_CLOCK_CYCLE` makes a run set the clocks itself through Horizon OC's override (hoc:clk). Each setting runs for two 5 s windows, the whole cycle twice. Temperatures are logged and the override is lifted at the end. Battle windows only:
+
+  | CPU / GPU / memory | Battle fps | Max SoC / CPU / GPU °C |
+  |---|---|---|
+  | 1224 / 768 / 1600 | ~32 | 41 / 51.5 / 52.5 |
+  | 1785 / 768 / 1600 | ~41 | 41 / 52 / 52.5 |
+  | 1785 / 921 / 1996 | ~44 | 42.6 / 54 / 54 |
+  | 1963 / 921 / 1996 (set by hand) | ~47-48 | 43 / 54 / 54.5 |
+
+  Lighter GS settings, switched every 5 s within one run (`UN5GS_CYCLE`):
+  - Texture preloading off drops a battle to 14 fps.
+  - Dithering off changes nothing.
+  - Minimum blending saves about 1 ms per frame (+1-2 fps) with nothing wrong on screen in a whole run, so it is now the default (`UN5GS_BLEND`).
+  - A blur on knockdowns seen in the cycling run came from one of the other settings.
+
+  The runner now closes the GS before it exits (engine patch 0025), because Mesa's glthread worker alive at exit crashed hbl.
 - **Next limit: the VU thread**, now ~100% busy running the 39 compiled VU1
   programs (0 interpreted) and VIF unpack; the GS thread waits on it ~28%
   of the time. Hottest: flag computation (`vuops::flags`) and DIV/SQRT via

@@ -1,0 +1,42 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 29 Oct 2026 15:08:43 +0700
+Subject: [PATCH 25/25] fix: the runner closes an external GS before it exits
+
+ExternalGs gains an optional close(), called by the windowed runner before std::_Exit. On the Switch a GL driver's worker thread (Mesa's glthread) still running at exit broke into hbl with 0x10801, as the VU thread did before patch 0016.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ host/window.cpp                     | 1 +
+ runtime/include/ps2/external_gs.hpp | 3 +++
+ 2 files changed, 4 insertions(+)
+
+diff --git a/host/window.cpp b/host/window.cpp
+index a4e2b23..1fe910d 100644
+--- a/host/window.cpp
++++ b/host/window.cpp
+@@ -443,6 +443,7 @@ int run_window(const std::function<int()> &emulate) {
+ #ifdef __SWITCH__
+     stop_switch_sampler();
+ #endif
++    if (const ps2::ExternalGs *external = ps2::external_gs(); external && external->close) external->close();
+     SDL_Quit();
+     std::fflush(nullptr);
+     std::_Exit(result);
+diff --git a/runtime/include/ps2/external_gs.hpp b/runtime/include/ps2/external_gs.hpp
+index 9ef7dc4..11a617d 100644
+--- a/runtime/include/ps2/external_gs.hpp
++++ b/runtime/include/ps2/external_gs.hpp
+@@ -19,6 +19,9 @@ struct ExternalGs {
+     void (*vsync)(std::uint32_t field);
+     // A GS-to-host image transfer (TRXDIR = 1).
+     void (*read_fifo)(void *data, std::uint32_t qwc);
++    // Optional: release the GS before the runner exits (its threads, such as
++    // a GL driver's worker, must not outlive the process on the Switch).
++    void (*close)() = nullptr;
+ };
+ 
+ void set_external_gs(const ExternalGs *gs);
+-- 
+2.54.0 (Apple Git-157)
+

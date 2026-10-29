@@ -28,7 +28,7 @@ void vsync(std::uint32_t field)
 	un5gs::vsync(field, true);
 }
 
-const ps2::ExternalGs kPcsx2Gs{open, transfer, privileged, un5gs::write_csr, vsync, un5gs::read_fifo};
+const ps2::ExternalGs kPcsx2Gs{open, transfer, privileged, un5gs::write_csr, vsync, un5gs::read_fifo, un5gs::close};
 
 [[maybe_unused]] const bool kRegistered = (ps2::set_external_gs(&kPcsx2Gs), true);
 

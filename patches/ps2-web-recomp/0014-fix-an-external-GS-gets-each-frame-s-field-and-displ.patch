@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Wed, 28 Oct 2026 00:12:04 +0700
-Subject: [PATCH 14/24] fix: an external GS gets each frame's field and display
+Subject: [PATCH 14/25] fix: an external GS gets each frame's field and display
  registers with its present
 
 The render thread can run frames behind the CPU thread. Reading the odd-field

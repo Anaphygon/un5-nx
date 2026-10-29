@@ -15,6 +15,9 @@
 #include "fmt/format.h"
 
 #include <algorithm>
+#include <cstring>
+#include <vector>
+#include <array>
 #include <iterator>
 #include <string>
 #include <cstdio>
@@ -39,6 +42,10 @@ extern u64 g_un5_gpu_behind, g_un5_presents;
 // From switch_clocks.cpp.
 unsigned un5_clock_mhz(int which);
 unsigned un5_measured_cpu_mhz();
+bool un5_hoc_open();
+u32 un5_hoc_nearest_hz(u32 module, u32 mhz);
+bool un5_hoc_override(const u32 hz[3]);
+bool un5_hoc_status(int out[5]);
 // From ps2-web-recomp's host/switch_threads.cpp: the core for threads
 // created from now on (-1: libnx's default).
 extern "C" void ps2_switch_new_thread_core(int core);
@@ -53,7 +60,9 @@ alignas(16) u8 s_privileged[0x2000];
 // GS settings from the environment (args.txt on the Switch), to trade
 // accuracy for speed without a rebuild:
 //   UN5GS_PRELOAD   texture preloading 0 off, 1 partial, 2 full (PCSX2 default)
-//   UN5GS_BLEND     blending accuracy 0 minimum .. 5 maximum (default 1, basic)
+//   UN5GS_BLEND     blending accuracy 0 minimum .. 5 maximum (default 0: measured
+//                   on a Switch, about 1 ms off the GS thread and +1-2 fps in battle,
+//                   nothing wrong on screen; PCSX2's own default is 1, basic)
 //   UN5GS_MIPMAP    hardware mipmapping 0 or 1 (default 1)
 //   UN5GS_DITHER    dithering 0 off .. 2 (default 2)
 //   UN5GS_DOWNLOAD  GS-to-EE readbacks, PCSX2's GSHardwareDownloadMode: 0 enabled
@@ -69,8 +78,7 @@ void apply_environment()
 	};
 	GSConfig.TexturePreloading = static_cast<TexturePreloadingLevel>(
 		std::clamp(number("UN5GS_PRELOAD", static_cast<int>(GSConfig.TexturePreloading)), 0, 2));
-	GSConfig.AccurateBlendingUnit = static_cast<AccBlendLevel>(
-		std::clamp(number("UN5GS_BLEND", static_cast<int>(GSConfig.AccurateBlendingUnit)), 0, 5));
+	GSConfig.AccurateBlendingUnit = static_cast<AccBlendLevel>(std::clamp(number("UN5GS_BLEND", 0), 0, 5));
 	GSConfig.HWMipmap = number("UN5GS_MIPMAP", GSConfig.HWMipmap ? 1 : 0) != 0;
 	GSConfig.Dithering = static_cast<u8>(std::clamp(number("UN5GS_DITHER", GSConfig.Dithering), 0, 2));
 	GSConfig.HWDownloadMode = static_cast<GSHardwareDownloadMode>(
@@ -94,6 +102,66 @@ struct GsTime
 	~GsTime() { s_gs_ticks += Common::Timer::GetCurrentValue() - start; }
 };
 
+
+#ifdef __SWITCH__
+bool s_clock_override = false;
+
+void clock_cycle_window()
+{
+	const char* spec = std::getenv("UN5_CLOCK_CYCLE");
+	if (!spec)
+		return;
+	static std::vector<std::array<u32, 3>> s_sets;
+	static int s_window = -1, s_rounds = 2;
+	static bool s_done = false;
+	if (s_window < 0)
+	{
+		if (!un5_hoc_open())
+		{
+			Console.WriteLn("[hoc] Horizon OC's hoc:clk is not running; clocks left alone");
+			s_done = true;
+		}
+		for (const char* p = spec; *p && !s_done;)
+		{
+			unsigned c = 0, g = 0, m = 0;
+			if (std::sscanf(p, "%u/%u/%u", &c, &g, &m) == 3)
+				s_sets.push_back({c, g, m});
+			const char* comma = std::strchr(p, ',');
+			p = comma ? comma + 1 : p + std::strlen(p);
+		}
+		if (const char* r = std::getenv("UN5_CLOCK_ROUNDS"))
+			s_rounds = std::max(1, std::atoi(r));
+		s_window = 0;
+	}
+	int st[5] = {};
+	if (s_clock_override && un5_hoc_status(st))
+		Console.WriteLn("[hoc] SoC %d.%d C, CPU %d.%d C, GPU %d.%d C, power %d mW (avg %d)", st[0] / 10, st[0] % 10,
+			st[1] / 10, st[1] % 10, st[2] / 10, st[2] % 10, st[3], st[4]);
+	if (s_done || s_sets.empty())
+		return;
+	const int total = static_cast<int>(s_sets.size()) * 2 * s_rounds;
+	if (s_window >= total)
+	{
+		const u32 lift[3] = {0, 0, 0};
+		un5_hoc_override(lift);
+		s_clock_override = false;
+		s_done = true;
+		Console.WriteLn("[hoc] cycle done; override lifted");
+		return;
+	}
+	if (s_window % 2 == 0)
+	{
+		const auto& set = s_sets[(s_window / 2) % s_sets.size()];
+		const u32 hz[3] = {un5_hoc_nearest_hz(0, set[0]), un5_hoc_nearest_hz(1, set[1]), un5_hoc_nearest_hz(2, set[2])};
+		s_clock_override = un5_hoc_override(hz);
+		Console.WriteLn("[hoc] next two windows: %u/%u/%u MHz (asked %u/%u/%u)%s", hz[0] / 1000000, hz[1] / 1000000,
+			hz[2] / 1000000, set[0], set[1], set[2], s_clock_override ? "" : " - override failed");
+	}
+	++s_window;
+}
+#else
+void clock_cycle_window() {}
+#endif
 
 // Why the GS split the last 5 s into draws, per frame: whether each draw had
 // the same state as the one before it (so could have been merged), only a
@@ -127,6 +195,32 @@ void log_draw_split(u32 fields, double gs_ms)
 #ifdef __SWITCH__
 	Console.WriteLn("[clocks] cpu %u (measured %u) gpu %u mem %u MHz; glthread worker on core %d", un5_clock_mhz(0),
 		un5_measured_cpu_mhz(), un5_clock_mhz(1), un5_clock_mhz(2), s_glthread_core);
+	// UN5_CLOCK_CYCLE="1224/768/1600,1785/921/1600,...": the run sets CPU/GPU/
+	// memory itself through Horizon OC's override, each set for two 5 s
+	// windows (the first lets it settle), UN5_CLOCK_ROUNDS times over (default
+	// 2), then lifts the override. Temperatures and power go in the log.
+	clock_cycle_window();
+	// UN5GS_CYCLE=1: a different GS setting every 5 s, to price each within
+	// one run: PCSX2's defaults, minimum blending accuracy, no dithering, no
+	// texture preloading. (Mipmapping stays as is: switching it mid-run
+	// would leave the texture cache inconsistent.)
+	if (const char* cycle = std::getenv("UN5GS_CYCLE"); cycle && std::atoi(cycle))
+	{
+		static const Pcsx2Config::GSOptions s_defaults = GSConfig;
+		static int s_step = 0;
+		static const char* const kNames[] = {"defaults", "blending 0", "dithering 0", "preloading 0"};
+		Console.WriteLn("[gs-cycle] this window: %s", kNames[s_step]);
+		s_step = (s_step + 1) % 4;
+		GSConfig.AccurateBlendingUnit = s_defaults.AccurateBlendingUnit;
+		GSConfig.Dithering = s_defaults.Dithering;
+		GSConfig.TexturePreloading = s_defaults.TexturePreloading;
+		if (s_step == 1)
+			GSConfig.AccurateBlendingUnit = AccBlendLevel::Minimum;
+		else if (s_step == 2)
+			GSConfig.Dithering = 0;
+		else if (s_step == 3)
+			GSConfig.TexturePreloading = TexturePreloadingLevel::Off;
+	}
 	// UN5_GLTHREAD_CYCLE=1: move the worker to the next core every 5 s, to
 	// compare cores within one run.
 	if (const char* cycle = std::getenv("UN5_GLTHREAD_CYCLE"); cycle && std::atoi(cycle))
@@ -243,6 +337,14 @@ bool open()
 
 void close()
 {
+#ifdef __SWITCH__
+	if (s_clock_override)
+	{
+		const u32 lift[3] = {0, 0, 0};
+		un5_hoc_override(lift);
+		s_clock_override = false;
+	}
+#endif
 	if (g_gs_renderer)
 	{
 		g_gs_renderer->Destroy();
