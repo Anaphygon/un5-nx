@@ -135,7 +135,12 @@ namespace dk
 
 		DkQueueMaker queue_maker;
 		dkQueueMakerDefaults(&queue_maker, m_device);
-		queue_maker.flags = DkQueueFlags_Graphics | DkQueueFlags_HighPrio | DkQueueFlags_EnableZcull;
+		// No zcull: the GS switches depth targets and writes depth by copies
+		// all the time, and zcull would need invalidating at each (stale zcull
+		// faulted the GPU outside our memory on hardware). Scratch for shaders
+		// with local memory, generously.
+		queue_maker.flags = DkQueueFlags_Graphics | DkQueueFlags_HighPrio | DkQueueFlags_DisableZcull;
+		queue_maker.perWarpScratchMemorySize = 16 * DK_PER_WARP_SCRATCH_MEM_ALIGNMENT;
 		m_queue = dkQueueCreate(&queue_maker);
 		if (!m_queue)
 			return false;
