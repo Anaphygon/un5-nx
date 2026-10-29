@@ -1,0 +1,379 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 29 Oct 2026 12:40:13 +0700
+Subject: [PATCH 17/17] feat: Switch thread placement and a sampling profiler
+
+host/switch_threads.cpp wraps libnx's threadCreate (-Wl,--wrap) so every
+thread is seen, and lets the runner place them: the emulation thread on
+core 1, the VU thread on core 2, the render thread keeps core 0, and a port
+can send the threads it creates next to a core of its choice
+(ps2_switch_new_thread_core, used for Mesa's glthread worker).
+
+host/switch_sampler.cpp is a profiler for a console without perf: with
+PS2_SAMPLE=<seconds> a thread pauses every other thread about once a
+millisecond (svcSetThreadActivity, svcGetThreadContext3), records PC, LR
+and frame-pointer frames, and at exit prints the hottest stacks and each
+thread's core to the log, for addr2line against ps2run.elf.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ CMakeLists.txt          |   4 +
+ host/main.cpp           |   6 ++
+ host/switch_sampler.cpp | 188 ++++++++++++++++++++++++++++++++++++++++
+ host/switch_sampler.hpp |   5 ++
+ host/switch_threads.cpp |  41 +++++++++
+ host/switch_threads.hpp |   7 ++
+ host/window.cpp         |  17 +++-
+ 7 files changed, 267 insertions(+), 1 deletion(-)
+ create mode 100644 host/switch_sampler.cpp
+ create mode 100644 host/switch_sampler.hpp
+ create mode 100644 host/switch_threads.cpp
+ create mode 100644 host/switch_threads.hpp
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index f3e0d9b..8a3aded 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -154,6 +154,10 @@ if(PS2_GENERATED)
+         set(PS2_NRO_NAME "ps2-web-recomp" CACHE STRING "Title the homebrew menu shows for the NRO")
+         target_compile_definitions(ps2run PRIVATE PS2_NRO_DIR="sdmc:/switch/${PS2_NRO_NAME}/")
+         nx_generate_nacp(ps2run.nacp NAME "${PS2_NRO_NAME}" AUTHOR "ps2-web-recomp")
++        # Thread placement and the sampling profiler (PS2_SAMPLE) see every
++        # thread by wrapping libnx's threadCreate.
++        target_sources(ps2run PRIVATE host/switch_threads.cpp host/switch_sampler.cpp)
++        target_link_options(ps2run PRIVATE -Wl,--wrap=threadCreate)
+         nx_create_nro(ps2run NACP ps2run.nacp)
+     endif()
+ endif()
+diff --git a/host/main.cpp b/host/main.cpp
+index ed4cb41..19770b1 100644
+--- a/host/main.cpp
++++ b/host/main.cpp
+@@ -1,3 +1,6 @@
++#ifdef __SWITCH__
++#include "switch_sampler.hpp"
++#endif
+ #include "ps2/system.hpp"
+ 
+ #ifdef PS2_WINDOW
+@@ -148,6 +151,9 @@ int main(int argc, char **argv) {
+         return ps2::run();
+ #endif
+     };
++#ifdef __SWITCH__
++    start_switch_sampler();
++#endif
+ #ifdef PS2_WINDOW
+     if (window) return run_window(emulate);
+ #endif
+diff --git a/host/switch_sampler.cpp b/host/switch_sampler.cpp
+new file mode 100644
+index 0000000..72793b0
+--- /dev/null
++++ b/host/switch_sampler.cpp
+@@ -0,0 +1,188 @@
++// A sampling profiler for the Switch runner: the Switch has no perf, so a
++// thread of our own pauses every other thread of the process about once a
++// millisecond, reads where it is (PC, LR and a few frame-pointer frames) and
++// lets it go. At exit it prints the hottest stacks per thread as absolute
++// addresses (subtract the NRO's load address, from a known symbol, for
++// addr2line against ps2run.elf) and each thread's core.
++//
++// PS2_SAMPLE=<seconds> in args.txt starts it that many seconds in.
++#ifdef __SWITCH__
++#include "switch_sampler.hpp"
++
++#include <switch.h>
++
++#include <algorithm>
++#include <atomic>
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <mutex>
++#include <vector>
++
++
++namespace {
++
++constexpr int kMaxThreads = 24;
++constexpr int kFrames = 6;
++constexpr std::size_t kTable = 1u << 14;
++
++struct Known {
++    Handle handle = INVALID_HANDLE;
++    std::uintptr_t entry = 0;  // what the thread runs, for its name
++    std::uintptr_t stack_lo = 0, stack_hi = 0;
++    std::uint64_t samples = 0;
++    bool dead = false;
++};
++
++struct Slot {
++    std::uint32_t thread;  // index + 1, 0 = empty
++    std::uint32_t count;
++    std::uintptr_t frames[kFrames];
++};
++
++std::mutex g_lock;
++Known g_threads[kMaxThreads];
++int g_count = 0;
++Slot g_table[kTable];
++std::uint64_t g_dropped = 0;
++Thread g_sampler;
++bool g_running = false;
++std::atomic<bool> g_stop{false};
++
++void add_thread(Handle h, std::uintptr_t entry) {
++    if (!std::getenv("PS2_SAMPLE")) return;
++    std::lock_guard<std::mutex> lock(g_lock);
++    if (g_count < kMaxThreads) g_threads[g_count++] = Known{h, entry};
++}
++
++
++// The mapping that holds sp: frame records outside it are not followed.
++void find_stack(Known &t, std::uintptr_t sp) {
++    MemoryInfo info{};
++    u32 page = 0;
++    if (R_SUCCEEDED(svcQueryMemory(&info, &page, sp))) {
++        t.stack_lo = info.addr;
++        t.stack_hi = info.addr + info.size;
++    }
++}
++
++void record(std::uint32_t thread, const std::uintptr_t (&frames)[kFrames]) {
++    std::uint64_t h = thread;
++    for (std::uintptr_t f : frames) h = (h ^ f) * 0x100000001B3ull;
++    for (std::size_t i = 0, at = h & (kTable - 1); i < 64; ++i, at = (at + 1) & (kTable - 1)) {
++        Slot &s = g_table[at];
++        if (!s.thread) {
++            s.thread = thread;
++            std::copy(std::begin(frames), std::end(frames), s.frames);
++        }
++        if (s.thread == thread && std::equal(std::begin(frames), std::end(frames), s.frames)) {
++            ++s.count;
++            return;
++        }
++    }
++    ++g_dropped;
++}
++
++void sample(int index, Known &t) {
++    if (R_FAILED(svcSetThreadActivity(t.handle, ThreadActivity_Paused))) {
++        t.dead = true;
++        return;
++    }
++    ThreadContext ctx{};
++    const Result rc = svcGetThreadContext3(&ctx, t.handle);
++    std::uintptr_t frames[kFrames] = {};
++    if (R_SUCCEEDED(rc)) {
++        const std::uintptr_t sp = ctx.sp;
++        if (!t.stack_hi || sp < t.stack_lo || sp >= t.stack_hi) find_stack(t, sp);
++        frames[0] = ctx.pc.x;
++        frames[1] = ctx.lr;
++        // Frame records: [fp] = caller's fp, [fp + 8] = return address. The
++        // thread is paused, so its stack holds still while we walk it. The
++        // first record often repeats LR (a non-leaf function), so that one
++        // is skipped.
++        std::uintptr_t fp = ctx.fp;
++        for (int n = 2; n < kFrames && fp >= sp && fp + 16 <= t.stack_hi && !(fp & 7);) {
++            const auto *rec = reinterpret_cast<const std::uintptr_t *>(fp);
++            if (!(n == 2 && rec[1] == frames[1])) frames[n++] = rec[1];
++            if (rec[0] <= fp) break;
++            fp = rec[0];
++        }
++    }
++    svcSetThreadActivity(t.handle, ThreadActivity_Runnable);
++    if (R_FAILED(rc)) return;
++    ++t.samples;
++    record(static_cast<std::uint32_t>(index + 1), frames);
++}
++
++void run(void *arg) {
++    const auto delay_ms = reinterpret_cast<std::uintptr_t>(arg);
++    for (std::uintptr_t waited = 0; waited < delay_ms && !g_stop.load(); waited += 100) svcSleepThread(100'000'000);
++    std::fprintf(stderr, "[sampler] started\n");
++    const Handle self = threadGetCurHandle();
++    while (!g_stop.load()) {
++        int count;
++        {
++            std::lock_guard<std::mutex> lock(g_lock);
++            count = g_count;
++        }
++        for (int i = 0; i < count; ++i)
++            if (!g_threads[i].dead && g_threads[i].handle != self) sample(i, g_threads[i]);
++        svcSleepThread(1'000'000);
++    }
++}
++
++void report() {
++    u64 process_mask = 0;
++    svcGetInfo(&process_mask, InfoType_CoreMask, CUR_PROCESS_HANDLE, 0);
++    std::fprintf(stderr, "[sampler] process core mask %#llx\n", static_cast<unsigned long long>(process_mask));
++    std::fprintf(stderr, "[sampler] start_switch_sampler at %p; %llu dropped\n",
++                 reinterpret_cast<void *>(&start_switch_sampler), static_cast<unsigned long long>(g_dropped));
++    std::vector<const Slot *> slots;
++    for (const Slot &s : g_table)
++        if (s.thread) slots.push_back(&s);
++    std::sort(slots.begin(), slots.end(), [](const Slot *a, const Slot *b) { return a->count > b->count; });
++    for (int i = 0; i < g_count; ++i) {
++        const Known &t = g_threads[i];
++        if (!t.samples) continue;
++        s32 core = -1;
++        u64 mask = 0;
++        svcGetThreadCoreMask(&core, &mask, t.handle);
++        std::fprintf(stderr, "[sampler] thread %d entry %#lx core %d mask %#llx: %llu samples\n", i,
++                     static_cast<unsigned long>(t.entry), static_cast<int>(core), static_cast<unsigned long long>(mask),
++                     static_cast<unsigned long long>(t.samples));
++        int shown = 0;
++        for (const Slot *s : slots) {
++            if (s->thread != static_cast<std::uint32_t>(i + 1)) continue;
++            std::fprintf(stderr, "[sampler]   %5.1f%%", 100.0 * s->count / static_cast<double>(t.samples));
++            for (std::uintptr_t f : s->frames)
++                if (f) std::fprintf(stderr, " %#lx", static_cast<unsigned long>(f));
++            std::fputc('\n', stderr);
++            if (++shown == 40) break;
++        }
++    }
++}
++
++}  // namespace
++
++void switch_sampler_add_thread(Handle handle, std::uintptr_t entry) { add_thread(handle, entry); }
++
++void start_switch_sampler() {
++    const char *delay = std::getenv("PS2_SAMPLE");
++    if (!delay || g_running) return;
++    add_thread(envGetMainThreadHandle(), 0);
++    const auto ms = static_cast<std::uintptr_t>(std::strtoul(delay, nullptr, 10) * 1000);
++    // Above the runner's threads (0x2C), so a sample is taken on time.
++    if (R_FAILED(threadCreate(&g_sampler, run, reinterpret_cast<void *>(ms), nullptr, 0x8000, 0x2A, -2))) return;
++    threadStart(&g_sampler);
++    g_running = true;
++}
++
++void stop_switch_sampler() {
++    if (!g_running) return;
++    g_stop.store(true);
++    threadWaitForExit(&g_sampler);
++    threadClose(&g_sampler);
++    g_running = false;
++    report();
++}
++#endif
+diff --git a/host/switch_sampler.hpp b/host/switch_sampler.hpp
+new file mode 100644
+index 0000000..91fda0e
+--- /dev/null
++++ b/host/switch_sampler.hpp
+@@ -0,0 +1,5 @@
++#pragma once
++
++// Switch only: see switch_sampler.cpp. Both are no-ops unless PS2_SAMPLE is set.
++void start_switch_sampler();
++void stop_switch_sampler();
+diff --git a/host/switch_threads.cpp b/host/switch_threads.cpp
+new file mode 100644
+index 0000000..9471ab0
+--- /dev/null
++++ b/host/switch_threads.cpp
+@@ -0,0 +1,41 @@
++// Thread placement on the Switch. libnx starts every thread on the process's
++// default core, and Horizon does not time-slice threads of the same
++// priority, so without this the runner's threads queue up on one core.
++#ifdef __SWITCH__
++#include "switch_threads.hpp"
++
++#include <switch.h>
++
++#include <atomic>
++#include <cstdint>
++
++void switch_sampler_add_thread(Handle handle, std::uintptr_t entry);
++
++namespace {
++std::atomic<int> g_new_thread_core{-1};
++}
++
++void switch_pin_current_thread(int core) {
++    svcSetThreadCoreMask(CUR_THREAD_HANDLE, core, 1u << core);
++}
++
++void switch_new_thread_core(int core) { g_new_thread_core.store(core); }
++
++// Every thread libnx creates passes through here (pthreads, C11 threads and
++// std::thread included): -Wl,--wrap=threadCreate.
++extern "C" Result __real_threadCreate(Thread *t, ThreadFunc entry, void *arg, void *stack_mem, size_t stack_sz, int prio,
++                                      int cpuid);
++extern "C" Result __wrap_threadCreate(Thread *t, ThreadFunc entry, void *arg, void *stack_mem, size_t stack_sz, int prio,
++                                      int cpuid) {
++    const int core = g_new_thread_core.load();
++    const Result rc = __real_threadCreate(t, entry, arg, stack_mem, stack_sz, prio, core >= 0 ? core : cpuid);
++    if (R_SUCCEEDED(rc)) {
++        if (core >= 0) svcSetThreadCoreMask(t->handle, core, 1u << core);
++        switch_sampler_add_thread(t->handle, reinterpret_cast<std::uintptr_t>(entry));
++    }
++    return rc;
++}
++
++// For code outside the runner (a port's GS) that cannot include this header.
++extern "C" void ps2_switch_new_thread_core(int core) { switch_new_thread_core(core); }
++#endif
+diff --git a/host/switch_threads.hpp b/host/switch_threads.hpp
+new file mode 100644
+index 0000000..66f410f
+--- /dev/null
++++ b/host/switch_threads.hpp
+@@ -0,0 +1,7 @@
++#pragma once
++
++// Switch only: see switch_threads.cpp.
++// Moves the calling thread to `core` (0-2 are the application's).
++void switch_pin_current_thread(int core);
++// Threads created from now on start on `core`; -1 restores libnx's default.
++void switch_new_thread_core(int core);
+diff --git a/host/window.cpp b/host/window.cpp
+index b4975b5..a4e2b23 100644
+--- a/host/window.cpp
++++ b/host/window.cpp
+@@ -1,3 +1,7 @@
++#ifdef __SWITCH__
++#include "switch_sampler.hpp"
++#include "switch_threads.hpp"
++#endif
+ #include "window.hpp"
+ 
+ #include "ps2/external_gs.hpp"
+@@ -409,11 +413,19 @@ int run_window(const std::function<int()> &emulate) {
+         // Joined below: libnx has no pthread_detach (std::thread::detach
+         // throws), and on the Switch exiting with the thread alive breaks
+         // into hbl with 0x10801.
+-        vu_thread = std::thread(ps2::run_vu_thread);
++        vu_thread = std::thread([] {
++#ifdef __SWITCH__
++            switch_pin_current_thread(2);
++#endif
++            ps2::run_vu_thread();
++        });
+     }
+     std::atomic<bool> done{false};
+     int result = 0;
+     std::thread emulation([&] {
++#ifdef __SWITCH__
++        switch_pin_current_thread(1);  // the render thread (this one's caller) keeps core 0
++#endif
+         result = emulate();
+         done.store(true);
+         ps2::wake_render_thread();
+@@ -428,6 +440,9 @@ int run_window(const std::function<int()> &emulate) {
+         ps2::stop_vu_thread();
+         vu_thread.join();
+     }
++#ifdef __SWITCH__
++    stop_switch_sampler();
++#endif
+     SDL_Quit();
+     std::fflush(nullptr);
+     std::_Exit(result);
+-- 
+2.54.0 (Apple Git-157)
+

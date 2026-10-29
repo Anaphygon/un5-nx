@@ -1,4 +1,4 @@
-# Mesa for the Switch, with program binaries
+# Mesa for the Switch, with program binaries and glthread
 
 devkitPro's `switch-mesa` 20.1.0-5 builds Mesa for horizon without a disk
 shader cache. Gallium then reports no program binary format, so PCSX2's
@@ -13,6 +13,27 @@ GLShaderCache stays off and every shader is compiled again on each run.
   instead (bump the tag in it when the driver's output changes).
 - `include/c11/threads.h`: devkitA64's newlib now has `timespec_get`.
 
+`0002-glthread-on-horizon.patch` makes `mesa_glthread=true` work, which it never
+did on horizon (measured on a Switch: the GS thread's GL submission went from
+about 16 to 3-4 ms per frame, battle from 30 to 34-40 fps):
+
+- `src/util/u_thread.h`: newlib's `<threads.h>` has `thrd_success == 4`, so
+  `u_thread_create` treated every new thread as a failure.
+- `src/mesa/state_tracker/st_manager.c`: devkitPro's port left
+  `start_thread` and `thread_finish` out on horizon.
+- `src/egl/drivers/switch/egl_switch.c`: a no-op `set_background_context`
+  (the worker calls it unconditionally), glthread finished before
+  `eglSwapBuffers` and `eglMakeCurrent` touch the context, and
+  `eglCreateContext` starts glthread when `mesa_glthread=true`.
+- `src/gallium/drivers/nouveau/nouveau_fence.c`: a fence wait sleeps 50 us
+  between polls after 16 instead of spinning; Horizon does not time-slice
+  threads of the same priority.
+
+The causes were found from the handoff notes of
+[LSWTCS-360-to-Switch-Port](https://github.com/KingDariusStim/LSWTCS-360-to-Switch-Port)
+(KingDariusStim), which met the same bugs in the same Mesa; that project is
+CC BY-NC-SA, so none of its code is used here, only what its notes describe.
+
 ## Build
 
 ```sh
@@ -24,6 +45,7 @@ patch -p1 -i ../switch-mesa-20.1.0-5.patch
 patch -p1 -i ../gl_XML.py.patch
 patch -p1 -i ../glX_XML.py.patch
 patch -p1 -i ~/SwitchDev/un5-nx/patches/switch-mesa/0001-program-binaries-on-horizon.patch
+patch -p1 -i ~/SwitchDev/un5-nx/patches/switch-mesa/0002-glthread-on-horizon.patch
 python3 -m venv ../venv && ../venv/bin/pip install meson==0.61.5 mako
 PATH=$PWD/../venv/bin:$PATH meson setup --buildtype=plain \
   --cross-file=~/SwitchDev/un5-nx/patches/switch-mesa/crossfile.txt \

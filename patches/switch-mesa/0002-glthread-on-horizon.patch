@@ -1,0 +1,121 @@
+diff --git a/src/egl/drivers/switch/egl_switch.c b/src/egl/drivers/switch/egl_switch.c
+index af56ca6..27ee754 100644
+--- a/src/egl/drivers/switch/egl_switch.c
++++ b/src/egl/drivers/switch/egl_switch.c
+@@ -447,6 +447,14 @@ switch_add_configs_for_visuals(_EGLDisplay *dpy)
+     return EGL_TRUE;
+ }
+ 
++/* glthread's worker calls this when it starts; Gallium on horizon has no
++ * per-thread loader state to set up, but the hook must exist. */
++static void
++switch_st_set_background_context(struct st_context_iface *stctxi,
++                                 struct util_queue_monitoring *queue_info)
++{
++}
++
+ // Called from st_api_create_context. This is only ever used for detecting
+ // whether the ST_MANAGER_BROKEN_INVALIDATE workaround is required.
+ static int
+@@ -490,6 +498,7 @@ switch_initialize(_EGLDriver *drv, _EGLDisplay *dpy)
+     }
+ 
+     stmgr->get_param = switch_st_get_param;
++    stmgr->set_background_context = switch_st_set_background_context;
+ 
+     // Create nouveau screen
+     TRACE("Creating nouveau screen\n");
+@@ -607,6 +616,11 @@ switch_create_context(_EGLDriver *drv, _EGLDisplay *dpy, _EGLConfig *conf,
+         goto cleanup;
+     }
+ 
++    /* glthread, as the dri frontend starts it: nothing on horizon did, so
++     * mesa_glthread=true had no effect. */
++    if (debug_get_bool_option("mesa_glthread", false) && context->stctx->start_thread)
++        context->stctx->start_thread(context->stctx);
++
+     return &context->base;
+ 
+ cleanup:
+@@ -631,6 +645,16 @@ switch_destroy_context(_EGLDriver* drv, _EGLDisplay *disp, _EGLContext* ctx)
+ }
+ 
+ 
++/* Lets glthread's worker finish what it queued before this thread touches
++ * the context or its surfaces itself. */
++static void
++switch_finish_glthread(_EGLContext *ctx)
++{
++    struct switch_egl_context *cont = switch_egl_context(ctx);
++    if (cont && cont->stctx && cont->stctx->thread_finish)
++        cont->stctx->thread_finish(cont->stctx);
++}
++
+ static EGLBoolean
+ switch_make_current(_EGLDriver* drv, _EGLDisplay* dpy, _EGLSurface *dsurf,
+     _EGLSurface *rsurf, _EGLContext *ctx)
+@@ -644,6 +668,7 @@ switch_make_current(_EGLDriver* drv, _EGLDisplay* dpy, _EGLSurface *dsurf,
+     _EGLContext *old_ctx;
+     _EGLSurface *old_dsurf, *old_rsurf;
+ 
++    switch_finish_glthread(_eglGetCurrentContext());
+     if (!_eglBindContext(ctx, dsurf, rsurf, &old_ctx, &old_dsurf, &old_rsurf))
+         return EGL_FALSE;
+ 
+@@ -688,6 +713,7 @@ switch_swap_buffers(_EGLDriver *drv, _EGLDisplay *dpy, _EGLSurface *surf)
+     }
+ 
+     TRACE("Flushing context\n");
++    switch_finish_glthread(&context->base);
+     context->stctx->flush(context->stctx, ST_FLUSH_END_OF_FRAME, NULL, NULL, NULL);
+ 
+     NvMultiFence mf = {0};
+diff --git a/src/gallium/drivers/nouveau/nouveau_fence.c b/src/gallium/drivers/nouveau/nouveau_fence.c
+index a830f81..7b85c5c 100644
+--- a/src/gallium/drivers/nouveau/nouveau_fence.c
++++ b/src/gallium/drivers/nouveau/nouveau_fence.c
+@@ -214,6 +214,11 @@ nouveau_fence_wait(struct nouveau_fence *fence, struct pipe_debug_callback *debu
+ #ifdef PIPE_OS_UNIX
+       if (!(spins % 8)) /* donate a few cycles */
+          sched_yield();
++#elif defined(__SWITCH__)
++      /* Horizon does not time-slice threads of equal priority, so a spin
++       * here can starve the core's other threads. */
++      if (spins > 16)
++         os_time_sleep(50);
+ #endif
+ 
+       nouveau_fence_update(screen, false);
+diff --git a/src/mesa/state_tracker/st_manager.c b/src/mesa/state_tracker/st_manager.c
+index b96e793..dde18b7 100644
+--- a/src/mesa/state_tracker/st_manager.c
++++ b/src/mesa/state_tracker/st_manager.c
+@@ -994,10 +994,11 @@ st_api_create_context(struct st_api *stapi, struct st_manager *smapi,
+    st->iface.teximage = st_context_teximage;
+    st->iface.copy = st_context_copy;
+    st->iface.share = st_context_share;
+-#ifndef __SWITCH__
++   /* devkitPro's port left these out on horizon, where glthread hung: its
++    * worker threads looked failed (newlib's thrd_success is 4) and the EGL
++    * driver had no set_background_context. Both are fixed now. */
+    st->iface.start_thread = st_start_thread;
+    st->iface.thread_finish = st_thread_finish;
+-#endif
+    st->iface.st_context_private = (void *) smapi;
+    st->iface.cso_context = st->cso_context;
+    st->iface.pipe = st->pipe;
+diff --git a/src/util/u_thread.h b/src/util/u_thread.h
+index 1f2a104..adbef7e 100644
+--- a/src/util/u_thread.h
++++ b/src/util/u_thread.h
+@@ -64,7 +64,9 @@ static inline thrd_t u_thread_create(int (*routine)(void *), void *param)
+    int ret;
+    ret = thrd_create( &thread, routine, param );
+ #endif
+-   if (ret)
++   /* Not "if (ret)": newlib's <threads.h> (horizon) has thrd_success == 4,
++    * so every worker thread, glthread's included, looked like a failure. */
++   if (ret != thrd_success)
+       return 0;
+ 
+    return thread;

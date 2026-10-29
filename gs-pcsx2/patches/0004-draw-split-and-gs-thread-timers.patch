@@ -1,0 +1,181 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 29 Oct 2026 12:29:57 +0700
+Subject: [PATCH] un5-nx: why frames split into draws, and where the GS
+ thread's time goes
+
+Counters for the port's speed log: each draw compared with the one before
+it (same state, texture only, render target, other state) and PCSX2's flush
+reason; time in GSRendererHW::Draw, GSDeviceOGL::RenderHW and SwapBuffers;
+and a fence per frame that tells whether the GPU is still on the previous
+frame at the next present.
+---
+ pcsx2/GS/GSState.cpp                      | 33 +++++++++++++++++++++++
+ pcsx2/GS/Renderers/HW/GSRendererHW.cpp    | 17 ++++++++++++
+ pcsx2/GS/Renderers/OpenGL/GSDeviceOGL.cpp | 32 +++++++++++++++++++++-
+ 3 files changed, 81 insertions(+), 1 deletion(-)
+
+diff --git a/pcsx2/GS/GSState.cpp b/pcsx2/GS/GSState.cpp
+index 88fdbb3..8ffda18 100644
+--- a/pcsx2/GS/GSState.cpp
++++ b/pcsx2/GS/GSState.cpp
+@@ -18,6 +18,7 @@
+ #include <sstream>
+ #include <iomanip>
+ #include <bit>
++#include <cstring>
+ 
+ u64 GSState::s_n = 0;
+ u64 GSState::s_last_transfer_draw_n = 0;
+@@ -2315,6 +2316,37 @@ void GSState::GIFRegHandlerHWREG(const GIFReg* RESTRICT r)
+ 	Write(reinterpret_cast<const u8*>(r), 8); // haunting ground
+ }
+ 
++// un5-nx: why UN5's frames split into so many draws, for the port's speed
++// log. Each draw is compared with the one before it.
++u64 g_un5_flush_reason[16];
++u64 g_un5_split[4]; // same state, texture only, render target, other state
++u64 g_un5_indices;
++
++namespace
++{
++	void Un5CountDraw(u32 reason, const GSDrawingContext& ctx, const GSDrawingEnvironment& env, u32 indices)
++	{
++		g_un5_flush_reason[std::countr_zero(reason) & 15]++;
++		g_un5_indices += indices;
++		const u64 key[] = {ctx.TEX0.U64, ctx.TEX1.U64, ctx.CLAMP.U64, ctx.MIPTBP1.U64, ctx.MIPTBP2.U64,
++			ctx.FRAME.U64, ctx.ZBUF.U64, ctx.XYOFFSET.U64, ctx.SCISSOR.U64, ctx.ALPHA.U64, ctx.TEST.U64,
++			ctx.FBA.U64, env.PRIM.U64, env.TEXA.U64, env.FOGCOL.U64, env.DTHE.U64, env.COLCLAMP.U64, env.PABE.U64};
++		static u64 prev[std::size(key)];
++		const auto differs = [&](size_t from, size_t to) {
++			return std::memcmp(key + from, prev + from, (to - from) * sizeof(u64)) != 0;
++		};
++		if (!differs(0, std::size(key)))
++			g_un5_split[0]++;
++		else if (differs(5, 7))
++			g_un5_split[2]++;
++		else if (!differs(5, std::size(key)))
++			g_un5_split[1]++;
++		else
++			g_un5_split[3]++;
++		std::memcpy(prev, key, sizeof(key));
++	}
++} // namespace
++
+ void GSState::Flush(GSFlushReason reason)
+ {
+ 	SetDrawBuffDirty();
+@@ -2369,6 +2401,7 @@ void GSState::FlushDraw(GSFlushReason reason)
+ 		PRIM = &m_prev_env.PRIM;
+ 		UpdateContext();
+ 
++		Un5CountDraw(reason, *m_context, *m_draw_env, m_index->tail);
+ 		FlushPrim();
+ 
+ 		m_draw_env = &m_env;
+diff --git a/pcsx2/GS/Renderers/HW/GSRendererHW.cpp b/pcsx2/GS/Renderers/HW/GSRendererHW.cpp
+index 8b058e1..ef25cfd 100644
+--- a/pcsx2/GS/Renderers/HW/GSRendererHW.cpp
++++ b/pcsx2/GS/Renderers/HW/GSRendererHW.cpp
+@@ -7,6 +7,7 @@
+ #include "GS/GSPerfMon.h"
+ #include "GS/GSUtil.h"
+ #include "Host.h"
++#include "common/Timer.h"
+ #include "common/Console.h"
+ #include "common/BitUtils.h"
+ #include "common/StringUtil.h"
+@@ -2776,8 +2777,24 @@ void GSRendererHW::RoundSpriteOffset()
+ 	}
+ }
+ 
++// un5-nx: milliseconds in Draw() (texture cache, heuristics, setup) and in
++// the device's RenderHW (GL submission), for the port's speed log.
++double g_un5_draw_ms = 0.0;
++double g_un5_render_ms = 0.0;
++
++namespace
++{
++	struct Un5Time
++	{
++		double& sum;
++		Common::Timer timer;
++		~Un5Time() { sum += timer.GetTimeMilliseconds(); }
++	};
++} // namespace
++
+ void GSRendererHW::Draw()
+ {
++	Un5Time un5_timed{g_un5_draw_ms};
+ 	static u32 num_skipped_channel_shuffle_draws = 0;
+ 	GSVertexBuff& vtx_buff = *m_vertex;
+ 	GSIndexBuff& idx_buff = *m_index;
+diff --git a/pcsx2/GS/Renderers/OpenGL/GSDeviceOGL.cpp b/pcsx2/GS/Renderers/OpenGL/GSDeviceOGL.cpp
+index 6c2cf08..6294fa1 100644
+--- a/pcsx2/GS/Renderers/OpenGL/GSDeviceOGL.cpp
++++ b/pcsx2/GS/Renderers/OpenGL/GSDeviceOGL.cpp
+@@ -10,6 +10,7 @@
+ #include "GS/GSUtil.h"
+ #include "Host.h"
+ 
++#include "common/Timer.h"
+ #include "common/Console.h"
+ #include "common/Error.h"
+ #include "common/ScopedGuard.h"
+@@ -1286,6 +1287,11 @@ GSDevice::PresentResult GSDeviceOGL::BeginPresent(bool frame_skip)
+ 	return PresentResult::OK;
+ }
+ 
++// un5-nx: time in SwapBuffers, and presents that found the GPU still busy
++// with the previous frame, for the port's speed log.
++double g_un5_swap_ms = 0.0;
++u64 g_un5_gpu_behind = 0, g_un5_presents = 0;
++
+ void GSDeviceOGL::EndPresent()
+ {
+ 	RenderImGui();
+@@ -1293,7 +1299,24 @@ void GSDeviceOGL::EndPresent()
+ 	if (m_gpu_timing_enabled)
+ 		PopTimestampQuery();
+ 
+-	m_gl_context->SwapBuffers();
++	{
++		Common::Timer swap;
++		m_gl_context->SwapBuffers();
++		g_un5_swap_ms += swap.GetTimeMilliseconds();
++	}
++	// un5-nx: is the GPU still on the last frame when this one is presented?
++	// A fence per frame, checked without waiting at the next present.
++	{
++		static GLsync s_frame_fence = nullptr;
++		if (s_frame_fence)
++		{
++			if (glClientWaitSync(s_frame_fence, 0, 0) == GL_TIMEOUT_EXPIRED)
++				g_un5_gpu_behind++;
++			glDeleteSync(s_frame_fence);
++		}
++		s_frame_fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
++		g_un5_presents++;
++	}
+ 
+ 	if (m_gpu_timing_enabled)
+ 		KickTimestampQuery();
+@@ -3052,8 +3075,15 @@ static constexpr std::array<GLenum, 3> s_gl_blend_ops = { {
+ } };
+ // clang-format on
+ 
++extern double g_un5_render_ms;
++
+ void GSDeviceOGL::RenderHW(GSHWDrawConfig& config)
+ {
++	struct Un5Time
++	{
++		Common::Timer timer;
++		~Un5Time() { g_un5_render_ms += timer.GetTimeMilliseconds(); }
++	} un5_timed;
+ 	if (!GLState::scissor.eq(config.scissor))
+ 	{
+ 		glScissor(config.scissor.x, config.scissor.y, config.scissor.width(), config.scissor.height());
+-- 
+2.54.0 (Apple Git-157)
+

@@ -1,0 +1,95 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 29 Oct 2026 12:40:13 +0700
+Subject: [PATCH 16/17] fix: the windowed runner joins its VU thread before it
+ exits
+
+On the Switch the VU thread was left running at std::_Exit (libnx has no
+pthread_detach), and exiting with it alive broke into hbl with 0x10801:
+every run that ended on its own (--frames) closed with a crash report.
+run_vu_thread now returns once stop_vu_thread() is called, within its
+50 ms wait, and run_window joins it on every platform.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ host/window.cpp                | 16 +++++++++-------
+ runtime/include/ps2/system.hpp |  2 ++
+ runtime/src/system.cpp         |  6 +++++-
+ 3 files changed, 16 insertions(+), 8 deletions(-)
+
+diff --git a/host/window.cpp b/host/window.cpp
+index 07af6fe..b4975b5 100644
+--- a/host/window.cpp
++++ b/host/window.cpp
+@@ -403,15 +403,13 @@ int run_window(const std::function<int()> &emulate) {
+         pace();
+     };
+     ps2::start_render_thread();
++    std::thread vu_thread;
+     if (!std::getenv("PS2_NO_VU_THREAD")) {
+         ps2::start_vu_thread();
+-#ifdef __SWITCH__
+-        // libnx has no pthread_detach, so std::thread::detach throws and the
+-        // runner aborted here. The thread lives until std::_Exit below.
+-        new std::thread(ps2::run_vu_thread);
+-#else
+-        std::thread(ps2::run_vu_thread).detach();
+-#endif
++        // Joined below: libnx has no pthread_detach (std::thread::detach
++        // throws), and on the Switch exiting with the thread alive breaks
++        // into hbl with 0x10801.
++        vu_thread = std::thread(ps2::run_vu_thread);
+     }
+     std::atomic<bool> done{false};
+     int result = 0;
+@@ -426,6 +424,10 @@ int run_window(const std::function<int()> &emulate) {
+         if (ps2::render_pending(g_gpu_present, g_gpu_present ? none : copy, show_speed, 8.0) == ps2::Rendered::idle) ps2::wait_render_work(4);
+     }
+     emulation.join();
++    if (vu_thread.joinable()) {
++        ps2::stop_vu_thread();
++        vu_thread.join();
++    }
+     SDL_Quit();
+     std::fflush(nullptr);
+     std::_Exit(result);
+diff --git a/runtime/include/ps2/system.hpp b/runtime/include/ps2/system.hpp
+index d794aee..e86d88e 100644
+--- a/runtime/include/ps2/system.hpp
++++ b/runtime/include/ps2/system.hpp
+@@ -117,6 +117,8 @@ void init_graphics();
+ void start_render_thread();
+ void start_vu_thread();
+ void run_vu_thread();
++// Asks run_vu_thread to return; the caller joins it.
++void stop_vu_thread();
+ double vu_thread_idle_ms();
+ std::uint64_t vu1_interpreted_calls();
+ void post_present();
+diff --git a/runtime/src/system.cpp b/runtime/src/system.cpp
+index 81628c8..9db3929 100644
+--- a/runtime/src/system.cpp
++++ b/runtime/src/system.cpp
+@@ -507,14 +507,18 @@ void start_render_thread() { gs::start_thread(); }
+ void start_vu_thread() { gs::queue::vu().start(32u << 20); }
+ 
+ std::atomic<double> g_vu_idle_ms{0.0};
++std::atomic<bool> g_vu_stop{false};
+ 
+ double vu_thread_idle_ms() { return g_vu_idle_ms.load(); }
+ std::uint64_t vu1_interpreted_calls() { return vu::interpreted_calls(); }
+ 
++// The loop wakes at least every 50 ms, so it sees the flag soon after.
++void stop_vu_thread() { g_vu_stop.store(true); }
++
+ void run_vu_thread() {
+     gs::queue::role() = gs::queue::Role::Vu;
+     gs::queue::Ring &in = gs::queue::vu();
+-    for (;;) {
++    while (!g_vu_stop.load()) {
+         gs::queue::Header h;
+         const std::uint8_t *payload = nullptr;
+         while (in.peek(h, payload)) {
+-- 
+2.54.0 (Apple Git-157)
+

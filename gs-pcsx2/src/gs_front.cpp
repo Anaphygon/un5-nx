@@ -12,8 +12,11 @@
 #include "GS/Renderers/OpenGL/GSDeviceOGL.h"
 #include "common/Console.h"
 #include "common/Timer.h"
+#include "fmt/format.h"
 
 #include <algorithm>
+#include <iterator>
+#include <string>
 #include <cstdio>
 #include <cstdlib>
 
@@ -24,6 +27,21 @@ static_assert(sizeof(Pcsx2Config) <= (1 << 16));
 
 // From patches/0003: time spent in GLShaderCache::GetProgram.
 extern double g_un5_program_ms;
+// From the runner (ps2/system.hpp): VU1 program runs left to the interpreter.
+namespace ps2 { std::uint64_t vu1_interpreted_calls(); }
+// From patches/0004: why frames split into draws, and where a draw's time goes.
+extern u64 g_un5_flush_reason[16];
+extern u64 g_un5_split[4];
+extern u64 g_un5_indices;
+extern double g_un5_draw_ms, g_un5_render_ms, g_un5_swap_ms;
+extern u64 g_un5_gpu_behind, g_un5_presents;
+#ifdef __SWITCH__
+// From switch_clocks.cpp.
+unsigned un5_clock_mhz(int which);
+// From ps2-web-recomp's host/switch_threads.cpp: the core for threads
+// created from now on (-1: libnx's default).
+extern "C" void ps2_switch_new_thread_core(int core);
+#endif
 
 namespace {
 alignas(16) u8 s_privileged[0x2000];
@@ -63,12 +81,57 @@ u32 s_shader_compiles = 0;
 // Time the render thread spends inside the GS, to tell a GS-bound frame from
 // one that waits on emulation.
 Common::Timer::Value s_gs_ticks = 0;
+// The part of it spent in vsync(): the last draw of the frame and the present.
+Common::Timer::Value s_vsync_ticks = 0;
 
 struct GsTime
 {
 	Common::Timer::Value start = Common::Timer::GetCurrentValue();
 	~GsTime() { s_gs_ticks += Common::Timer::GetCurrentValue() - start; }
 };
+
+
+// Why the GS split the last 5 s into draws, per frame: whether each draw had
+// the same state as the one before it (so could have been merged), only a
+// new texture, a new render target, or other state; why PCSX2 flushed; and
+// the GS thread's time split between Draw() setup and GL submission.
+void log_draw_split(u32 fields, double gs_ms)
+{
+	static const char* const kReasons[16] = {"unknown", "reset", "state change", "clut change", "gs transfer",
+		"dirty texture", "dirty frame", "dirty z", "local move", "download", "save state", "load state",
+		"autoflush", "vsync", "reopen", "vertex count"};
+	const u64 draws = g_un5_split[0] + g_un5_split[1] + g_un5_split[2] + g_un5_split[3];
+	const double per = fields ? 1.0 / fields : 0.0;
+	const auto pct = [draws](u64 n) { return draws ? 100.0 * static_cast<double>(n) / static_cast<double>(draws) : 0.0; };
+	std::string reasons;
+	for (int i = 0; i < 16; i++)
+		if (g_un5_flush_reason[i])
+			reasons += fmt::format(" {} {:.0f}%,", kReasons[i], pct(g_un5_flush_reason[i]));
+	if (!reasons.empty())
+		reasons.pop_back();
+	Console.WriteLn("[draws] %.0f per frame, %.1f indices each; vs the previous draw: same state %.0f%%, texture only %.0f%%, "
+					"render target %.0f%%, other state %.0f%%; flushed for:%s; ms per frame: GS %.1f, Draw() %.1f, RenderHW %.1f, "
+					"vsync() %.1f, SwapBuffers %.1f; GPU still busy at %.0f%% of presents",
+		static_cast<double>(draws) * per, draws ? static_cast<double>(g_un5_indices) / static_cast<double>(draws) : 0.0,
+		pct(g_un5_split[0]), pct(g_un5_split[1]), pct(g_un5_split[2]), pct(g_un5_split[3]), reasons.c_str(),
+		gs_ms * per, g_un5_draw_ms * per, g_un5_render_ms * per,
+		Common::Timer::ConvertValueToMilliseconds(s_vsync_ticks) * per, g_un5_swap_ms * per,
+		g_un5_presents ? 100.0 * static_cast<double>(g_un5_gpu_behind) / static_cast<double>(g_un5_presents) : 0.0);
+	s_vsync_ticks = 0;
+	g_un5_swap_ms = 0.0;
+	g_un5_gpu_behind = g_un5_presents = 0;
+#ifdef __SWITCH__
+	Console.WriteLn("[clocks] cpu %u gpu %u mem %u MHz", un5_clock_mhz(0), un5_clock_mhz(1), un5_clock_mhz(2));
+#endif
+	static std::uint64_t s_interpreted = 0;
+	const std::uint64_t interpreted = ps2::vu1_interpreted_calls();
+	Console.WriteLn("[vu1] %.1f interpreted program runs per frame", static_cast<double>(interpreted - s_interpreted) * per);
+	s_interpreted = interpreted;
+	std::fill(std::begin(g_un5_flush_reason), std::end(g_un5_flush_reason), 0);
+	std::fill(std::begin(g_un5_split), std::end(g_un5_split), 0);
+	g_un5_indices = 0;
+	g_un5_draw_ms = g_un5_render_ms = 0.0;
+}
 
 // Fields per second and the GS's share of the time, every 5 s: the Switch
 // has no title bar to show them in.
@@ -92,6 +155,7 @@ void log_speed()
 		s_shader_compiles, g_un5_program_ms,
 		g_perfmon.GetCounter(GSPerfMon::Draw), g_perfmon.GetCounter(GSPerfMon::DrawCalls), g_perfmon.GetCounter(GSPerfMon::TextureUploads),
 		g_perfmon.GetCounter(GSPerfMon::TextureCopies), g_perfmon.GetCounter(GSPerfMon::Readbacks), g_perfmon.GetCounter(GSPerfMon::Barriers));
+	log_draw_split(s_fields, Common::Timer::ConvertValueToSeconds(s_gs_ticks) * 1000.0);
 	s_shader_compiles = 0;
 	g_un5_program_ms = 0.0;
 	s_start = now;
@@ -137,7 +201,17 @@ bool open()
 	EmuConfig.CurrentCustomAspectRatio = 0.0f;
 	g_gs_device = std::make_unique<GSDeviceOGL>();
 	const char* vsync = std::getenv("UN5GS_VSYNC");
-	if (!g_gs_device->Create(vsync && std::atoi(vsync) ? GSVSyncMode::FIFO : GSVSyncMode::Disabled, false))
+#ifdef __SWITCH__
+	// glthread's worker starts with the context: off the render thread's
+	// core 0. UN5_GLTHREAD_CORE picks another (0-2).
+	const char* gl_core = std::getenv("UN5_GLTHREAD_CORE");
+	ps2_switch_new_thread_core(gl_core ? std::clamp(std::atoi(gl_core), 0, 2) : 2);
+#endif
+	const bool created = g_gs_device->Create(vsync && std::atoi(vsync) ? GSVSyncMode::FIFO : GSVSyncMode::Disabled, false);
+#ifdef __SWITCH__
+	ps2_switch_new_thread_core(-1);
+#endif
+	if (!created)
 	{
 		Console.Error("un5gs: the OpenGL GS device could not be created");
 		g_gs_device.reset();
@@ -192,6 +266,12 @@ void vsync(std::uint32_t field, bool registers_written)
 	// As GSvsync in GS.cpp: the display rectangles first, then the pending draw.
 	{
 	GsTime timed;
+	const Common::Timer::Value vsync_start = timed.start;
+	struct VsyncTime
+	{
+		Common::Timer::Value start;
+		~VsyncTime() { s_vsync_ticks += Common::Timer::GetCurrentValue() - start; }
+	} vsync_timed{vsync_start};
 	GSRenderer& r = *g_gs_renderer;
 	r.PCRTCDisplays.SetVideoMode(r.GetVideoMode());
 	r.PCRTCDisplays.EnableDisplays(r.m_regs->PMODE, r.m_regs->SMODE2, r.isReallyInterlaced());

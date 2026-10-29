@@ -141,7 +141,7 @@ GL renderer (PCSX2-style) is the way to full speed.
   on 2 000 to 25 000 GL draw calls a frame: the CPU side of the driver, not
   the GPU, limits it. `mesa_glthread` (on) gains ~10%; lighter GS settings
   (`UN5GS_PRELOAD/BLEND/MIPMAP/DITHER`) and presenting without vsync did not
-  help. Next: why the GS splits UN5's frames into so many draws.
+  help. (The draw counts and the glthread gain were wrong; see below.)
 - **Shader cache.** A new shader costs ~12 ms to compile, ~22 ms with its
   binary saved; jutsu bursts spent up to 1.6 s of every 5 s compiling.
   devkitPro's Mesa (horizon) has no disk cache and so reports no program
@@ -153,6 +153,33 @@ GL renderer (PCSX2-style) is the way to full speed.
 - **Stripes and ghosting (fixed, patch 0014).** The present read the field
   and the display registers when the lagging render thread got to it, so
   PCSX2 deinterlaced with the wrong field and showed another frame's buffer.
+- **What limits a battle (2026-10-29, same clocks).** Our own counters
+  (`gs-pcsx2/patches/0004`, `[draws]` line) replace PCSX2's per-frame
+  averages, which were wrong: a battle frame has **~750 draws**, and only 2%
+  share the previous draw's state (CLUT changes and register writes flush
+  almost every one), so batching draws gains nothing. The GS thread spent
+  32.7 ms a frame (30 fps): 16 in GL submission, ~9 in PCSX2's setup. CPU
+  1785 or 1963, GPU 921 or 1152, memory 1600 or 1996 MHz: the same 30 fps.
+- **A profiler on the console.** `PS2_SAMPLE=<seconds>` (engine patch 0017)
+  samples every thread about once a millisecond and prints their hottest
+  stacks at exit. It showed that **glthread had never run**: devkitPro's Mesa
+  leaves `start_thread`/`thread_finish` out on horizon, and newlib's
+  `thrd_success` is 4, which Mesa read as a failed thread. `mesa_glthread`'s
+  "~10%" earlier was noise.
+- **glthread on (`patches/switch-mesa/0002`).** With those fixed, plus the
+  EGL hooks glthread needs and a fence wait that sleeps instead of spinning,
+  the GS thread went from 33 to ~20 ms a frame (GL submission 16 to 3-4 ms,
+  now on the worker on core 2) and **battle from 30 to 34-40 fps**. The
+  causes were found from the LSWTCS 360-to-Switch port's notes, which hit
+  the same Mesa; their code (CC BY-NC-SA) is not used. Threads are placed
+  on cores (render 0, emulation 1, VU and glthread 2). nouveau's per-draw
+  constant cache flush, priced by switching it on and off within a run,
+  made no difference and is left alone.
+- **Next limit: the VU thread**, now ~100% busy running the 39 compiled VU1
+  programs (0 interpreted) and VIF unpack; the GS thread waits on it ~28%
+  of the time. Hottest: flag computation (`vuops::flags`) and DIV/SQRT via
+  doubles (`fp::from_double`). Plan: finer flag liveness in vurecomp (MAC,
+  status, sticky apart), vectorised flags, single-precision DIV/SQRT/RSQRT.
 
 ## Open
 
