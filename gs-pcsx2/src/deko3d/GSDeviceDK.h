@@ -124,6 +124,8 @@ private:
 	std::string GenGlslHeader(std::string_view entry, DkStage stage, std::string_view macro) const;
 	std::string GetShaderSource(std::string_view entry, DkStage stage, std::string_view code, std::string_view macro = {}) const;
 	const DkShader* GetShader(DkStage stage, const std::string& source);
+	const DkShader* LoadPackedShader(u64 hash);
+	void PreloadPack();
 	Program GetProgram(const std::string& vs, const std::string& ps);
 	std::string GetVSSource(VSSelector sel) const;
 	std::string GetPSSource(const PSSelector& sel) const;

@@ -15,6 +15,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <dirent.h>
 #include <sys/stat.h>
 
 // libnx's window functions (switch.h itself clashes with PCSX2's types).
@@ -214,6 +215,7 @@ bool GSDeviceDK::Create(GSVSyncMode vsync_mode, bool allow_present_throttle)
 	}
 	m_tfx_vgs = std::move(*vgs);
 	m_tfx_fs = std::move(*fs);
+	PreloadPack();
 	if (!CreateFixedPrograms())
 		return false;
 
@@ -308,30 +310,36 @@ const DkShader* GSDeviceDK::GetShader(DkStage stage, const std::string& source)
 	if (m_missing_shaders.count(hash))
 		return nullptr;
 
+	if (const DkShader* shader = LoadPackedShader(hash))
+		return shader;
+
+	// Not in the pack: keep the source for the next one and skip the draw.
+	m_missing_shaders.emplace(hash, true);
+	const std::string missing = fmt::format("{}/{:016x}.{}", kMissingDir, hash, stage == DkStage_Vertex ? "vert" : "frag");
+	if (std::FILE* f = std::fopen(missing.c_str(), "wb"))
+	{
+		std::fwrite(source.data(), 1, source.size(), f);
+		std::fclose(f);
+	}
+	Console.Warning("deko3d: shader %016llx is not in the pack", static_cast<unsigned long long>(hash));
+	return nullptr;
+}
+
+const DkShader* GSDeviceDK::LoadPackedShader(u64 hash)
+{
 	Common::Timer timer;
 	ScopedGuard timed([&timer]() { g_un5_program_ms += timer.GetTimeMilliseconds(); });
 
 	std::vector<u8> file;
 	const std::string path = fmt::format("{}/{:016x}.dksh", kPackDir, hash);
 	if (!ReadFile(path, &file) || file.size() < sizeof(DkshHeader))
-	{
-		m_missing_shaders.emplace(hash, true);
-		const std::string missing = fmt::format("{}/{:016x}.{}", kMissingDir, hash, stage == DkStage_Vertex ? "vert" : "frag");
-		if (std::FILE* f = std::fopen(missing.c_str(), "wb"))
-		{
-			std::fwrite(source.data(), 1, source.size(), f);
-			std::fclose(f);
-		}
-		Console.Warning("deko3d: shader %016llx is not in the pack", static_cast<unsigned long long>(hash));
 		return nullptr;
-	}
 
 	DkshHeader header;
 	std::memcpy(&header, file.data(), sizeof(header));
 	if (header.control_sz + header.code_sz > file.size())
 	{
 		Console.Error("deko3d: %s is truncated", path.c_str());
-		m_missing_shaders.emplace(hash, true);
 		return nullptr;
 	}
 	DkMemBlock code_block;
@@ -340,7 +348,6 @@ const DkShader* GSDeviceDK::GetShader(DkStage stage, const std::string& source)
 	if (!m_ctx.AllocCode(header.code_sz, &code_block, &code_offset, &code_cpu))
 	{
 		Console.Error("deko3d: out of shader code memory");
-		m_missing_shaders.emplace(hash, true);
 		return nullptr;
 	}
 	std::memcpy(code_cpu, file.data() + header.control_sz, header.code_sz);
@@ -438,6 +445,28 @@ std::string GSDeviceDK::GetPSSource(const PSSelector& sel) const
 	std::string src = GenGlslHeader("ps_main", DkStage_Fragment, macro);
 	src += m_tfx_fs;
 	return src;
+}
+
+// Loads the whole pack up front, as an emulator builds its shader cache at
+// start, so nothing is read or set up in the middle of a fight.
+void GSDeviceDK::PreloadPack()
+{
+	Common::Timer timer;
+	DIR* dir = opendir(kPackDir);
+	if (!dir)
+	{
+		Console.Warning("deko3d: no shader pack in %s", kPackDir);
+		return;
+	}
+	while (const dirent* entry = readdir(dir))
+	{
+		unsigned long long hash = 0;
+		char ext[8] = {};
+		if (std::sscanf(entry->d_name, "%16llx.%7s", &hash, ext) == 2 && std::strcmp(ext, "dksh") == 0 && !m_shaders.count(hash))
+			LoadPackedShader(hash);
+	}
+	closedir(dir);
+	Console.WriteLn("deko3d: %zu shaders from the pack in %.0f ms", m_shaders.size(), timer.GetTimeMilliseconds());
 }
 
 bool GSDeviceDK::CreateFixedPrograms()
