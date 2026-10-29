@@ -3,6 +3,9 @@
 
 #include "common/Console.h"
 
+#include <cstdio>
+#include <cstdlib>
+#include <algorithm>
 #include <cstring>
 
 namespace dk
@@ -23,6 +26,21 @@ namespace dk
 		}
 
 		u32 AlignUp(u32 v, u32 a) { return (v + a - 1) & ~(a - 1); }
+
+		// A fence that never signals means the GPU stopped on a bad command;
+		// waiting for it forever freezes the console. Give up with a clear
+		// log line and a crash report instead.
+		constexpr s64 kFenceTimeoutNs = 3'000'000'000;
+
+		void WaitFence(DkQueue queue, DkFence* fence, u64 batch)
+		{
+			if (dkFenceWait(fence, kFenceTimeoutNs) == DkResult_Success)
+				return;
+			Console.Error("deko3d: batch %llu did not finish in 3 s (queue %s); stopping",
+				static_cast<unsigned long long>(batch), dkQueueIsInErrorState(queue) ? "in error state" : "still busy");
+			std::fflush(stderr);
+			std::abort();
+		}
 	} // namespace
 
 	bool Context::Create()
@@ -91,7 +109,7 @@ namespace dk
 
 	void Context::Destroy()
 	{
-		if (m_queue)
+		if (m_queue && !dkQueueIsInErrorState(m_queue))
 			dkQueueWaitIdle(m_queue);
 		while (!m_deferred.empty())
 		{
@@ -177,7 +195,7 @@ namespace dk
 			Submit();
 		const u32 idx = static_cast<u32>(id % NUM_FENCES);
 		if (m_fence_batch[idx] == id)
-			dkFenceWait(&m_fences[idx], -1);
+			WaitFence(m_queue, &m_fences[idx], id);
 		m_completed_batch = id;
 	}
 
@@ -187,18 +205,48 @@ namespace dk
 		// The fence slot's previous batch must be done before it is reused.
 		if (m_fence_batch[idx] && m_fence_batch[idx] > m_completed_batch)
 		{
-			dkFenceWait(&m_fences[idx], -1);
+			WaitFence(m_queue, &m_fences[idx], m_fence_batch[idx]);
 			m_completed_batch = m_fence_batch[idx];
+		}
+		// The first batches are traced and flushed to the SD card at once, so a
+		// GPU hang still leaves the last step in the log.
+		const bool trace = m_current_batch <= 12;
+		if (trace)
+		{
+			Console.WriteLn("deko3d: submitting batch %llu", static_cast<unsigned long long>(m_current_batch));
+			std::fflush(stderr);
 		}
 		dkCmdBufSignalFence(m_cmd, &m_fences[idx], true);
 		const DkCmdList list = dkCmdBufFinishList(m_cmd);
 		dkQueueSubmitCommands(m_queue, list);
 		dkQueueFlush(m_queue);
+		if (!m_reported_error && dkQueueIsInErrorState(m_queue))
+		{
+			m_reported_error = true;
+			Console.Error("deko3d: the GPU queue is in an error state after batch %llu", static_cast<unsigned long long>(m_current_batch));
+		}
 		m_fence_batch[idx] = m_current_batch;
+		if (trace)
+		{
+			const bool done = dkFenceWait(&m_fences[idx], 2'000'000'000) == DkResult_Success;
+			Console.WriteLn("deko3d: batch %llu %s", static_cast<unsigned long long>(m_current_batch),
+				done ? "finished" : (dkQueueIsInErrorState(m_queue) ? "FAILED (queue error)" : "NOT finished after 2 s"));
+			std::fflush(stderr);
+		}
 		m_stream_marks.emplace_back(m_current_batch, m_stream_head);
 		m_current_batch++;
 		RetireCompleted();
 		BeginBatch();
+	}
+
+	bool Context::SubmitAndProbe(BatchId id, s64 timeout_ns)
+	{
+		Submit();
+		const u32 idx = static_cast<u32>(id % NUM_FENCES);
+		if (dkFenceWait(&m_fences[idx], timeout_ns) != DkResult_Success)
+			return false;
+		m_completed_batch = std::max(m_completed_batch, id);
+		return true;
 	}
 
 	void Context::SubmitAndWait()

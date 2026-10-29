@@ -180,6 +180,7 @@ private:
 	void SendHWDraw(const GSHWDrawConfig& config, bool one_barrier, bool full_barrier);
 
 	void RenderImGui();
+	void SelfTest();
 
 	dk::Context m_ctx;
 

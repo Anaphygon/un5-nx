@@ -219,9 +219,11 @@ bool GSDeviceDK::Create(GSVSyncMode vsync_mode, bool allow_present_throttle)
 	if (!CreateFixedPrograms())
 		return false;
 
+	SelfTest();
 	std::memset(static_cast<void*>(&m_vs_cb_cache), 0xFF, sizeof(m_vs_cb_cache));
 	std::memset(static_cast<void*>(&m_ps_cb_cache), 0xFF, sizeof(m_ps_cb_cache));
 	Console.WriteLn("deko3d: device ready, %zu shaders loaded, %zu missing from the pack", m_shaders.size(), m_missing_shaders.size());
+	std::fflush(stderr);
 	return true;
 }
 
@@ -249,6 +251,60 @@ void GSDeviceDK::Destroy()
 		dkMemBlockDestroy(m_expand_ib);
 	m_expand_ib = nullptr;
 	m_ctx.Destroy();
+}
+
+// Steps the GPU through what a first frame does, each in its own batch with
+// a bounded wait, and logs which one does not finish. Added after the first
+// runs on hardware hung on batch 1 with the queue not in an error state.
+void GSDeviceDK::SelfTest()
+{
+	const auto step = [this](const char* what) {
+		const dk::BatchId id = m_ctx.CurrentBatch();
+		const bool done = m_ctx.SubmitAndProbe(id, 2'000'000'000);
+		Console.WriteLn("deko3d selftest: %s: %s", what, done ? "ok" : "HUNG");
+		std::fflush(stderr);
+		if (!done)
+		{
+			// Leave now: presenting from a stuck queue freezes the whole screen.
+			Console.Error("deko3d selftest failed; stopping");
+			std::fflush(stderr);
+			std::abort();
+		}
+		return done;
+	};
+	if (!step("empty batch"))
+		return;
+	CommitClear(m_dummy); // no-op unless cleared; clear it explicitly
+	{
+		GSTextureDK* const saved = m_current_rt;
+		m_current_rt = m_dummy;
+		m_targets_dirty = true;
+		SetViewport(GSVector2i(1, 1));
+		SetScissor(GSVector4i(0, 0, 1, 1));
+		FlushState();
+		dkCmdBufClearColorFloat(m_ctx.Cmd(), 0, DkColorMask_RGBA, 0.0f, 0.0f, 0.0f, 1.0f);
+		m_current_rt = saved;
+		m_targets_dirty = true;
+	}
+	if (!step("clear a texture"))
+		return;
+	const int slot = dkQueueAcquireImage(m_ctx.Queue(), m_swapchain);
+	Console.WriteLn("deko3d selftest: acquired swapchain image %d", slot);
+	if (!step("acquire a swapchain image"))
+		return;
+	DkImageView view;
+	dkImageViewDefaults(&view, &m_swap_images[slot]);
+	const DkImageView* colors[1] = {&view};
+	dkCmdBufBindRenderTargets(m_ctx.Cmd(), colors, 1, nullptr);
+	const DkScissor sc = {0, 0, m_window_info.surface_width, m_window_info.surface_height};
+	dkCmdBufSetScissors(m_ctx.Cmd(), 0, &sc, 1);
+	dkCmdBufClearColorFloat(m_ctx.Cmd(), 0, DkColorMask_RGBA, 0.0f, 0.0f, 0.0f, 1.0f);
+	m_targets_dirty = true;
+	m_scissor_dirty = true;
+	if (!step("clear the swapchain image"))
+		return;
+	dkQueuePresentImage(m_ctx.Queue(), m_swapchain, slot);
+	step("present");
 }
 
 GSTexture* GSDeviceDK::CreateSurface(GSTexture::Usage usage, int width, int height, int levels, GSTexture::Format format)
@@ -843,6 +899,7 @@ void GSDeviceDK::FlushState()
 	if (m_targets_dirty)
 	{
 		m_targets_dirty = false;
+		m_color_mask_dirty = true;
 		DkImageView colors[2];
 		const DkImageView* color_ptrs[2] = {nullptr, nullptr};
 		u32 num_colors = 0;
@@ -912,7 +969,9 @@ void GSDeviceDK::FlushState()
 		m_color_mask_dirty = false;
 		DkColorWriteState cws;
 		dkColorWriteStateDefaults(&cws);
-		dkColorWriteStateSetMask(&cws, 0, m_color_mask & 0xF);
+		// The swapchain image is composited with its alpha; the PS2's alpha
+		// (often 0.5) would show the frame see-through, so it stays at 1.
+		dkColorWriteStateSetMask(&cws, 0, m_color_mask & (m_rendering_to_swapchain ? 0x7 : 0xF));
 		dkCmdBufBindColorWriteState(cmd, &cws);
 	}
 	if (m_blend_dirty)
@@ -1106,8 +1165,8 @@ void GSDeviceDK::CommitClear(GSTexture* t)
 void GSDeviceDK::CopyBufferToTexture(GSTextureDK* t, int level, const GSVector4i& r, DkGpuAddr src, u32 pitch)
 {
 	BeforeTransfer(nullptr, t);
-	const u32 row_length = t->IsCompressedFormat() ? (pitch / GSTexture::GetCompressedBytesPerBlock(t->GetFormat())) * 4 : (pitch >> t->PixelShift());
-	const DkCopyBuf buf = {src, row_length, 0};
+	// DkCopyBuf's row length is in bytes.
+	const DkCopyBuf buf = {src, pitch, 0};
 	const DkImageView view = t->LevelView(level);
 	const DkImageRect rect = Rect(r);
 	dkCmdBufCopyBufferToImage(m_ctx.Cmd(), &buf, &view, &rect, 0);
@@ -1117,7 +1176,7 @@ void GSDeviceDK::CopyBufferToTexture(GSTextureDK* t, int level, const GSVector4i
 void GSDeviceDK::CopyTextureToBuffer(GSTextureDK* t, int level, const GSVector4i& r, DkGpuAddr dst, u32 pitch)
 {
 	BeforeTransfer(t, nullptr);
-	const DkCopyBuf buf = {dst, pitch >> t->PixelShift(), 0};
+	const DkCopyBuf buf = {dst, pitch, 0};
 	const DkImageView view = t->LevelView(level);
 	const DkImageRect rect = Rect(r);
 	dkCmdBufCopyImageToBuffer(m_ctx.Cmd(), &view, &rect, &buf, 0);
@@ -1913,6 +1972,11 @@ GSDevice::PresentResult GSDeviceDK::BeginPresent(bool frame_skip)
 	if (frame_skip)
 		return PresentResult::FrameSkipped;
 	m_swap_slot = dkQueueAcquireImage(m_ctx.Queue(), m_swapchain);
+	if (g_un5_presents < 3)
+	{
+		Console.WriteLn("deko3d: present %llu, swapchain image %d", static_cast<unsigned long long>(g_un5_presents), m_swap_slot);
+		std::fflush(stderr);
+	}
 	BindSwapchainTarget();
 	OMSetColorMask(OMColorMaskSelector());
 	FlushState();

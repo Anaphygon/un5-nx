@@ -68,7 +68,10 @@ GSTextureDK::GSTextureDK(Usage usage, int width, int height, int levels, Format 
 	maker.dimensions[2] = 1;
 	maker.mipLevels = m_mipmap_levels;
 	maker.flags = DkImageFlags_BlockLinear;
-	if (IsRenderTargetOrDepthStencil())
+	// Every uncompressed image may be drawn to: the GS draws into plain
+	// textures too (conversions, the ImGui font's clear), and deko3d requires
+	// the flag on any image bound as a target.
+	if (!IsCompressedFormat())
 		maker.flags |= DkImageFlags_UsageRender;
 	if (!IsDepthStencil() && !IsCompressedFormat())
 		maker.flags |= DkImageFlags_Usage2DEngine;

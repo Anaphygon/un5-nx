@@ -44,6 +44,8 @@ namespace dk
 
 		// Ends the batch being recorded and hands it to the GPU.
 		void Submit();
+		// Submit, then wait up to timeout_ns for batch id; false if it did not finish.
+		bool SubmitAndProbe(BatchId id, s64 timeout_ns);
 		// Submit, then wait for everything to finish.
 		void SubmitAndWait();
 
@@ -99,6 +101,7 @@ namespace dk
 		std::array<BatchId, NUM_FENCES> m_fence_batch{};
 		BatchId m_current_batch = 1;
 		BatchId m_completed_batch = 0;
+		bool m_reported_error = false;
 
 		// Streaming ring.
 		static constexpr u32 STREAM_SIZE = 96 * 1024 * 1024;
