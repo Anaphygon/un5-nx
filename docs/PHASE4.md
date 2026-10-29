@@ -210,7 +210,7 @@ GL renderer (PCSX2-style) is the way to full speed.
     - FPS counter.
   - **In-game menu.** L3+R3 pauses the game and shows the same rows over the last frame, drawn with PCSX2's ImGui overlay. Quit there ends the game and gives the clocks back.
   - **Saving.** Choices are kept in `launcher.ini`.
-  - **Resolution cost.** 2x costs next to nothing in a normal battle, since the GPU had room.
+  - **Resolution cost** (Fast preset, Tsunade battle). Native with the sharp filter: 34-38 fps, because the sharp present prescales the small frame (~6 ms a frame). 2x: 44-49 fps, so it is the default. 3x: 37-40 fps, with the GS thread at ~25 ms a frame, 97% busy, waiting on the GPU.
   - **Audio stretching** (engine patch 0026). The host repeats 10 ms grains of sound when the queue runs low, so the pitch stays. Empty-queue batches went from tens or hundreds per 5 s to mostly none.
   - **Open:** frame drops on some big jutsu (Tsunade) even at Fast with 2x. The log now has the VU thread's busy share every 5 s to tell a VU-bound drop from a GPU-bound one. Also open: a purple flash in Master Mode's forest, possibly minimum blending.
 - **Next limit: the VU thread**, now ~100% busy running the 39 compiled VU1

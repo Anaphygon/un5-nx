@@ -152,8 +152,9 @@ Un5RowText un5_row_text(const Un5Settings& s, int row, bool in_game)
 		}
 		case kRowUpscale:
 			return {"Resolution", s.upscale == 1 ? "Native" : std::to_string(s.upscale) + "x",
-				std::string(s.upscale == 1 ? "The PS2's own resolution: fastest, soft on a sharp screen." :
-											  "Renders the game larger and sharper; more work for the GPU.") +
+				std::string(s.upscale == 1 ? "The PS2's own resolution: soft on a sharp screen, and the Sharp filter costs more here." :
+							s.upscale == 2 ? "Sharper, at about the same speed as Native: the best fit for the Switch." :
+											  "Sharpest, but about 38-40 fps in battle at Fast instead of 44-49.") +
 					(in_game ? "  Takes effect next time the game starts." : "")};
 		case kRowFilter:
 			return {"Screen filter", kFilters[s.filter],
