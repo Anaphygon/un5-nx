@@ -1,0 +1,22 @@
+diff --git a/src/util/u_queue.c b/src/util/u_queue.c
+index 4049a4c..d85b1cc 100644
+--- a/src/util/u_queue.c
++++ b/src/util/u_queue.c
+@@ -71,6 +71,17 @@ global_init(void)
+    atexit(atexit_handler);
+ }
+ 
++/* un5-nx: the runner leaves with _Exit, which skips atexit; it calls this
++ * first so no queue thread is alive at exit (hbl breaks on that).
++ */
++void util_queue_kill_all_threads(void);
++void
++util_queue_kill_all_threads(void)
++{
++   call_once(&atexit_once_flag, global_init);
++   atexit_handler();
++}
++
+ static void
+ add_to_atexit_list(struct util_queue *queue)
+ {

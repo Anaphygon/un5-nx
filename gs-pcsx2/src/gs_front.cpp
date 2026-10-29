@@ -318,6 +318,10 @@ void log_to_stderr(LOGLEVEL, ConsoleColors, std::string_view message)
 }
 }
 
+#ifdef __SWITCH__
+extern "C" void util_queue_kill_all_threads(void); // our Mesa (patches/switch-mesa/0003)
+#endif
+
 namespace un5gs {
 
 // Mesa reads this when the GL context is made; args.txt can override it.
@@ -397,6 +401,12 @@ void close()
 		g_gs_device->Destroy();
 		g_gs_device.reset();
 	}
+#ifdef __SWITCH__
+	// Mesa's worker threads (glthread and others) would outlive the runner's
+	// _Exit, which skips the atexit handler that stops them, and hbl breaks
+	// on a thread alive at exit (seen 2026-10-29 after Quit from the menu).
+	util_queue_kill_all_threads();
+#endif
 }
 
 void transfer(int path, const void* data, std::uint32_t qwords)
