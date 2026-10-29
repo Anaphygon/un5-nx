@@ -15,9 +15,10 @@ struct Un5Settings
 	bool audio_stretch = true;
 	bool show_fps = false;
 	bool deko3d = false; // draw with deko3d instead of OpenGL (takes effect at start)
+	int upscale_fix = 0; // how upscaled full-screen effects are drawn (see un5_apply_upscale_fix)
 };
 
-enum Un5Row { kRowPreset, kRowUpscale, kRowFilter, kRowBlending, kRowAudio, kRowFps, kRowRenderer, kSettingRows };
+enum Un5Row { kRowPreset, kRowUpscale, kRowFilter, kRowBlending, kRowAudio, kRowFps, kRowRenderer, kRowUpscaleFix, kSettingRows };
 
 struct Un5RowText
 {
@@ -34,4 +35,12 @@ void un5_row_step(Un5Settings& s, int row, int step);
 // everything kept in launcher.ini for the next start. The GS and audio parts
 // are applied by the caller.
 Un5Settings un5_settings();
+
+// The upscale fixes, tried live from the menu: 0 the game database's (half-pixel
+// offset special, native scaling aggressive), 1 native scaling normal, 2 native
+// scaling off, 3 half-pixel offset native, 4 round sprite full, 5 adaptive
+// deinterlacing. Applied to the GS config (gs_front.cpp).
+constexpr int kUpscaleFixes = 6;
+const char* un5_upscale_fix_name(int fix);
+void un5_apply_upscale_fix(int fix);
 void un5_settings_change(const Un5Settings& s);

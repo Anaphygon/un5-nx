@@ -110,15 +110,15 @@ namespace
 		for (int r = 0; r < kSettingRows; ++r)
 		{
 			const Un5RowText t = un5_row_text(s, r, true);
-			const float y = 140.0f + r * 61.0f;
+			const float y = 138.0f + r * 54.0f;
 			const bool sel = r == selected;
-			c.dl->AddRectFilled(c.at(140, y), c.at(1140, y + 55), sel ? tile_sel : tile);
+			c.dl->AddRectFilled(c.at(140, y), c.at(1140, y + 49), sel ? tile_sel : tile);
 			if (sel)
-				frame(140, y, 1000, 55);
-			c.text(170, y + 5, 20, sel ? cyan : fg, t.label);
+				frame(140, y, 1000, 49);
+			c.text(170, y + 3, 19, sel ? cyan : fg, t.label);
 			const std::string v = "<  " + t.value + "  >";
-			c.text(1110 - c.width(20, v.c_str()), y + 5, 20, fg, v.c_str());
-			c.text(170, y + 32, 15, muted, t.note.c_str());
+			c.text(1110 - c.width(19, v.c_str()), y + 3, 19, fg, v.c_str());
+			c.text(170, y + 28, 14, muted, t.note.c_str());
 		}
 		const auto button = [&](int index, float x, float w, const char* label, ImU32 fill) {
 			const bool sel = index == selected;
@@ -141,6 +141,7 @@ namespace
 		GSConfig.AccurateBlendingUnit = s.min_blending ? AccBlendLevel::Minimum : AccBlendLevel::Basic;
 		GSConfig.LinearPresent = static_cast<GSPostBilinearMode>(s.filter);
 		ps2::set_audio_stretch(s.audio_stretch);
+		un5_apply_upscale_fix(s.upscale_fix);
 	}
 
 	bool s_show_fps = false, s_fps_read = false;

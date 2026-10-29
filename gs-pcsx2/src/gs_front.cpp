@@ -10,6 +10,7 @@
 #include "GS/GSState.h"
 #include "GS/Renderers/HW/GSRendererHW.h"
 #include "GS/Renderers/OpenGL/GSDeviceOGL.h"
+#include "un5_settings.h"
 #ifdef __SWITCH__
 #include "deko3d/GSDeviceDK.h"
 #endif
@@ -102,8 +103,11 @@ void apply_environment()
 	// upscaled: without them its full-screen effects (hit flashes, smoke) come
 	// out in horizontal stripes. Half-pixel offset "Special", native scaling
 	// "Aggressive".
-	GSConfig.UserHacks_HalfPixelOffset = static_cast<GSHalfPixelOffset>(std::clamp(number("UN5GS_HPO", 2), 0, 5));
-	GSConfig.UserHacks_NativeScaling = static_cast<GSNativeScaling>(std::clamp(number("UN5GS_NATIVE_SCALING", 2), 0, 4));
+	un5_apply_upscale_fix(std::clamp(number("UN5GS_FIX", 0), 0, kUpscaleFixes - 1));
+	if (std::getenv("UN5GS_HPO"))
+		GSConfig.UserHacks_HalfPixelOffset = static_cast<GSHalfPixelOffset>(std::clamp(number("UN5GS_HPO", 2), 0, 5));
+	if (std::getenv("UN5GS_NATIVE_SCALING"))
+		GSConfig.UserHacks_NativeScaling = static_cast<GSNativeScaling>(std::clamp(number("UN5GS_NATIVE_SCALING", 2), 0, 4));
 	Console.WriteLn("un5gs: texture preloading %d, blending %d, mipmap %d, dithering %d, download %d, upscale %.0fx, filter %d, "
 					"half-pixel offset %d, native scaling %d",
 		static_cast<int>(GSConfig.TexturePreloading), static_cast<int>(GSConfig.AccurateBlendingUnit), GSConfig.HWMipmap ? 1 : 0,
@@ -469,4 +473,30 @@ void read_fifo(void* data, std::uint32_t qwords)
 	g_gs_renderer->ReadFIFO(mem, qwords);
 }
 
+}
+
+const char* un5_upscale_fix_name(int fix)
+{
+	static const char* const kNames[kUpscaleFixes] = {"Game database", "Native scaling normal", "Native scaling off",
+		"Half-pixel native", "Round sprite", "Deinterlace adaptive"};
+	return kNames[std::clamp(fix, 0, kUpscaleFixes - 1)];
+}
+
+void un5_apply_upscale_fix(int fix)
+{
+	// The game database's fixes for SLES-55605 are the starting point.
+	GSConfig.UserHacks_HalfPixelOffset = GSHalfPixelOffset::Special;
+	GSConfig.UserHacks_NativeScaling = GSNativeScaling::Aggressive;
+	GSConfig.UserHacks_RoundSprite = 0;
+	GSConfig.InterlaceMode = GSInterlaceMode::Automatic;
+	switch (fix)
+	{
+		case 1: GSConfig.UserHacks_NativeScaling = GSNativeScaling::Normal; break;
+		case 2: GSConfig.UserHacks_NativeScaling = GSNativeScaling::Off; break;
+		case 3: GSConfig.UserHacks_HalfPixelOffset = GSHalfPixelOffset::Native; break;
+		case 4: GSConfig.UserHacks_RoundSprite = 2; break;
+		case 5: GSConfig.InterlaceMode = GSInterlaceMode::AdaptiveTFF; break;
+		default: break;
+	}
+	Console.WriteLn("un5gs: upscale fix %s", un5_upscale_fix_name(fix));
 }

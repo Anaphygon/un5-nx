@@ -68,6 +68,8 @@ namespace
 					s.show_fps = v != 0;
 				else if (std::sscanf(line, "deko3d=%d", &v) == 1)
 					s.deko3d = v != 0;
+				else if (std::sscanf(line, "upscale_fix=%d", &v) == 1 && v >= 0 && v < kUpscaleFixes)
+					s.upscale_fix = v;
 			}
 			std::fclose(f);
 		}
@@ -80,8 +82,9 @@ namespace
 			return;
 		if (std::FILE* f = std::fopen(ini_path(g_dir.c_str()).c_str(), "w"))
 		{
-			std::fprintf(f, "preset=%d\nupscale=%d\nfilter=%d\nmin_blending=%d\naudio_stretch=%d\nshow_fps=%d\ndeko3d=%d\n", s.preset,
-				s.upscale, s.filter, s.min_blending ? 1 : 0, s.audio_stretch ? 1 : 0, s.show_fps ? 1 : 0, s.deko3d ? 1 : 0);
+			std::fprintf(f, "preset=%d\nupscale=%d\nfilter=%d\nmin_blending=%d\naudio_stretch=%d\nshow_fps=%d\ndeko3d=%d\nupscale_fix=%d\n",
+				s.preset, s.upscale, s.filter, s.min_blending ? 1 : 0, s.audio_stretch ? 1 : 0, s.show_fps ? 1 : 0, s.deko3d ? 1 : 0,
+				s.upscale_fix);
 			std::fclose(f);
 		}
 	}
@@ -98,7 +101,7 @@ namespace
 	}
 
 	constexpr int kStart = kSettingRows; // the launcher's last row
-	constexpr int kRowsTop = 140, kRowStep = 61, kRowH = 55;
+	constexpr int kRowsTop = 138, kRowStep = 54, kRowH = 49;
 
 	void row(int index, int selected, const Un5RowText& t)
 	{
@@ -107,10 +110,10 @@ namespace
 		gfx_rect(140, y, 1000, kRowH, sel ? kTileSel : kTile);
 		if (sel)
 			gfx_border(136, y - 4, 1008, kRowH + 8, 4, kCyan, kGreen);
-		gfx_text(170, y + 5, 20, sel ? kCyan : kText, t.label);
+		gfx_text(170, y + 3, 19, sel ? kCyan : kText, t.label);
 		const std::string v = std::string("<  ") + t.value + "  >";
-		gfx_text(1110 - gfx_text_width(20, v.c_str()), y + 5, 20, kText, v.c_str());
-		gfx_text_fit(170, y + 32, 15, kMuted, t.note.c_str(), 940);
+		gfx_text(1110 - gfx_text_width(19, v.c_str()), y + 3, 19, kText, v.c_str());
+		gfx_text_fit(170, y + 28, 14, kMuted, t.note.c_str(), 940);
 	}
 
 	void draw(const Un5Settings& s, int selected)
@@ -164,6 +167,9 @@ Un5RowText un5_row_text(const Un5Settings& s, int row, bool in_game)
 				s.filter == 1 ? "PCSX2's default smoothing: soft." :
 				s.upscale == 1 ? "Bilinear sharp: crisp, but at Native it costs about 6 ms a frame; use it with 2x or more." :
 								 "Bilinear sharp: smooth scaling, crisper than Smooth."};
+		case kRowUpscaleFix:
+			return {"Upscale fix", un5_upscale_fix_name(s.upscale_fix),
+				"For striped full-screen effects (ultimates) at 2x or 3x; try them during one. No effect at Native."};
 		case kRowRenderer:
 			return {"Renderer", s.deko3d ? "deko3d (test)" : "OpenGL",
 				std::string(s.deko3d ? "The Switch's own graphics API: faster, still being tested." :
@@ -197,6 +203,7 @@ void un5_row_step(Un5Settings& s, int row, int step)
 		case kRowAudio: s.audio_stretch = !s.audio_stretch; break;
 		case kRowFps: s.show_fps = !s.show_fps; break;
 		case kRowRenderer: s.deko3d = !s.deko3d; break;
+		case kRowUpscaleFix: s.upscale_fix = (s.upscale_fix + kUpscaleFixes + step) % kUpscaleFixes; break;
 	}
 }
 
@@ -264,6 +271,7 @@ bool un5_launcher(const char* dir)
 	setenv("PS2_AUDIO_STRETCH", s.audio_stretch ? "1" : "0", 1);
 	setenv("UN5_SHOW_FPS", s.show_fps ? "1" : "0", 1);
 	setenv("UN5GS_RENDERER", s.deko3d ? "dk" : "gl", 1);
+	setenv("UN5GS_FIX", std::to_string(s.upscale_fix).c_str(), 1);
 	if (s.preset)
 		set_clocks(s.preset);
 	std::fprintf(stderr, "[launcher] preset %s, resolution %dx, filter %d, blending %s, audio stretching %s, renderer %s\n",
