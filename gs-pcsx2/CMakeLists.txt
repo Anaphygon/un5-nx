@@ -36,18 +36,25 @@ set(COMMON_SOURCES
     ${COMMON}/Timer.cpp ${COMMON}/WindowInfo.cpp ${COMMON}/Perf.cpp
     ${COMMON}/ProgressCallback.cpp ${COMMON}/MemorySettingsInterface.cpp ${COMMON}/SettingsWrapper.cpp)
 set(GLAD_SOURCES "${PCSX2_SRC}/3rdparty/glad/src/gl.c" "${PCSX2_SRC}/3rdparty/glad/src/egl.c")
-# GS devices draw an ImGui overlay; with no ImGui context made, they draw none.
+# GS devices draw an ImGui overlay; with no ImGui context current they draw
+# none. The in-game menu (src/ingame_menu.cpp) makes one while it is open.
 set(IMGUI "${PCSX2_SRC}/3rdparty/imgui/src/imgui.cpp" "${PCSX2_SRC}/3rdparty/imgui/src/imgui_draw.cpp"
-    "${PCSX2_SRC}/3rdparty/imgui/src/imgui_tables.cpp" "${PCSX2_SRC}/3rdparty/imgui/src/imgui_widgets.cpp")
+    "${PCSX2_SRC}/3rdparty/imgui/src/imgui_tables.cpp" "${PCSX2_SRC}/3rdparty/imgui/src/imgui_widgets.cpp"
+    "${PCSX2_SRC}/3rdparty/imgui/src/imgui_freetype.cpp")
 add_library(pcsx2gs STATIC ${GS_CORE} ${GS_RENDERERS} ${GS_GLUE} ${IMGUI} ${COMMON_SOURCES} ${GLAD_SOURCES})
 # devkitPro's EGL headers know the Switch; glad's do not, so they come first.
 find_path(SWITCH_EGL_INCLUDE EGL/eglplatform.h REQUIRED)
+# The launcher draws text with FreeType (link it into ps2run: freetype,
+# harfbuzz, bz2, png16, z, as the portlibs build of FreeType needs).
+find_path(SWITCH_FREETYPE_INCLUDE ft2build.h PATH_SUFFIXES freetype2 REQUIRED)
 target_include_directories(pcsx2gs PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include")
 target_include_directories(pcsx2gs PRIVATE
-    "${CMAKE_CURRENT_SOURCE_DIR}/shim" "${SWITCH_EGL_INCLUDE}"
+    "${CMAKE_CURRENT_SOURCE_DIR}/shim" "${SWITCH_EGL_INCLUDE}" "${SWITCH_FREETYPE_INCLUDE}"
     "${PCSX2_SRC}" "${PCSX2_SRC}/pcsx2" "${GS}"
     "${PCSX2_SRC}/3rdparty/fmt/include" "${PCSX2_SRC}/3rdparty/glad/include" "${PCSX2_SRC}/3rdparty/include" "${PCSX2_SRC}/3rdparty/fast_float/include" "${PCSX2_SRC}/3rdparty/imgui/include")
 target_compile_definitions(pcsx2gs PUBLIC ENABLE_OPENGL FMT_HEADER_ONLY)
+# ImGui's default "open in shell" forks a process; the Switch has neither.
+target_compile_definitions(pcsx2gs PRIVATE IMGUI_DISABLE_DEFAULT_SHELL_FUNCTIONS)
 # GCC refuses always_inline on functions it thinks the linker may interpose.
 target_compile_options(pcsx2gs PRIVATE -Wno-deprecated-declarations -fno-semantic-interposition)
 

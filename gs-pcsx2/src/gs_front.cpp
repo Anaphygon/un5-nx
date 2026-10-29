@@ -31,7 +31,7 @@ static_assert(sizeof(Pcsx2Config) <= (1 << 16));
 // From patches/0003: time spent in GLShaderCache::GetProgram.
 extern double g_un5_program_ms;
 // From the runner (ps2/system.hpp): VU1 program runs left to the interpreter.
-namespace ps2 { std::uint64_t vu1_interpreted_calls(); }
+namespace ps2 { std::uint64_t vu1_interpreted_calls(); double vu_thread_idle_ms(); }
 // From patches/0004: why frames split into draws, and where a draw's time goes.
 extern u64 g_un5_flush_reason[16];
 extern u64 g_un5_split[4];
@@ -42,6 +42,8 @@ extern u64 g_un5_gpu_behind, g_un5_presents;
 // From switch_clocks.cpp.
 unsigned un5_clock_mhz(int which);
 unsigned un5_measured_cpu_mhz();
+void un5_menu_poll();
+void un5_osd_begin();
 bool un5_hoc_open();
 u32 un5_hoc_nearest_hz(u32 module, u32 mhz);
 bool un5_hoc_override(const u32 hz[3]);
@@ -67,6 +69,9 @@ alignas(16) u8 s_privileged[0x2000];
 //   UN5GS_DITHER    dithering 0 off .. 2 (default 2)
 //   UN5GS_DOWNLOAD  GS-to-EE readbacks, PCSX2's GSHardwareDownloadMode: 0 enabled
 //                   (default), 1 enabled and full, 2 no readbacks, 3 unsynchronized, 4 disabled
+//   UN5GS_UPSCALE   internal resolution, 1 native .. 3 (default 1)
+//   UN5GS_FILTER    screen filter: 0 off (sharp pixels), 1 smooth (PCSX2's
+//                   default, soft on an OLED), 2 sharp bilinear (default 2)
 //   UN5GS_VSYNC     wait for the display's vertical blank when presenting (default 0:
 //                   the runner already paces frames, and the Switch shows 60 Hz to a
 //                   50 Hz game, so waiting stalls the render thread)
@@ -83,8 +88,11 @@ void apply_environment()
 	GSConfig.Dithering = static_cast<u8>(std::clamp(number("UN5GS_DITHER", GSConfig.Dithering), 0, 2));
 	GSConfig.HWDownloadMode = static_cast<GSHardwareDownloadMode>(
 		std::clamp(number("UN5GS_DOWNLOAD", static_cast<int>(GSConfig.HWDownloadMode)), 0, 4));
-	Console.WriteLn("un5gs: texture preloading %d, blending %d, mipmap %d, dithering %d, download %d", static_cast<int>(GSConfig.TexturePreloading),
-		static_cast<int>(GSConfig.AccurateBlendingUnit), GSConfig.HWMipmap ? 1 : 0, GSConfig.Dithering, static_cast<int>(GSConfig.HWDownloadMode));
+	GSConfig.UpscaleMultiplier = static_cast<float>(std::clamp(number("UN5GS_UPSCALE", 1), 1, 3));
+	GSConfig.LinearPresent = static_cast<GSPostBilinearMode>(std::clamp(number("UN5GS_FILTER", 2), 0, 2));
+	Console.WriteLn("un5gs: texture preloading %d, blending %d, mipmap %d, dithering %d, download %d, upscale %.0fx, filter %d",
+		static_cast<int>(GSConfig.TexturePreloading), static_cast<int>(GSConfig.AccurateBlendingUnit), GSConfig.HWMipmap ? 1 : 0,
+		GSConfig.Dithering, static_cast<int>(GSConfig.HWDownloadMode), GSConfig.UpscaleMultiplier, static_cast<int>(GSConfig.LinearPresent));
 }
 
 // Shader compiles, counted from PCSX2's log into the speed line.
@@ -232,7 +240,17 @@ void log_draw_split(u32 fields, double gs_ms)
 #endif
 	static std::uint64_t s_interpreted = 0;
 	const std::uint64_t interpreted = ps2::vu1_interpreted_calls();
-	Console.WriteLn("[vu1] %.1f interpreted program runs per frame", static_cast<double>(interpreted - s_interpreted) * per);
+	// The VU thread's share of the window, to tell a VU-bound drop (big jutsu)
+	// from a GS- or GPU-bound one (the [draws] line has the GS and the GPU).
+	static double s_vu_idle = 0;
+	static Common::Timer::Value s_vu_since = Common::Timer::GetCurrentValue();
+	const double vu_idle = ps2::vu_thread_idle_ms();
+	const double window_ms = Common::Timer::ConvertValueToMilliseconds(Common::Timer::GetCurrentValue() - s_vu_since);
+	const double vu_busy = window_ms > 0 ? std::clamp(100.0 * (1.0 - (vu_idle - s_vu_idle) / window_ms), 0.0, 100.0) : 0.0;
+	s_vu_idle = vu_idle;
+	s_vu_since = Common::Timer::GetCurrentValue();
+	Console.WriteLn("[vu1] VU thread busy %.0f%%; %.1f interpreted program runs per frame", vu_busy,
+		static_cast<double>(interpreted - s_interpreted) * per);
 	s_interpreted = interpreted;
 	std::fill(std::begin(g_un5_flush_reason), std::end(g_un5_flush_reason), 0);
 	std::fill(std::begin(g_un5_split), std::end(g_un5_split), 0);
@@ -399,8 +417,14 @@ void vsync(std::uint32_t field, bool registers_written)
 	r.PCRTCDisplays.CalculateDisplayOffset(r.m_scanmask_used);
 	r.PCRTCDisplays.CalculateFramebufferOffset(r.m_scanmask_used, r.m_regs->DISP[0].DISPFB, r.m_regs->DISP[1].DISPFB);
 	r.Flush(GSState::VSYNC);
+#ifdef __SWITCH__
+	un5_osd_begin();
+#endif
 	r.VSync(field, registers_written, r.IsIdleFrame());
 	}
+#ifdef __SWITCH__
+	un5_menu_poll();
+#endif
 	log_speed();
 }
 

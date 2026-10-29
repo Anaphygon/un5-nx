@@ -4,6 +4,7 @@
 #include <switch.h>
 
 #include <cstring>
+#include <initializer_list>
 
 // MHz of the CPU (0), GPU (1) and memory (2); 0 when unreadable.
 unsigned un5_clock_mhz(int which)
@@ -45,14 +46,16 @@ unsigned un5_measured_cpu_mhz()
 	return static_cast<unsigned>(static_cast<double>(kTurns * 8) / seconds / 1e6);
 }
 
-// Horizon OC's clock service (hoc:clk, the sys-clk protocol: commands and
-// layouts from github.com/Horizon-OC/Horizon-OC, Source/hoc-clk/common). A
-// benchmark run can set the clocks itself through its override, the same
-// override the overlay sets, and read temperatures and power.
+// The clock service: Horizon OC's hoc:clk, or else sys-clk's sys:clk (also
+// what HATS-style packs and sys-clk-oc forks run; Tesla and Ultrahand are only
+// overlay loaders on top). Both speak the sys-clk protocol (commands from
+// github.com/retronx-team/sys-clk and github.com/Horizon-OC/Horizon-OC): the
+// override is the one the overlay sets. Temperatures and power are read
+// with Horizon OC's context layout only.
 namespace
 {
 	Service g_hoc;
-	bool g_hoc_open = false;
+	bool g_hoc_open = false, g_hoc_tried = false, g_is_hoc = false;
 	constexpr u32 kGetApiVersion = 0, kGetCurrentContext = 2, kSetOverride = 8, kGetFreqList = 11;
 	constexpr u32 kModules = 3; // CPU, GPU, memory
 
@@ -67,34 +70,58 @@ namespace
 
 bool un5_hoc_open()
 {
-	if (g_hoc_open)
-		return true;
-	if (R_FAILED(smGetService(&g_hoc, "hoc:clk")))
-		return false;
-	u32 version = 0;
-	if (R_FAILED(serviceDispatchOut(&g_hoc, kGetApiVersion, version)))
+	if (g_hoc_open || g_hoc_tried)
+		return g_hoc_open;
+	g_hoc_tried = true;
+	for (const char* name : {"hoc:clk", "sys:clk"})
 	{
+		if (R_FAILED(smGetService(&g_hoc, name)))
+			continue;
+		u32 version = 0;
+		if (R_SUCCEEDED(serviceDispatchOut(&g_hoc, kGetApiVersion, version)))
+		{
+			g_hoc_open = true;
+			g_is_hoc = name[0] == 'h';
+			return true;
+		}
 		serviceClose(&g_hoc);
-		return false;
 	}
-	g_hoc_open = true;
-	return true;
+	return false;
 }
 
-// The supported frequency nearest to mhz, in Hz (0 when none is known). The
-// list is asked for in full (64): with 32 entries 1963 MHz was cut off and the
-// nearest left was 1836.
+// "Horizon OC", "sys-clk" or nullptr when neither runs.
+const char* un5_clock_service_name()
+{
+	return un5_hoc_open() ? (g_is_hoc ? "Horizon OC" : "sys-clk") : nullptr;
+}
+
+// The supported frequency nearest to mhz, in Hz. The list is asked for in
+// full: 64 for Horizon OC (with 32, 1963 MHz was cut off and the nearest left
+// was 1836), 32 for sys-clk, whose service wants maxCount to match the buffer
+// and goes no further. Without a list the request goes as it is and the
+// service picks.
 u32 un5_hoc_nearest_hz(u32 module, u32 mhz)
 {
-	constexpr u32 kMax = 64; // HOCCLK_FREQ_LIST_MAX; the service wants maxCount to match the buffer
-	u32 list[kMax] = {}, count = 0;
-	const struct { u32 module, max_count; } args = {module, kMax};
-	if (!g_hoc_open || R_FAILED(serviceDispatchInOut(&g_hoc, kGetFreqList, args, count,
-						   .buffer_attrs = {SfBufferAttr_HipcAutoSelect | SfBufferAttr_Out},
-						   .buffers = {{list, sizeof(list)}})))
+	if (!g_hoc_open)
 		return 0;
+	u32 list[64] = {}, count = 0;
+	bool listed = false;
+	for (const u32 max : {64u, 32u})
+	{
+		const struct { u32 module, max_count; } args = {module, max};
+		if (R_SUCCEEDED(serviceDispatchInOut(&g_hoc, kGetFreqList, args, count,
+				.buffer_attrs = {SfBufferAttr_HipcAutoSelect | SfBufferAttr_Out},
+				.buffers = {{list, max * sizeof(u32)}})))
+		{
+			listed = count > 0;
+			count = count < max ? count : max;
+			break;
+		}
+	}
+	if (!listed)
+		return mhz * 1000000;
 	u32 best = 0;
-	for (u32 i = 0; i < count && i < kMax; ++i)
+	for (u32 i = 0; i < count; ++i)
 	{
 		const s64 d = static_cast<s64>(list[i]) - static_cast<s64>(mhz) * 1000000;
 		const s64 b = static_cast<s64>(best) - static_cast<s64>(mhz) * 1000000;
@@ -120,7 +147,7 @@ bool un5_hoc_override(const u32 hz[3])
 bool un5_hoc_status(int out[5])
 {
 	alignas(8) static u8 buffer[8192];
-	if (!g_hoc_open || R_FAILED(serviceDispatch(&g_hoc, kGetCurrentContext,
+	if (!g_hoc_open || !g_is_hoc || R_FAILED(serviceDispatch(&g_hoc, kGetCurrentContext,
 						   .buffer_attrs = {SfBufferAttr_HipcAutoSelect | SfBufferAttr_Out},
 						   .buffers = {{buffer, sizeof(buffer)}})))
 		return false;
@@ -131,5 +158,47 @@ bool un5_hoc_status(int out[5])
 	out[2] = c.temps[6] / 100;
 	out[3] = c.power[0];
 	out[4] = c.power[1];
+	return true;
+}
+
+// The in-game menu's view of the controller and the console's font, here
+// because this file may include libnx (ingame_menu.cpp includes PCSX2).
+namespace
+{
+	PadState g_menu_pad;
+	bool g_menu_pad_ready = false;
+} // namespace
+
+// Bits: 1 A, 2 B, 4 up, 8 down, 16 left, 32 right, 64 L3, 128 R3.
+void un5_pad_read(u32& held, u32& down)
+{
+	if (!g_menu_pad_ready)
+	{
+		padInitializeAny(&g_menu_pad);
+		g_menu_pad_ready = true;
+	}
+	padUpdate(&g_menu_pad);
+	const auto map = [](u64 b) {
+		return ((b & HidNpadButton_A) ? 1u : 0u) | ((b & HidNpadButton_B) ? 2u : 0u) | ((b & HidNpadButton_AnyUp) ? 4u : 0u) |
+			   ((b & HidNpadButton_AnyDown) ? 8u : 0u) | ((b & HidNpadButton_AnyLeft) ? 16u : 0u) |
+			   ((b & HidNpadButton_AnyRight) ? 32u : 0u) | ((b & HidNpadButton_StickL) ? 64u : 0u) | ((b & HidNpadButton_StickR) ? 128u : 0u);
+	};
+	held = map(padGetButtons(&g_menu_pad));
+	down = map(padGetButtonsDown(&g_menu_pad));
+}
+
+// The console's standard shared font, for ImGui (not copied, owned by pl).
+bool un5_shared_font(const void** data, std::size_t* size)
+{
+	static bool ready = false;
+	static PlFontData font;
+	if (!ready)
+	{
+		if (R_FAILED(plInitialize(PlServiceType_User)) || R_FAILED(plGetSharedFontByType(&font, PlSharedFontType_Standard)))
+			return false;
+		ready = true;
+	}
+	*data = font.address;
+	*size = font.size;
 	return true;
 }

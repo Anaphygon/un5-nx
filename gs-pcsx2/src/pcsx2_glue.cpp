@@ -350,10 +350,8 @@ bool RGBA8Image::SaveToFile(const char*, u8) const
 	return false;
 }
 
-const ImFontLoader* ImGuiFreeType::GetFontLoader()
-{
-	return nullptr;
-}
+// ImGuiFreeType::GetFontLoader comes from imgui_freetype.cpp now that FreeType
+// is linked (for the launcher and the in-game menu).
 
 // ---- files and paths ---------------------------------------------------
 

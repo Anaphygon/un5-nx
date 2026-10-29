@@ -3,6 +3,11 @@
 // Compiled into ps2run through PS2_EXTRA_SOURCES, as an object rather than
 // from a library, so the linker keeps the registration below.
 #include "ps2/external_gs.hpp"
+#include "ps2/system.hpp"
+
+#ifdef __SWITCH__
+bool un5_launcher(const char* nro_dir);
+#endif
 
 #include "../include/un5gs.h"
 
@@ -31,5 +36,10 @@ void vsync(std::uint32_t field)
 const ps2::ExternalGs kPcsx2Gs{open, transfer, privileged, un5gs::write_csr, vsync, un5gs::read_fifo, un5gs::close};
 
 [[maybe_unused]] const bool kRegistered = (ps2::set_external_gs(&kPcsx2Gs), true);
+
+#ifdef __SWITCH__
+// The settings screen before the game (gs-pcsx2/src/launcher.cpp).
+[[maybe_unused]] const bool kLauncher = (ps2::set_port_launcher(un5_launcher), true);
+#endif
 
 }

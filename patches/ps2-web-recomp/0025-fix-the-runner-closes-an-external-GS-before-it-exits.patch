@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Thu, 29 Oct 2026 15:08:43 +0700
-Subject: [PATCH 25/25] fix: the runner closes an external GS before it exits
+Subject: [PATCH 25/26] fix: the runner closes an external GS before it exits
 
 ExternalGs gains an optional close(), called by the windowed runner before std::_Exit. On the Switch a GL driver's worker thread (Mesa's glthread) still running at exit broke into hbl with 0x10801, as the VU thread did before patch 0016.
 

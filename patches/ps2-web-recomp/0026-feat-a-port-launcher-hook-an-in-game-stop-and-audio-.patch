@@ -1,0 +1,176 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 29 Oct 2026 16:05:27 +0700
+Subject: [PATCH 26/26] feat: a port launcher hook, an in-game stop, and audio
+ that does not crackle when the game falls behind
+
+set_port_launcher lets a port show a screen before the game when the Switch NRO starts from the homebrew menu without args.txt; request_stop ends the run at the next frame, as --frames does. Below 45 ms of queued sound the window host now repeats the last 10 ms of it, cross-faded over 2 ms, so a game running below full speed no longer leaves gaps (heard as crackles) and the pitch stays; audio_stretch()/set_audio_stretch() switch it (PS2_AUDIO_STRETCH at start). Every 5 s the log gets the queue's low point, empty batches and the stretch used.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ host/main.cpp                  |  6 ++-
+ host/window.cpp                | 75 +++++++++++++++++++++++++++++++++-
+ runtime/include/ps2/system.hpp | 13 ++++++
+ runtime/src/system.cpp         | 18 ++++++++
+ 4 files changed, 109 insertions(+), 3 deletions(-)
+
+diff --git a/host/main.cpp b/host/main.cpp
+index 19770b1..7ebc95f 100644
+--- a/host/main.cpp
++++ b/host/main.cpp
+@@ -54,7 +54,11 @@ int main(int argc, char **argv) {
+         // args.txt next to the NRO replaces the options after game.elf, one per
+         // line; NAME=value lines set environment variables (NAME= unsets one),
+         // and $DIR/ stands for the NRO's folder.
+-        if (std::FILE *f = std::fopen((dir + "args.txt").c_str(), "r")) {
++        std::FILE *f = std::fopen((dir + "args.txt").c_str(), "r");
++        if (!f) {
++            if (const ps2::PortLauncher launcher = ps2::port_launcher(); launcher && !launcher(dir.c_str())) return 0;
++        }
++        if (f) {
+             defaults.resize(2);
+             char line[512];
+             while (std::fgets(line, sizeof line, f)) {
+diff --git a/host/window.cpp b/host/window.cpp
+index 1fe910d..21bc3bb 100644
+--- a/host/window.cpp
++++ b/host/window.cpp
+@@ -341,9 +341,80 @@ void on_vblank() {
+     pace();
+ }
+ 
++// When emulation runs below full speed the game makes sound slower than the
++// device plays it, the queue runs dry and each gap is heard as a crackle.
++// Below 45 ms queued (pace() keeps a full-speed game at 60-90) the sound is
++// lengthened, up to twice as long as the queue empties, by playing short stretches of it again: the last 10 ms are
++// repeated, cross-faded over 2 ms where the repeat begins, so the pitch stays
++// as it is (resampling instead lowered it as much). The last 2 ms are held
++// back each time so the next repeat can fade into them. PS2_AUDIO_STRETCH=0
++// (or the in-game menu) turns it off. Every 5 s the log gets the queue's low
++// point and average, the batches that found it empty and the stretch used.
++struct AudioStats {
++    std::uint32_t batches = 0, starved = 0;
++    double queued_sum = 0, in_frames = 0, out_frames = 0;
++    Uint32 queued_min = ~0u;
++    std::uint64_t since = 0;
++};
++AudioStats g_audio_stats;
++std::vector<std::int16_t> g_audio_work;     // stereo frames not yet queued (the held-back tail)
++std::vector<std::int16_t> g_audio_history;  // the last kGrain frames produced, queued or not
++double g_audio_owed = 0;                    // frames to add by repeating
++
++constexpr std::size_t kGrain = 480, kFade = 96;  // 10 ms and 2 ms at 48 kHz
++
+ void queue_audio(const std::int16_t *samples, std::size_t frames) {
+-    if (SDL_GetQueuedAudioSize(g_audio) > 500 * kAudioBytesPerMs) return;
+-    SDL_QueueAudio(g_audio, samples, static_cast<Uint32>(frames * 4));
++    const bool stretch = ps2::audio_stretch();
++    const Uint32 queued = SDL_GetQueuedAudioSize(g_audio) / kAudioBytesPerMs;
++    AudioStats &a = g_audio_stats;
++    ++a.batches;
++    a.starved += queued == 0;
++    a.queued_sum += queued;
++    a.queued_min = std::min(a.queued_min, queued);
++    const std::uint64_t now = SDL_GetTicks64();
++    if (!a.since) a.since = now;
++    if (now - a.since >= 5000) {
++        std::fprintf(stderr, "[audio] queue low %u ms, average %.0f ms; %u of %u batches found it empty; stretch %.3f\n", a.queued_min,
++                     a.queued_sum / a.batches, a.starved, a.batches, a.in_frames ? a.out_frames / a.in_frames : 1.0);
++        a = AudioStats{};
++        a.since = now;
++    }
++    if (queued > 500) return;
++    std::vector<std::int16_t> &w = g_audio_work;
++    w.insert(w.end(), samples, samples + frames * 2);
++    a.in_frames += static_cast<double>(frames);
++    // pace() keeps a full-speed game at 60-90 ms queued; below 45 ms the game
++    // is behind and the shortfall is made up, more the emptier the queue.
++    if (stretch && queued < 45) g_audio_owed += static_cast<double>(frames) * (45.0 - queued) / 45.0;
++    if (!stretch) g_audio_owed = 0;
++    // Repeat the last grain while enough is owed. The grain comes from the
++    // history (most of it is already queued); the repeat starts by fading
++    // the held-back tail into the grain's start, then plays the rest of it,
++    // which ends where the sound had got to, so new input follows on.
++    std::vector<std::int16_t> &h = g_audio_history;
++    h.insert(h.end(), samples, samples + frames * 2);
++    if (h.size() > kGrain * 2) h.erase(h.begin(), h.end() - static_cast<std::ptrdiff_t>(kGrain * 2));
++    while (g_audio_owed >= static_cast<double>(kGrain - kFade) && h.size() == kGrain * 2 && w.size() / 2 >= kFade) {
++        const std::size_t frames_now = w.size() / 2;
++        for (std::size_t i = 0; i < kFade; ++i) {
++            const double t = (static_cast<double>(i) + 0.5) / kFade;
++            for (int c = 0; c < 2; ++c) {
++                std::int16_t &tail = w[(frames_now - kFade + i) * 2 + c];
++                tail = static_cast<std::int16_t>(tail * (1.0 - t) + h[i * 2 + c] * t);
++            }
++        }
++        w.insert(w.end(), h.begin() + kFade * 2, h.end());
++        g_audio_owed -= static_cast<double>(kGrain - kFade);
++    }
++    if (g_audio_owed > kGrain * 4) g_audio_owed = kGrain * 4;
++    // Queue all but the held-back tail.
++    const std::size_t hold = std::min<std::size_t>(kFade, w.size() / 2);
++    const std::size_t ready = w.size() / 2 - hold;
++    if (ready) {
++        SDL_QueueAudio(g_audio, w.data(), static_cast<Uint32>(ready * 4));
++        a.out_frames += static_cast<double>(ready);
++        w.erase(w.begin(), w.begin() + static_cast<std::ptrdiff_t>(ready * 2));
++    }
+ }
+ 
+ }
+diff --git a/runtime/include/ps2/system.hpp b/runtime/include/ps2/system.hpp
+index e86d88e..60778dd 100644
+--- a/runtime/include/ps2/system.hpp
++++ b/runtime/include/ps2/system.hpp
+@@ -141,6 +141,19 @@ void set_pad_axis(int axis, std::uint8_t value, int pad = 0);
+ void set_pad_pressure(int button, std::uint8_t value, int pad = 0);
+ void set_pad_connected(int pad, bool connected);
+ std::uint16_t pad_rumble(int pad = 0);
++// A port's screen before the game starts (the Switch NRO from the homebrew
++// menu without args.txt): it may set the environment, and returns false when
++// the player quits. Set at static init, like set_external_gs.
++using PortLauncher = bool (*)(const char *nro_dir);
++// Ends the run at the next frame, the way --frames does (an in-game "quit").
++void request_stop();
++// Whether the host stretches sound when emulation falls behind (window.cpp);
++// PS2_AUDIO_STRETCH sets it at start, a port's menu may change it later.
++bool audio_stretch();
++void set_audio_stretch(bool on);
++void set_port_launcher(PortLauncher launcher);
++PortLauncher port_launcher();
++
+ void set_audio_sink(std::function<void(const std::int16_t *samples, std::size_t frames)> sink);
+ 
+ }
+diff --git a/runtime/src/system.cpp b/runtime/src/system.cpp
+index eda27fd..ced9d90 100644
+--- a/runtime/src/system.cpp
++++ b/runtime/src/system.cpp
+@@ -676,6 +676,24 @@ void set_pad_axis(int axis, std::uint8_t value, int pad) { iop::sio2::set_axis(p
+ void set_pad_pressure(int button, std::uint8_t value, int pad) { iop::sio2::set_pressure(pad, button, value); }
+ void set_pad_connected(int pad, bool connected) { iop::sio2::set_connected(pad, connected); }
+ std::uint16_t pad_rumble(int pad) { return iop::sio2::rumble(pad); }
++namespace {
++PortLauncher g_port_launcher = nullptr;
++std::atomic<int> g_audio_stretch{-1};  // -1: not read from the environment yet
++}
++void request_stop() { g_options.max_frames = g_frames + 1; }
++bool audio_stretch() {
++    int v = g_audio_stretch.load();
++    if (v < 0) {
++        const char *e = std::getenv("PS2_AUDIO_STRETCH");
++        v = !e || std::atoi(e) != 0;
++        g_audio_stretch.store(v);
++    }
++    return v != 0;
++}
++void set_audio_stretch(bool on) { g_audio_stretch.store(on ? 1 : 0); }
++void set_port_launcher(PortLauncher launcher) { g_port_launcher = launcher; }
++PortLauncher port_launcher() { return g_port_launcher; }
++
+ void set_audio_sink(std::function<void(const std::int16_t *, std::size_t)> sink) { iop::spu2::set_sink(std::move(sink)); }
+ 
+ }
+-- 
+2.54.0 (Apple Git-157)
+

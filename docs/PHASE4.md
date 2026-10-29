@@ -200,6 +200,19 @@ GL renderer (PCSX2-style) is the way to full speed.
   - A blur on knockdowns seen in the cycling run came from one of the other settings.
 
   The runner now closes the GS before it exits (engine patch 0025), because Mesa's glthread worker alive at exit crashed hbl.
+- **For players (2026-10-29).**
+  - **Launcher.** Started from the homebrew menu (without args.txt), the NRO opens a settings screen first. The rows:
+    - Performance preset (clocks through Horizon OC's hoc:clk, or sys-clk's sys:clk);
+    - Resolution, native to 3x;
+    - Screen filter: off, smooth, or sharp (the default; smooth looked soft on an OLED);
+    - Blending;
+    - Audio stretching;
+    - FPS counter.
+  - **In-game menu.** L3+R3 pauses the game and shows the same rows over the last frame, drawn with PCSX2's ImGui overlay. Quit there ends the game and gives the clocks back.
+  - **Saving.** Choices are kept in `launcher.ini`.
+  - **Resolution cost.** 2x costs next to nothing in a normal battle, since the GPU had room.
+  - **Audio stretching** (engine patch 0026). The host repeats 10 ms grains of sound when the queue runs low, so the pitch stays. Empty-queue batches went from tens or hundreds per 5 s to mostly none.
+  - **Open:** frame drops on some big jutsu (Tsunade) even at Fast with 2x. The log now has the VU thread's busy share every 5 s to tell a VU-bound drop from a GPU-bound one. Also open: a purple flash in Master Mode's forest, possibly minimum blending.
 - **Next limit: the VU thread**, now ~100% busy running the 39 compiled VU1
   programs (0 interpreted) and VIF unpack; the GS thread waits on it ~28%
   of the time. Hottest: flag computation (`vuops::flags`) and DIV/SQRT via
