@@ -180,6 +180,32 @@ private:
 	void SendHWDraw(const GSHWDrawConfig& config, bool one_barrier, bool full_barrier);
 
 	void RenderImGui();
+	void TraceTransfer(const char* op, const GSTextureDK* a, const GSTextureDK* b, const GSVector4i& r, u64 addr, u32 pitch);
+	void DumpTransferTrace();
+	struct TransferTrace
+	{
+		const char* op = nullptr;
+		dk::BatchId batch = 0;
+		GSVector2i a, b;
+		GSVector4i r;
+		u64 addr = 0;
+		u32 pitch = 0;
+	};
+	std::array<TransferTrace, 32> m_transfer_trace{};
+	struct DrawTrace
+	{
+		dk::BatchId batch = 0;
+		u32 kind = 0; // 1 indexed, 2 plain, 3 expanded
+		u32 count = 0, vertices = 0;
+		u64 vtx = 0, idx = 0;
+		u32 slots[NUM_TEXTURE_UNITS] = {};
+		GSVector2i target;
+	};
+	std::array<DrawTrace, 16> m_draw_trace{};
+	size_t m_draw_trace_next = 0;
+	void TraceDraw(u32 kind, u32 count);
+	size_t m_transfer_trace_next = 0;
+	bool m_dumped_trace = false;
 	void SelfTest();
 	void OrientationProbe();
 

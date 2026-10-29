@@ -40,6 +40,9 @@ namespace dk
 		// The batch being recorded now; whatever it uses is safe to reuse once
 		// IsComplete() says so.
 		BatchId CurrentBatch() const { return m_current_batch; }
+		bool InErrorState() const { return m_reported_error; }
+		// Called once when the queue is first found in an error state.
+		std::function<void()> on_error;
 		bool IsComplete(BatchId id);
 		void WaitFor(BatchId id);
 

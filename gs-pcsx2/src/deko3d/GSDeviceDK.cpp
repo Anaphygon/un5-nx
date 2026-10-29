@@ -134,6 +134,7 @@ bool GSDeviceDK::Create(GSVSyncMode vsync_mode, bool allow_present_throttle)
 		return false;
 	}
 	m_name = "deko3d";
+	m_ctx.on_error = [this]() { DumpTransferTrace(); };
 
 	// What GSDeviceOGL::CheckFeatures arrives at on the Switch's Mesa, so the
 	// shaders come out the same.
@@ -1200,8 +1201,72 @@ void GSDeviceDK::CommitClear(GSTexture* t)
 	SetScissor(saved_scissor);
 }
 
-void GSDeviceDK::CopyBufferToTexture(GSTextureDK* t, int level, const GSVector4i& r, DkGpuAddr src, u32 pitch)
+// The last transfers, printed when the GPU reports an error, to name the one
+// that faulted.
+void GSDeviceDK::TraceTransfer(const char* op, const GSTextureDK* a, const GSTextureDK* b, const GSVector4i& r, u64 addr, u32 pitch)
 {
+	TransferTrace& t = m_transfer_trace[m_transfer_trace_next++ % m_transfer_trace.size()];
+	t = TransferTrace{op, m_ctx.CurrentBatch(), a ? a->GetSize() : GSVector2i(0, 0), b ? b->GetSize() : GSVector2i(0, 0), r, addr, pitch};
+}
+
+void GSDeviceDK::TraceDraw(u32 kind, u32 count)
+{
+	DrawTrace& d = m_draw_trace[m_draw_trace_next++ % m_draw_trace.size()];
+	d.batch = m_ctx.CurrentBatch();
+	d.kind = kind;
+	d.count = count;
+	d.vertices = m_vertex.count;
+	d.vtx = m_vertex.addr;
+	d.idx = m_index.addr;
+	for (u32 i = 0; i < NUM_TEXTURE_UNITS; i++)
+		d.slots[i] = m_textures[i] ? m_textures[i]->Descriptor() : 0;
+	d.target = m_current_rt ? m_current_rt->GetSize() : (m_current_ds ? m_current_ds->GetSize() : GSVector2i(-1, -1));
+}
+
+void GSDeviceDK::DumpTransferTrace()
+{
+	Console.Error("deko3d: the last draws, oldest first:");
+	for (size_t i = 0; i < m_draw_trace.size(); i++)
+	{
+		const DrawTrace& d = m_draw_trace[(m_draw_trace_next + i) % m_draw_trace.size()];
+		if (!d.kind)
+			continue;
+		Console.Error("  batch %llu %s %u (of %u vertices at 0x%llx, indices 0x%llx) into %dx%d, slots %u %u %u %u %u",
+			static_cast<unsigned long long>(d.batch), d.kind == 1 ? "indexed" : d.kind == 2 ? "plain" : "expanded", d.count, d.vertices,
+			static_cast<unsigned long long>(d.vtx), static_cast<unsigned long long>(d.idx), d.target.x, d.target.y, d.slots[0], d.slots[1],
+			d.slots[2], d.slots[3], d.slots[4]);
+	}
+	Console.Error("deko3d: the last transfers, oldest first:");
+	for (size_t i = 0; i < m_transfer_trace.size(); i++)
+	{
+		const TransferTrace& t = m_transfer_trace[(m_transfer_trace_next + i) % m_transfer_trace.size()];
+		if (!t.op)
+			continue;
+		Console.Error("  batch %llu %s: %dx%d -> %dx%d rect (%d,%d)-(%d,%d) buffer 0x%llx pitch %u", static_cast<unsigned long long>(t.batch), t.op,
+			t.a.x, t.a.y, t.b.x, t.b.y, t.r.x, t.r.y, t.r.z, t.r.w, static_cast<unsigned long long>(t.addr), t.pitch);
+	}
+	std::fflush(stderr);
+}
+
+// A rectangle a copy engine can take: inside the image level, not empty.
+static bool ClipToLevel(const GSTextureDK* t, int level, GSVector4i* r)
+{
+	const GSVector4i bounds(0, 0, std::max(1, t->GetWidth() >> level), std::max(1, t->GetHeight() >> level));
+	*r = r->rintersect(bounds);
+	return !r->rempty();
+}
+
+void GSDeviceDK::CopyBufferToTexture(GSTextureDK* t, int level, const GSVector4i& r_in, DkGpuAddr src, u32 pitch)
+{
+	GSVector4i r = r_in;
+	if (!r.eq(r.rintersect(GSVector4i(0, 0, std::max(1, t->GetWidth() >> level), std::max(1, t->GetHeight() >> level)))) || r.rempty())
+	{
+		// Clipping an upload would need the source moved too; skip and say so.
+		Console.Warning("deko3d: upload (%d,%d)-(%d,%d) does not fit a %dx%d texture level %d; skipped", r.x, r.y, r.z, r.w,
+			t->GetWidth(), t->GetHeight(), level);
+		return;
+	}
+	TraceTransfer("upload", nullptr, t, r, src, pitch);
 	BeforeTransfer(nullptr, t);
 	// DkCopyBuf's row length is in bytes.
 	const DkCopyBuf buf = {src, pitch, 0};
@@ -1211,8 +1276,12 @@ void GSDeviceDK::CopyBufferToTexture(GSTextureDK* t, int level, const GSVector4i
 	AfterTransfer(t);
 }
 
-void GSDeviceDK::CopyTextureToBuffer(GSTextureDK* t, int level, const GSVector4i& r, DkGpuAddr dst, u32 pitch)
+void GSDeviceDK::CopyTextureToBuffer(GSTextureDK* t, int level, const GSVector4i& r_in, DkGpuAddr dst, u32 pitch)
 {
+	GSVector4i r = r_in;
+	if (!ClipToLevel(t, level, &r))
+		return;
+	TraceTransfer("readback", t, nullptr, r, dst, pitch);
 	BeforeTransfer(t, nullptr);
 	const DkCopyBuf buf = {dst, pitch, 0};
 	const DkImageView view = t->LevelView(level);
@@ -1274,6 +1343,7 @@ void GSDeviceDK::CopyRect(GSTexture* sTex, GSTexture* dTex, const GSVector4i& r_
 	}
 	else
 	{
+		TraceTransfer("copy", S, D, r, (static_cast<u64>(destX) << 32) | destY, 0);
 		BeforeTransfer(S, D);
 		const DkImageView src = S->LevelView(0);
 		const DkImageView dst = D->LevelView(0);
@@ -1321,6 +1391,7 @@ void GSDeviceDK::VSSetPushConstants(u32 base_vertex, u32 base_index)
 void GSDeviceDK::DrawPrimitive()
 {
 	g_perfmon.Put(GSPerfMon::DrawCalls, 1);
+	TraceDraw(2, m_vertex.count);
 	const DkCmdBuf cmd = m_ctx.Cmd();
 	dkCmdBufBindVtxBuffer(cmd, 0, m_vertex.addr, m_vertex.count * m_vertex.stride);
 	dkCmdBufDraw(cmd, m_topology, m_vertex.count, 1, 0, 0);
@@ -1329,6 +1400,7 @@ void GSDeviceDK::DrawPrimitive()
 void GSDeviceDK::DrawIndexedPrimitive(int offset, int count)
 {
 	g_perfmon.Put(GSPerfMon::DrawCalls, 1);
+	TraceDraw(1, static_cast<u32>(count));
 	const DkCmdBuf cmd = m_ctx.Cmd();
 	dkCmdBufBindVtxBuffer(cmd, 0, m_vertex.addr, m_vertex.count * m_vertex.stride);
 	dkCmdBufBindIdxBuffer(cmd, DkIdxFormat_Uint16, m_index.addr);
@@ -1342,6 +1414,7 @@ void GSDeviceDK::Draw(const GSHWDrawConfig& config, int offset, int count)
 	{
 		// The vertex shader reads vertices (and indices) from storage buffers.
 		g_perfmon.Put(GSPerfMon::DrawCalls, 1);
+		TraceDraw(3, static_cast<u32>(count));
 		const bool vs_indexing = config.vs.UseVSExpandIndexBuffer();
 		VSSetPushConstants(0, vs_indexing ? static_cast<u32>(offset) : 0);
 		FlushState();
@@ -2044,6 +2117,12 @@ void GSDeviceDK::EndPresent()
 	Common::Timer swap;
 	const dk::BatchId frame = m_ctx.CurrentBatch();
 	m_ctx.Submit();
+	if (m_ctx.InErrorState())
+	{
+		Console.Error("deko3d: stopping after a GPU error (see above)");
+		std::fflush(stderr);
+		std::abort();
+	}
 	dkQueuePresentImage(m_ctx.Queue(), m_swapchain, m_swap_slot);
 	g_un5_swap_ms += swap.GetTimeMilliseconds();
 

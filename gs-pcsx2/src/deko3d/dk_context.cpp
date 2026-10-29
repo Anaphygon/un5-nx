@@ -325,6 +325,9 @@ namespace dk
 		{
 			m_reported_error = true;
 			Console.Error("deko3d: the GPU queue is in an error state after batch %llu", static_cast<unsigned long long>(m_current_batch));
+			if (on_error)
+				on_error();
+			std::fflush(stderr);
 		}
 		m_fence_batch[idx] = m_current_batch;
 		if (trace)
