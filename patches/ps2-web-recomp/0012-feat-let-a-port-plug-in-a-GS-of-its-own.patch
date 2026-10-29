@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Tue, 27 Oct 2026 22:12:19 +0700
-Subject: [PATCH 12/17] feat: let a port plug in a GS of its own
+Subject: [PATCH 12/20] feat: let a port plug in a GS of its own
 
 ps2/external_gs.hpp: a port registers a GS (such as a hardware renderer) with set_external_gs before the window opens. The runtime then hands it raw GIF packets from gif::render, mirrors privileged register writes into its register block (CSR through write_csr), calls vsync for each presented field, reads GS-to-host transfers from it, opens it in place of its own GPU device, and the window host leaves the screen to it (SDL for sound and pads only). PS2_EXTRA_SOURCES and PS2_EXTRA_LIBRARIES link such a GS into ps2run. Without one, nothing changes: a UN5 battle replay gives byte-identical frames.
 

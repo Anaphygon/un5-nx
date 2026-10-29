@@ -41,6 +41,9 @@ unsigned un5_clock_mhz(int which);
 // From ps2-web-recomp's host/switch_threads.cpp: the core for threads
 // created from now on (-1: libnx's default).
 extern "C" void ps2_switch_new_thread_core(int core);
+// ... and moves the last thread placed that way (glthread's worker).
+extern "C" bool ps2_switch_move_placed_thread(int core);
+int s_glthread_core = 1;
 #endif
 
 namespace {
@@ -121,7 +124,16 @@ void log_draw_split(u32 fields, double gs_ms)
 	g_un5_swap_ms = 0.0;
 	g_un5_gpu_behind = g_un5_presents = 0;
 #ifdef __SWITCH__
-	Console.WriteLn("[clocks] cpu %u gpu %u mem %u MHz", un5_clock_mhz(0), un5_clock_mhz(1), un5_clock_mhz(2));
+	Console.WriteLn("[clocks] cpu %u gpu %u mem %u MHz; glthread worker on core %d", un5_clock_mhz(0), un5_clock_mhz(1),
+		un5_clock_mhz(2), s_glthread_core);
+	// UN5_GLTHREAD_CYCLE=1: move the worker to the next core every 5 s, to
+	// compare cores within one run.
+	if (const char* cycle = std::getenv("UN5_GLTHREAD_CYCLE"); cycle && std::atoi(cycle))
+	{
+		const int next = (s_glthread_core + 1) % 3;
+		if (ps2_switch_move_placed_thread(next))
+			s_glthread_core = next;
+	}
 #endif
 	static std::uint64_t s_interpreted = 0;
 	const std::uint64_t interpreted = ps2::vu1_interpreted_calls();
@@ -202,10 +214,13 @@ bool open()
 	g_gs_device = std::make_unique<GSDeviceOGL>();
 	const char* vsync = std::getenv("UN5GS_VSYNC");
 #ifdef __SWITCH__
-	// glthread's worker starts with the context: off the render thread's
-	// core 0. UN5_GLTHREAD_CORE picks another (0-2).
+	// glthread's worker starts with the context, on core 1 with the emulation
+	// thread, which waits often: measured 2026-10-29, cores 0 and 1 gave ~38
+	// fps in battle, core 2 (the busy VU thread's) ~32. UN5_GLTHREAD_CORE
+	// picks another (0-2).
 	const char* gl_core = std::getenv("UN5_GLTHREAD_CORE");
-	ps2_switch_new_thread_core(gl_core ? std::clamp(std::atoi(gl_core), 0, 2) : 2);
+	s_glthread_core = gl_core ? std::clamp(std::atoi(gl_core), 0, 2) : 1;
+	ps2_switch_new_thread_core(s_glthread_core);
 #endif
 	const bool created = g_gs_device->Create(vsync && std::atoi(vsync) ? GSVSyncMode::FIFO : GSVSyncMode::Disabled, false);
 #ifdef __SWITCH__

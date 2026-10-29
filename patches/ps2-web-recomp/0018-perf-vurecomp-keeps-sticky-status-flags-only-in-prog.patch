@@ -1,0 +1,120 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 29 Oct 2026 13:14:10 +0700
+Subject: [PATCH 18/20] perf: vurecomp keeps sticky status flags only in
+ programs that read them
+
+A single status read (FSAND, FSEQ, FSOR, FSSET) used to make every flag-setting op of its program compute flags, for the sticky bits. Status is now live exactly where MAC is unless the program reads a sticky bit, or some program reads one it did not set first. In UN5 four programs test sticky sign (FSAND 0x80), each after clearing it with FSSET, so the other programs drop to MAC liveness.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ recomp/vurecomp.cpp | 58 ++++++++++++++++++++++++++++++++++++++++-----
+ 1 file changed, 52 insertions(+), 6 deletions(-)
+
+diff --git a/recomp/vurecomp.cpp b/recomp/vurecomp.cpp
+index a68401f..c0464f8 100644
+--- a/recomp/vurecomp.cpp
++++ b/recomp/vurecomp.cpp
+@@ -284,6 +284,9 @@ struct Lower {
+     std::string code;
+     int writes = -1;
+     bool reads_flags = false, reads_status = false;
++    // Reads a sticky status bit (6-11): those collect every flag-setting op
++    // since they were last cleared, in this program or an earlier one.
++    bool reads_sticky = false;
+     bool branch = false, jump = false;
+     std::uint32_t target = 0;
+     bool supported = true;
+@@ -424,10 +427,18 @@ Lower lower(std::uint32_t w, std::uint32_t pc) {
+     case 0x11: c = std::format("r.clip = {}u; fl.set_clip(r.clip, fl.t - 4u); ", w & 0xFFFFFFu); break;
+     case 0x12: c = std::format("set_vi(r, 1, (fl.clip() & {}u) ? 1u : 0u); ", w & 0xFFFFFFu); break;
+     case 0x13: c = std::format("set_vi(r, 1, ((fl.clip() | {}u) & 0xFFFFFFu) == 0xFFFFFFu ? 1u : 0u); ", w & 0xFFFFFFu); break;
+-    case 0x14: c = std::format("set_vi(r, {}, (fl.status() & 0xFFFu) == {}u ? 1u : 0u); ", it, imm12); l.reads_flags = l.reads_status = true; break;
++    case 0x14: c = std::format("set_vi(r, {}, (fl.status() & 0xFFFu) == {}u ? 1u : 0u); ", it, imm12); l.reads_flags = l.reads_status = l.reads_sticky = true; break;
+     case 0x15: c = std::format("r.status = (fl.status() & 0x3Fu) | ({}u & 0xFC0u); fl.force_mac(r.mac, r.status); ", imm12); l.reads_flags = l.reads_status = true; break;
+-    case 0x16: c = std::format("set_vi(r, {}, fl.status() & {}u); ", it, imm12); l.reads_flags = l.reads_status = true; break;
+-    case 0x17: c = std::format("set_vi(r, {}, ((fl.status() | {}u) & 0xFFFu) == 0xFFFu ? 1u : 0u); ", it, imm12); l.reads_flags = l.reads_status = true; break;
++    case 0x16:
++        c = std::format("set_vi(r, {}, fl.status() & {}u); ", it, imm12);
++        l.reads_flags = l.reads_status = true;
++        l.reads_sticky = (imm12 & 0xFC0u) != 0;
++        break;
++    case 0x17:
++        c = std::format("set_vi(r, {}, ((fl.status() | {}u) & 0xFFFu) == 0xFFFu ? 1u : 0u); ", it, imm12);
++        l.reads_flags = l.reads_status = true;
++        l.reads_sticky = (~imm12 & 0xFC0u) != 0;
++        break;
+     case 0x18: c = std::format("set_vi(r, {}, (fl.mac() & 0xFFFFu) == r.vi[{}] ? 1u : 0u); ", it, is); l.reads_flags = true; break;
+     case 0x1A: c = std::format("set_vi(r, {}, fl.mac() & r.vi[{}]); ", it, is); l.reads_flags = true; break;
+     case 0x1B: c = std::format("set_vi(r, {}, ((fl.mac() | r.vi[{}]) & 0xFFFFu) == 0xFFFFu ? 1u : 0u); ", it, is); l.reads_flags = true; break;
+@@ -482,7 +493,29 @@ int vi_written(const std::string &code) {
+     return std::atoi(code.c_str() + at + 10);
+ }
+ 
+-std::string generate(const Program &p, std::string &name) {
++// How a program uses the sticky status bits (6-11), which collect every
++// flag-setting op since they were last cleared.
++struct StickyUse {
++    bool reads = false;   // FSEQ, or FSAND/FSOR selecting a sticky bit
++    bool clears = false;  // FSSET, which sets them from its immediate
++};
++
++StickyUse sticky_use(const Program &p) {
++    StickyUse u;
++    for (std::uint32_t pc : ps2::vu::reachable(p.code.data(), kMask, p.entry)) {
++        const std::uint32_t lo = word(p.code, pc), hi = word(p.code, pc + 4);
++        if (hi & 0x80000000u) continue;
++        u.reads = u.reads || lower(lo, pc).reads_sticky;
++        u.clears = u.clears || (lo >> 25) == 0x15;
++    }
++    return u;
++}
++
++// sticky_live: this program reads a sticky bit, or some program reads one
++// without setting it first (so it may see ops from earlier programs). Then
++// every flag-setting op computes flags as soon as status is read at all.
++// Otherwise status is live exactly where MAC is: same pipeline delay.
++std::string generate(const Program &p, std::string &name, bool sticky_live) {
+     const std::vector<std::uint32_t> pcs = ps2::vu::reachable(p.code.data(), kMask, p.entry);
+     std::set<std::uint32_t> in(pcs.begin(), pcs.end());
+     std::map<std::uint32_t, Lower> lowers;
+@@ -573,7 +606,7 @@ std::string generate(const Program &p, std::string &name) {
+         const std::uint32_t lo = word(p.code, pc), hi = word(p.code, pc + 4);
+         bool out_live = false;
+         for (std::int64_t s : successors(pc)) out_live = out_live || s < 0 || !in.count(static_cast<std::uint32_t>(s)) || live_in[static_cast<std::uint32_t>(s)];
+-        const Upper u = upper(hi, any_status ? true : (any_flags && out_live));
++        const Upper u = upper(hi, (any_status && sticky_live) ? true : (any_flags && out_live));
+         const Lower &l = lowers[pc];
+         std::string body;
+         if (keep_bk.count(pc)) body += std::format("next_bk = r.vi[{}]; ", def[pc]);
+@@ -675,13 +708,26 @@ int main(int argc, char **argv) {
+     fs::create_directories(out_dir);
+     for (const auto &e : fs::directory_iterator(out_dir))
+         if (e.path().filename().string().rfind("vu1_", 0) == 0) fs::remove(e.path());
++    // UN5: four programs clear the sticky bits with FSSET and later test sticky
++    // sign (FSAND 0x80); none reads one it did not clear.
++    std::vector<bool> sticky_reader(programs.size());
++    bool inherited = false;
++    std::size_t readers = 0;
++    for (std::size_t i = 0; i < programs.size(); ++i) {
++        const StickyUse u = sticky_use(programs[i]);
++        sticky_reader[i] = u.reads;
++        readers += u.reads;
++        inherited = inherited || (u.reads && !u.clears);
++    }
++    std::printf("sticky status bits: %zu programs read them%s\n", readers,
++                inherited ? ", some without setting them first: kept in every program" : ", each after setting them");
+     const std::size_t per_file = 16;
+     std::vector<std::string> names;
+     for (std::size_t first = 0; first < programs.size(); first += per_file) {
+         std::string text = "#include \"ps2/vu_ops.hpp\"\n\nnamespace gen {\n\nusing namespace ps2;\nusing namespace ps2::vuops;\n\n";
+         for (std::size_t i = first; i < std::min(programs.size(), first + per_file); ++i) {
+             std::string name;
+-            text += generate(programs[i], name);
++            text += generate(programs[i], name, inherited || sticky_reader[i]);
+             names.push_back(name);
+         }
+         text += "}\n";
+-- 
+2.54.0 (Apple Git-157)
+

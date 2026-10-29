@@ -175,6 +175,13 @@ GL renderer (PCSX2-style) is the way to full speed.
   on cores (render 0, emulation 1, VU and glthread 2). nouveau's per-draw
   constant cache flush, priced by switching it on and off within a run,
   made no difference and is left alone.
+- **Cores and VU (2026-10-29, later).** Moving glthread's worker between
+  cores every 5 s within one run: core 2 (with the busy VU thread) ~32 fps,
+  cores 0 and 1 ~38; it now starts on core 1. Engine patches 0018-0019 cut
+  VU flag work (sticky status kept only in the 4 programs that read it,
+  flags built from all lanes at once) and do DIV/SQRT in single precision
+  with an exact round-toward-zero fix-up (same bits; the Mac replay stays
+  byte-identical): about +1 fps. Battle now **~38 fps**, sometimes 41.
 - **Next limit: the VU thread**, now ~100% busy running the 39 compiled VU1
   programs (0 interpreted) and VIF unpack; the GS thread waits on it ~28%
   of the time. Hottest: flag computation (`vuops::flags`) and DIV/SQRT via
