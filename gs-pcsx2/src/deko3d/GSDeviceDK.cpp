@@ -900,7 +900,7 @@ void GSDeviceDK::Barrier(DkBarrier mode)
 
 void GSDeviceDK::TextureBarrier()
 {
-	Barrier(DkBarrier_Fragments);
+	Barrier(m_transfers_since_barrier ? DkBarrier_Full : DkBarrier_Fragments);
 }
 
 void GSDeviceDK::BeforeTransfer(GSTextureDK* src, GSTextureDK* dst)
@@ -973,8 +973,11 @@ void GSDeviceDK::FlushState()
 		if (t && ((m_transfers_since_barrier && t->m_last_write == m_epoch) || (t->m_last_read == m_epoch && !IsBoundTextureUnit(t))))
 			hazard = true;
 	}
+	// A copy or upload since the last barrier ran on a copy engine, which a
+	// fragments barrier does not wait for: an effect copied into a texture then
+	// read the old contents and stayed on screen (ultimates, on hardware).
 	if (hazard)
-		Barrier(DkBarrier_Fragments);
+		Barrier(m_transfers_since_barrier ? DkBarrier_Full : DkBarrier_Fragments);
 	for (GSTextureDK* t : m_textures)
 	{
 		if (t)
