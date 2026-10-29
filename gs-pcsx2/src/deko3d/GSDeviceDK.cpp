@@ -25,6 +25,12 @@ NWindow* nwindowGetDefault(void);
 u32 nwindowSetSwapInterval(NWindow* nw, u32 swap_interval);
 }
 
+// uam, devkitPro's deko3d shader compiler, built into the NRO as a library
+// (third_party_src/uam, every symbol but this one prefixed so it cannot clash
+// with Mesa's own copy of the same GLSL compiler).
+// Runs it on a thread with a large stack (uam_thread.cpp).
+bool un5_uam_compile_big_stack(int stage, const char* glsl, const char* out_path);
+
 // Counters for the port's speed log (defined next to the OpenGL device).
 extern double g_un5_render_ms, g_un5_swap_ms, g_un5_program_ms;
 extern u64 g_un5_gpu_behind, g_un5_presents;
@@ -408,7 +414,28 @@ const DkShader* GSDeviceDK::GetShader(DkStage stage, const std::string& source)
 	if (const DkShader* shader = LoadPackedShader(hash))
 		return shader;
 
-	// Not in the pack: keep the source for the next one and skip the draw.
+	// Not in the pack: compile it here, once, into the pack. Sources with
+	// uniforms outside a block (only the fixed shaders, which the pack built on
+	// the Mac always has) need tools/dk_shaders.py's rewrite and are left out.
+	if (!HasLooseUniforms(source))
+	{
+		Common::Timer timer;
+		const std::string path = fmt::format("{}/{:016x}.dksh", kPackDir, hash);
+		const bool built = un5_uam_compile_big_stack(static_cast<int>(stage), source.c_str(), path.c_str());
+		const double ms = timer.GetTimeMilliseconds();
+		g_un5_program_ms += ms;
+		if (built)
+		{
+			if (const DkShader* shader = LoadPackedShader(hash))
+			{
+				Console.WriteLn("deko3d: compiled shader %016llx on the console in %.0f ms", static_cast<unsigned long long>(hash), ms);
+				return shader;
+			}
+		}
+		Console.Warning("deko3d: compiling shader %016llx on the console failed", static_cast<unsigned long long>(hash));
+	}
+
+	// Not built: keep the source for the Mac (tools/dk_sync.sh) and skip the draw.
 	m_missing_shaders.emplace(hash, true);
 	const std::string missing = fmt::format("{}/{:016x}.{}", kMissingDir, hash, stage == DkStage_Vertex ? "vert" : "frag");
 	if (std::FILE* f = std::fopen(missing.c_str(), "wb"))
@@ -418,6 +445,25 @@ const DkShader* GSDeviceDK::GetShader(DkStage stage, const std::string& source)
 	}
 	Console.Warning("deko3d: shader %016llx is not in the pack", static_cast<unsigned long long>(hash));
 	return nullptr;
+}
+
+bool GSDeviceDK::HasLooseUniforms(const std::string& source)
+{
+	size_t pos = 0;
+	while ((pos = source.find("uniform ", pos)) != std::string::npos)
+	{
+		const size_t line_start = source.rfind('\n', pos);
+		const size_t start = (line_start == std::string::npos) ? 0 : line_start + 1;
+		const size_t end = source.find_first_of(";{\n", pos);
+		const std::string_view prefix(source.data() + start, pos - start);
+		const bool at_line_start = prefix.find_first_not_of(" \t") == std::string_view::npos;
+		const std::string_view decl(source.data() + pos, (end == std::string::npos ? source.size() : end) - pos);
+		if (at_line_start && end != std::string::npos && source[end] == ';' && decl.find("sampler") == std::string_view::npos &&
+			decl.find("image") == std::string_view::npos)
+			return true;
+		pos += 8;
+	}
+	return false;
 }
 
 const DkShader* GSDeviceDK::LoadPackedShader(u64 hash)

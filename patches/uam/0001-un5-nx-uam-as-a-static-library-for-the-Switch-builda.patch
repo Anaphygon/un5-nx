@@ -1,0 +1,110 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 29 Oct 2026 18:57:00 +0700
+Subject: [PATCH] un5-nx: uam as a static library for the Switch, buildable
+ with bison 2.3
+
+---
+ mesa-imported/glsl/glcpp/glcpp-parse.y |  4 ++--
+ mesa-imported/glsl/glsl_parser.yy      |  4 ++--
+ meson.build                            | 21 +++++++++++++++------
+ source/meson.build                     |  2 +-
+ source/un5_uam.cpp                     | 14 ++++++++++++++
+ 5 files changed, 34 insertions(+), 11 deletions(-)
+ create mode 100644 source/un5_uam.cpp
+
+diff --git a/mesa-imported/glsl/glcpp/glcpp-parse.y b/mesa-imported/glsl/glcpp/glcpp-parse.y
+index b179d31..6093ec4 100644
+--- a/mesa-imported/glsl/glcpp/glcpp-parse.y
++++ b/mesa-imported/glsl/glcpp/glcpp-parse.y
+@@ -154,8 +154,8 @@ add_builtin_define(glcpp_parser_t *parser, const char *name, int value);
+ 
+ %}
+ 
+-%define api.pure // fincs-edit
+-%define parse.error verbose // fincs-edit
++%pure-parser /* un5-nx: bison 2.3 */
++%error-verbose /* un5-nx: bison 2.3 */
+ 
+ %locations
+ %initial-action {
+diff --git a/mesa-imported/glsl/glsl_parser.yy b/mesa-imported/glsl/glsl_parser.yy
+index 36e1697..695dde9 100644
+--- a/mesa-imported/glsl/glsl_parser.yy
++++ b/mesa-imported/glsl/glsl_parser.yy
+@@ -80,8 +80,8 @@ static bool match_layout_qualifier(const char *s1, const char *s2,
+ 
+ %expect 0
+ 
+-%define api.pure // fincs-edit
+-%define parse.error verbose // fincs-edit
++%pure-parser // un5-nx: bison 2.3 on macOS (was %define api.pure)
++%error-verbose // un5-nx: bison 2.3 (was %define parse.error verbose)
+ 
+ %locations
+ %initial-action {
+diff --git a/meson.build b/meson.build
+index 1486cbc..0f26ca5 100644
+--- a/meson.build
++++ b/meson.build
+@@ -78,9 +78,18 @@ uam_incs = []
+ subdir('source')
+ subdir('mesa-imported')
+ 
+-uam = executable(
+-	'uam',
+-	uam_files,
+-	include_directories: uam_incs,
+-	install: true,
+-)
++if host_machine.system() == 'horizon'
++	# un5-nx: a static library for the Switch (no main), with un5_uam_compile().
++	uam = static_library(
++		'uam',
++		uam_files,
++		include_directories: uam_incs,
++	)
++else
++	uam = executable(
++		'uam',
++		uam_files,
++		include_directories: uam_incs,
++		install: true,
++	)
++endif
+diff --git a/source/meson.build b/source/meson.build
+index ea60677..2afc8a4 100644
+--- a/source/meson.build
++++ b/source/meson.build
+@@ -2,7 +2,7 @@
+ uam_files += files(
+ 	'compiler_iface.cpp',
+ 	'glsl_frontend.cpp',
+-	'main.cpp',
++	'un5_uam.cpp',
+ 	'mini-os.c',
+ 	'tgsi_support.cpp',
+ )
+diff --git a/source/un5_uam.cpp b/source/un5_uam.cpp
+new file mode 100644
+index 0000000..db6c32c
+--- /dev/null
++++ b/source/un5_uam.cpp
+@@ -0,0 +1,14 @@
++// un5-nx: uam as a library for the Switch. Compiles one GLSL stage into a DKSH
++// file, so the deko3d renderer can build a shader its pack lacks on the console.
++#include "compiler_iface.h"
++
++extern "C" bool un5_uam_compile(int stage, const char* glsl, const char* out_path)
++{
++	if (stage < 0 || stage > pipeline_stage_compute)
++		return false;
++	DekoCompiler compiler{static_cast<pipeline_stage>(stage)};
++	if (!compiler.CompileGlsl(glsl))
++		return false;
++	compiler.OutputDksh(out_path);
++	return true;
++}
+-- 
+2.54.0 (Apple Git-157)
+
