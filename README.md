@@ -142,7 +142,7 @@ tests pass), ready to send upstream:
 
 <table>
   <tr>
-    <td align="center"><a href="https://github.com/Lisvindanu"><img src="https://github.com/Lisvindanu.png?size=100" width="100" alt="Lisvindanu"/><br/><b>Lisvindanu</b></a><br/>Project manager and product owner: direction, priorities, and the go/no-go at each phase gate</td>
+    <td align="center"><a href="https://github.com/Anaphygon"><img src="https://github.com/Anaphygon.png?size=100" width="100" alt="Anaphygon"/><br/><b>Anaphygon</b></a><br/>Project manager and product owner: direction, priorities, and the go/no-go at each phase gate</td>
     <td align="center"><a href="https://github.com/claude"><img src="https://github.com/claude.png?size=100" width="100" alt="claude"/><br/><b>Claude (Anthropic)</b></a><br/>Executor: research, reverse engineering, tooling, builds and documentation</td>
   </tr>
 </table>
