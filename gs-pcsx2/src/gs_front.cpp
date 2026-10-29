@@ -38,6 +38,7 @@ extern u64 g_un5_gpu_behind, g_un5_presents;
 #ifdef __SWITCH__
 // From switch_clocks.cpp.
 unsigned un5_clock_mhz(int which);
+unsigned un5_measured_cpu_mhz();
 // From ps2-web-recomp's host/switch_threads.cpp: the core for threads
 // created from now on (-1: libnx's default).
 extern "C" void ps2_switch_new_thread_core(int core);
@@ -124,8 +125,8 @@ void log_draw_split(u32 fields, double gs_ms)
 	g_un5_swap_ms = 0.0;
 	g_un5_gpu_behind = g_un5_presents = 0;
 #ifdef __SWITCH__
-	Console.WriteLn("[clocks] cpu %u gpu %u mem %u MHz; glthread worker on core %d", un5_clock_mhz(0), un5_clock_mhz(1),
-		un5_clock_mhz(2), s_glthread_core);
+	Console.WriteLn("[clocks] cpu %u (measured %u) gpu %u mem %u MHz; glthread worker on core %d", un5_clock_mhz(0),
+		un5_measured_cpu_mhz(), un5_clock_mhz(1), un5_clock_mhz(2), s_glthread_core);
 	// UN5_GLTHREAD_CYCLE=1: move the worker to the next core every 5 s, to
 	// compare cores within one run.
 	if (const char* cycle = std::getenv("UN5_GLTHREAD_CYCLE"); cycle && std::atoi(cycle))

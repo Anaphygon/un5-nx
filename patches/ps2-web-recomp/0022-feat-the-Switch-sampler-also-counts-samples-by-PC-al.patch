@@ -1,0 +1,82 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 29 Oct 2026 13:49:47 +0700
+Subject: [PATCH 22/22] feat: the Switch sampler also counts samples by PC
+ alone
+
+A second table keyed by thread and PC gives a line-level profile (addr2line -i on the hottest PCs), which the per-stack table could not: the VU thread's samples spread over thousands of distinct stacks.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ host/switch_sampler.cpp | 34 ++++++++++++++++++++++++++++++++++
+ 1 file changed, 34 insertions(+)
+
+diff --git a/host/switch_sampler.cpp b/host/switch_sampler.cpp
+index 4d97ba6..ee5a602 100644
+--- a/host/switch_sampler.cpp
++++ b/host/switch_sampler.cpp
+@@ -46,6 +46,12 @@ std::mutex g_lock;
+ Known g_threads[kMaxThreads];
+ int g_count = 0;
+ Slot g_table[kTable];
++// Samples by PC alone, for a line-level profile of the hottest code.
++struct Leaf {
++    std::uint32_t thread, count;
++    std::uintptr_t pc;
++};
++Leaf g_leaves[kTable];
+ std::uint64_t g_dropped = 0;
+ Thread g_sampler;
+ bool g_running = false;
+@@ -85,6 +91,20 @@ void record(std::uint32_t thread, const std::uintptr_t (&frames)[kFrames]) {
+     ++g_dropped;
+ }
+ 
++void record_leaf(std::uint32_t thread, std::uintptr_t pc) {
++    for (std::size_t i = 0, at = ((pc >> 2) * 0x9E3779B97F4A7C15ull + thread) & (kTable - 1); i < 64; ++i, at = (at + 1) & (kTable - 1)) {
++        Leaf &l = g_leaves[at];
++        if (!l.thread) {
++            l.thread = thread;
++            l.pc = pc;
++        }
++        if (l.thread == thread && l.pc == pc) {
++            ++l.count;
++            return;
++        }
++    }
++}
++
+ void sample(int index, Known &t) {
+     if (R_FAILED(svcSetThreadActivity(t.handle, ThreadActivity_Paused))) {
+         t.dead = true;
+@@ -114,6 +134,7 @@ void sample(int index, Known &t) {
+     if (R_FAILED(rc)) return;
+     ++t.samples;
+     record(static_cast<std::uint32_t>(index + 1), frames);
++    record_leaf(static_cast<std::uint32_t>(index + 1), frames[0]);
+ }
+ 
+ void run(void *arg) {
+@@ -176,6 +197,19 @@ void report() {
+             if (++shown == 300) break;
+         }
+     }
++    std::vector<const Leaf *> leaves;
++    for (const Leaf &l : g_leaves)
++        if (l.thread) leaves.push_back(&l);
++    std::sort(leaves.begin(), leaves.end(), [](const Leaf *a, const Leaf *b) { return a->count > b->count; });
++    for (int i = 0; i < g_count; ++i) {
++        int shown = 0;
++        for (const Leaf *l : leaves) {
++            if (l->thread != static_cast<std::uint32_t>(i + 1)) continue;
++            out("[sampler-pc] thread %d %5.2f%% %#lx\n", i, 100.0 * l->count / static_cast<double>(g_threads[i].samples),
++                static_cast<unsigned long>(l->pc));
++            if (++shown == 400) break;
++        }
++    }
+     std::fwrite(g_out.data(), 1, g_out.size(), stderr);
+     std::fflush(stderr);
+     g_out.clear();
+-- 
+2.54.0 (Apple Git-157)
+

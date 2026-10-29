@@ -1,0 +1,186 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 29 Oct 2026 13:38:15 +0700
+Subject: [PATCH 21/22] feat: PS2_VU_PROFILE splits the VU thread's time
+
+Every 5 s the VU thread prints how long it was busy and idle, the time spent in compiled VU1 programs (with XGKICK apart) and in VIF unpack, and the twelve programs that took longest with their call counts. Read on first use, since args.txt sets the environment after static init.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ runtime/src/system.cpp   | 14 ++++++++-
+ runtime/src/vif.cpp      | 13 ++++++++
+ runtime/src/vu_micro.cpp | 64 +++++++++++++++++++++++++++++++++++++++-
+ runtime/src/vu_micro.hpp |  5 ++++
+ 4 files changed, 94 insertions(+), 2 deletions(-)
+
+diff --git a/runtime/src/system.cpp b/runtime/src/system.cpp
+index 9db3929..eda27fd 100644
+--- a/runtime/src/system.cpp
++++ b/runtime/src/system.cpp
+@@ -545,7 +545,19 @@ void run_vu_thread() {
+         }
+         const auto start = std::chrono::steady_clock::now();
+         in.wait_for_work(50);
+-        g_vu_idle_ms.store(g_vu_idle_ms.load() + std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
++        const double idle = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
++        g_vu_idle_ms.store(g_vu_idle_ms.load() + idle);
++        if (vu::profiling()) {
++            static auto since = std::chrono::steady_clock::now();
++            static double idle_since = 0;
++            idle_since += idle;
++            const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - since).count();
++            if (ms >= 5000) {
++                vu::report_profile(ms - idle_since, idle_since, ms / 1000);
++                since = std::chrono::steady_clock::now();
++                idle_since = 0;
++            }
++        }
+     }
+ }
+ void post_present() { gs::post_present(); }
+diff --git a/runtime/src/vif.cpp b/runtime/src/vif.cpp
+index 00cfdd7..b5a6f95 100644
+--- a/runtime/src/vif.cpp
++++ b/runtime/src/vif.cpp
+@@ -8,6 +8,7 @@
+ 
+ #include "ps2/state.hpp"
+ 
++#include <chrono>
+ #include <cstdio>
+ #include <cstring>
+ #include <vector>
+@@ -123,7 +124,19 @@ constexpr FastUnpack kFastUnpack[4][4][2] = {
+     {{fast_pair<16>(1, false), fast_pair<16>(1, true)}, {fast_pair<16>(2, false), fast_pair<16>(2, true)}, {fast_pair<16>(3, false), fast_pair<16>(3, true)}, {fast_pair<16>(4, false), fast_pair<16>(4, true)}},
+ };
+ 
++void unpack_body(int unit, std::uint32_t cmd, const std::uint32_t *data);
++
+ void unpack(int unit, std::uint32_t cmd, const std::uint32_t *data) {
++    if (!vu::profiling() || !on_vu_thread()) {  // the VU thread's share only
++        unpack_body(unit, cmd, data);
++        return;
++    }
++    const auto t = std::chrono::steady_clock::now();
++    unpack_body(unit, cmd, data);
++    vu::add_unpack_time(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t).count());
++}
++
++void unpack_body(int unit, std::uint32_t cmd, const std::uint32_t *data) {
+     Unit &u = state(unit);
+     const bool dry = shadow(unit);
+     if (dry && u.mode != 2) {
+diff --git a/runtime/src/vu_micro.cpp b/runtime/src/vu_micro.cpp
+index fb1a090..6000376 100644
+--- a/runtime/src/vu_micro.cpp
++++ b/runtime/src/vu_micro.cpp
+@@ -12,6 +12,10 @@
+ #include "ps2/state.hpp"
+ 
+ #include <atomic>
++#include <vector>
++#include <format>
++#include <chrono>
++#include <algorithm>
+ #include <cmath>
+ #include <cstdio>
+ #include <cstdlib>
+@@ -710,6 +714,36 @@ void run_fast(int n, std::uint32_t address);
+ 
+ std::unordered_map<std::uint64_t, ProgramFn> g_programs;
+ 
++// PS2_VU_PROFILE: where the VU thread's time goes, printed every 5 s: time
++// in each compiled VU1 program (by key), in XGKICK and in VIF unpack (the
++// latter added by vif.cpp through add_unpack_time).
++// Read on first use: args.txt sets the environment after static init.
++bool profile_on() {
++    static const bool on = std::getenv("PS2_VU_PROFILE") != nullptr;
++    return on;
++}
++struct ProgramStat {
++    std::uint64_t calls = 0;
++    double ms = 0;
++};
++std::unordered_map<ProgramFn, ProgramStat> g_program_stats;
++double g_kick_ms = 0, g_unpack_ms = 0;
++using Clock = std::chrono::steady_clock;
++
++double ms_since(Clock::time_point t) { return std::chrono::duration<double, std::milli>(Clock::now() - t).count(); }
++
++void run_profiled(ProgramFn fn) {
++    if (!profile_on()) {
++        fn(g_vu1, g_vu1_mem);
++        return;
++    }
++    const auto t = Clock::now();
++    fn(g_vu1, g_vu1_mem);
++    ProgramStat &s = g_program_stats[fn];
++    ++s.calls;
++    s.ms += ms_since(t);
++}
++
+ struct Candidate {
+     std::vector<std::uint32_t> runs;
+     std::vector<std::uint8_t> code;
+@@ -775,7 +809,35 @@ void register_programs(const Program *programs, std::uint32_t count) {
+ void kick(int unit, std::uint32_t address) {
+     if (g_kick_log && unit == 1) g_kick_log->push_back(address);
+     Unit u = unit_of(unit);
++    if (!profile_on()) {
++        xgkick(u, address);
++        return;
++    }
++    const auto t = Clock::now();
+     xgkick(u, address);
++    g_kick_ms += ms_since(t);
++}
++
++void add_unpack_time(double ms) { g_unpack_ms += ms; }
++bool profiling() { return profile_on(); }
++
++void report_profile(double busy_ms, double idle_ms, double seconds) {
++    std::vector<std::pair<ProgramFn, ProgramStat>> v(g_program_stats.begin(), g_program_stats.end());
++    std::sort(v.begin(), v.end(), [](const auto &a, const auto &b) { return a.second.ms > b.second.ms; });
++    double programs = 0;
++    for (const auto &[fn, s] : v) programs += s.ms;
++    std::string line = std::format("[vu-profile] {:.1f} s: VU thread busy {:.0f} ms, idle {:.0f} ms; VU1 programs {:.0f} ms "
++                                   "(of it XGKICK {:.0f}), VIF unpack {:.0f} ms; top programs:",
++                                   seconds, busy_ms, idle_ms, programs, g_kick_ms, g_unpack_ms);
++    for (std::size_t i = 0; i < v.size() && i < 12; ++i) {
++        std::uint64_t key = 0;
++        for (const auto &[k, f] : g_programs)
++            if (f == v[i].first) key = k;
++        line += std::format(" {:016X} {:.0f}ms/{}", key, v[i].second.ms, v[i].second.calls);
++    }
++    std::fprintf(stderr, "%s\n", line.c_str());
++    g_program_stats.clear();
++    g_kick_ms = g_unpack_ms = 0;
+ }
+ 
+ std::uint32_t top() { return g_top; }
+@@ -922,7 +984,7 @@ void run_entry(int unit, std::uint32_t pc) {
+                 return;
+             }
+             if (jit && jit != fn && ++sampled % 32 == 0) check_jit(fn, jit);
+-            else fn(g_vu1, g_vu1_mem);
++            else run_profiled(fn);
+             return;
+         }
+     }
+diff --git a/runtime/src/vu_micro.hpp b/runtime/src/vu_micro.hpp
+index 2b853a1..5091377 100644
+--- a/runtime/src/vu_micro.hpp
++++ b/runtime/src/vu_micro.hpp
+@@ -20,4 +20,9 @@ void code_changed(int unit);
+ Vu0Regs &regs(int unit);
+ std::uint64_t interpreted_calls();
+ 
++// PS2_VU_PROFILE (see vu_micro.cpp): timing of the VU thread's work.
++bool profiling();
++void add_unpack_time(double ms);
++void report_profile(double busy_ms, double idle_ms, double seconds);
++
+ }
+-- 
+2.54.0 (Apple Git-157)
+

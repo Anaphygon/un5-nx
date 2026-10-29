@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Tue, 27 Oct 2026 15:50:48 +0700
-Subject: [PATCH 06/20] feat: build a Nintendo Switch NRO with the software GS
+Subject: [PATCH 06/22] feat: build a Nintendo Switch NRO with the software GS
 
 With devkitPro's CMake toolchain the runner now builds as an NRO: wgpu-native has no Switch build, so the GS renders in software; GCC (devkitA64) gets fallbacks for clang's __builtin_elementwise_min and __builtin_reduce_or; getrusage and /proc are skipped; and launched from the homebrew menu with no arguments it takes game.elf, disc.iso and memcard.ps2 from its own folder, logging to ps2run.log there. devkitA64's GCC 16 honours [[clang::musttail]], which the generated code relies on.
 

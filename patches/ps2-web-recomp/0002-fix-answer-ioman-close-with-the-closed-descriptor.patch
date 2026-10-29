@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Tue, 27 Oct 2026 11:37:56 +0700
-Subject: [PATCH 02/20] fix: answer ioman close with the closed descriptor
+Subject: [PATCH 02/22] fix: answer ioman close with the closed descriptor
 
 UN5's SNDBASE compares close's result with the descriptor it passed and retries until they match, printing "file close error!", so every sound file it read hung its loader and the game in Master Mode and battles.
 
