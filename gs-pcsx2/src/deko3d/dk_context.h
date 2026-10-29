@@ -72,7 +72,9 @@ namespace dk
 
 		// Memory for images: one block per image, rounded to the block alignment.
 		// The tag names it in the log when the GPU faults inside it.
-		DkMemBlock AllocImageMemory(u32 size, std::string tag);
+		// An image may need a larger alignment than a block's 4 KB; *offset is
+		// where in the block it starts.
+		DkMemBlock AllocImageMemory(u32 size, u32 alignment, std::string tag, u32* offset);
 		// Destroys a block once the current batch is complete.
 		void FreeBlock(DkMemBlock block);
 		// Every block made, live or freed, by GPU address; logs the ones that

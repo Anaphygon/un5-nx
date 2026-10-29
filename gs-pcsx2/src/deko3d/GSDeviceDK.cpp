@@ -170,10 +170,11 @@ bool GSDeviceDK::Create(GSVSyncMode vsync_mode, bool allow_present_throttle)
 		std::array<const DkImage*, NUM_SWAPCHAIN_IMAGES> images;
 		for (u32 i = 0; i < NUM_SWAPCHAIN_IMAGES; i++)
 		{
-			m_swap_memory[i] = m_ctx.AllocImageMemory(size, fmt::format("swapchain image {}", i));
+			u32 offset = 0;
+			m_swap_memory[i] = m_ctx.AllocImageMemory(size, dkImageLayoutGetAlignment(&layout), fmt::format("swapchain image {}", i), &offset);
 			if (!m_swap_memory[i])
 				return false;
-			dkImageInitialize(&m_swap_images[i], &layout, m_swap_memory[i], 0);
+			dkImageInitialize(&m_swap_images[i], &layout, m_swap_memory[i], offset);
 			images[i] = &m_swap_images[i];
 		}
 		DkSwapchainMaker swap_maker;
@@ -1237,8 +1238,13 @@ void GSDeviceDK::GenerateMipmaps(GSTextureDK* t)
 	}
 }
 
-void GSDeviceDK::CopyRect(GSTexture* sTex, GSTexture* dTex, const GSVector4i& r, u32 destX, u32 destY)
+void GSDeviceDK::CopyRect(GSTexture* sTex, GSTexture* dTex, const GSVector4i& r_in, u32 destX, u32 destY)
 {
+	// OpenGL clips a copy to both images; the copy engines read whatever the
+	// rectangle says, past the image's memory too.
+	GSVector4i r = r_in.rintersect(GSVector4i::loadh(sTex->GetSize()));
+	r.z = std::min(r.z, r.x + std::max(0, dTex->GetWidth() - static_cast<int>(destX)));
+	r.w = std::min(r.w, r.y + std::max(0, dTex->GetHeight() - static_cast<int>(destY)));
 	if (r.rempty())
 		return;
 	GSTextureDK* const S = static_cast<GSTextureDK*>(sTex);
@@ -1829,6 +1835,16 @@ void GSDeviceDK::RenderHW(GSHWDrawConfig& config)
 	{
 		SetVertexLayout(LAYOUT_NONE);
 		m_index.count = config.nindices;
+		if (config.nindices > EXPAND_BUFFER_SIZE / sizeof(u16))
+		{
+			// More than the fixed buffer holds: the GPU would read past it.
+			static bool s_warned = false;
+			if (!s_warned)
+				Console.Error("deko3d: %u expanded indices, more than the %u the buffer holds; draw cut", config.nindices,
+					static_cast<u32>(EXPAND_BUFFER_SIZE / sizeof(u16)));
+			s_warned = true;
+			m_index.count = EXPAND_BUFFER_SIZE / sizeof(u16);
+		}
 	}
 	else if (config.vs.UseVSExpandIndexBuffer())
 	{

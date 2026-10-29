@@ -80,14 +80,15 @@ GSTextureDK::GSTextureDK(Usage usage, int width, int height, int levels, Format 
 	dkImageLayoutInitialize(&m_layout, &maker);
 
 	const u32 size = static_cast<u32>(dkImageLayoutGetSize(&m_layout));
-	m_memory = ctx.AllocImageMemory(size, fmt::format("a {}x{} texture (format {}, usage {})", m_size.x, m_size.y,
-		static_cast<int>(format), static_cast<int>(usage)));
+	u32 offset = 0;
+	m_memory = ctx.AllocImageMemory(size, dkImageLayoutGetAlignment(&m_layout),
+		fmt::format("a {}x{} texture (format {}, usage {})", m_size.x, m_size.y, static_cast<int>(format), static_cast<int>(usage)), &offset);
 	if (!m_memory)
 	{
 		Console.Error("deko3d: failed to allocate %u bytes for a %dx%d texture", size, m_size.x, m_size.y);
 		return;
 	}
-	dkImageInitialize(&m_image, &m_layout, m_memory, 0);
+	dkImageInitialize(&m_image, &m_layout, m_memory, offset);
 
 	dkImageViewDefaults(&m_view, &m_image);
 	if (format == Format::UNorm8)

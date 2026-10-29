@@ -95,7 +95,25 @@ namespace dk
 			}
 		}
 		if (!any)
+		{
 			Console.Error("deko3d: fault address 0x%llx is in no block the device made", static_cast<unsigned long long>(addr));
+			// The nearest blocks on either side: a read past an end shows here.
+			const BlockInfo* below = nullptr;
+			const BlockInfo* above = nullptr;
+			for (const BlockInfo& b : m_blocks)
+			{
+				if (b.gpu + b.size <= addr && (!below || b.gpu > below->gpu))
+					below = &b;
+				if (b.gpu > addr && (!above || b.gpu < above->gpu))
+					above = &b;
+			}
+			if (below)
+				Console.Error("deko3d: block below: %s, ends 0x%llx before it (%s)", below->tag.c_str(),
+					static_cast<unsigned long long>(addr - (below->gpu + below->size)), below->freed ? "freed" : "live");
+			if (above)
+				Console.Error("deko3d: block above: %s, starts 0x%llx after it (%s)", above->tag.c_str(),
+					static_cast<unsigned long long>(above->gpu - addr), above->freed ? "freed" : "live");
+		}
 		std::fflush(stderr);
 	}
 
@@ -435,9 +453,18 @@ namespace dk
 		m_deferred.emplace_back(m_current_batch, std::move(fn));
 	}
 
-	DkMemBlock Context::AllocImageMemory(u32 size, std::string tag)
+	DkMemBlock Context::AllocImageMemory(u32 size, u32 alignment, std::string tag, u32* offset)
 	{
-		DkMemBlock block = MakeBlock(m_device, size, DkMemBlockFlags_GpuCached | DkMemBlockFlags_Image);
+		const u32 extra = alignment > DK_MEMBLOCK_ALIGNMENT ? alignment : 0;
+		DkMemBlock block = MakeBlock(m_device, size + extra, DkMemBlockFlags_GpuCached | DkMemBlockFlags_Image);
+		*offset = 0;
+		if (!block)
+			return nullptr;
+		if (extra)
+		{
+			const u64 gpu = dkMemBlockGetGpuAddr(block);
+			*offset = static_cast<u32>(((gpu + alignment - 1) & ~static_cast<u64>(alignment - 1)) - gpu);
+		}
 		Track(block, std::move(tag));
 		return block;
 	}
