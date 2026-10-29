@@ -10,6 +10,9 @@
 #include "GS/GSState.h"
 #include "GS/Renderers/HW/GSRendererHW.h"
 #include "GS/Renderers/OpenGL/GSDeviceOGL.h"
+#ifdef __SWITCH__
+#include "deko3d/GSDeviceDK.h"
+#endif
 #include "common/Console.h"
 #include "common/Timer.h"
 #include "fmt/format.h"
@@ -54,6 +57,8 @@ extern "C" void ps2_switch_new_thread_core(int core);
 // ... and moves the last thread placed that way (glthread's worker).
 extern "C" bool ps2_switch_move_placed_thread(int core);
 int s_glthread_core = 1;
+// The device in use is deko3d (UN5GS_RENDERER=dk), not OpenGL.
+bool s_deko3d = false;
 #endif
 
 namespace {
@@ -335,7 +340,15 @@ bool open()
 	apply_environment();
 	EmuConfig.CurrentAspectRatio = AspectRatioType::R4_3;
 	EmuConfig.CurrentCustomAspectRatio = 0.0f;
-	g_gs_device = std::make_unique<GSDeviceOGL>();
+#ifdef __SWITCH__
+	// UN5GS_RENDERER=dk draws with deko3d (src/deko3d/) instead of OpenGL.
+	const char* renderer = std::getenv("UN5GS_RENDERER");
+	s_deko3d = renderer && std::strcmp(renderer, "dk") == 0;
+	if (s_deko3d)
+		g_gs_device = std::make_unique<GSDeviceDK>();
+	else
+#endif
+		g_gs_device = std::make_unique<GSDeviceOGL>();
 	const char* vsync = std::getenv("UN5GS_VSYNC");
 #ifdef __SWITCH__
 	// glthread's worker starts with the context, on core 1 with the emulation
@@ -352,7 +365,7 @@ bool open()
 #endif
 	if (!created)
 	{
-		Console.Error("un5gs: the OpenGL GS device could not be created");
+		Console.Error("un5gs: the %s GS device could not be created", s_deko3d ? "deko3d" : "OpenGL");
 		g_gs_device.reset();
 		return false;
 	}

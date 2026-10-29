@@ -14,9 +14,10 @@ struct Un5Settings
 	bool min_blending = true;
 	bool audio_stretch = true;
 	bool show_fps = false;
+	bool deko3d = false; // draw with deko3d instead of OpenGL (takes effect at start)
 };
 
-enum Un5Row { kRowPreset, kRowUpscale, kRowFilter, kRowBlending, kRowAudio, kRowFps, kSettingRows };
+enum Un5Row { kRowPreset, kRowUpscale, kRowFilter, kRowBlending, kRowAudio, kRowFps, kRowRenderer, kSettingRows };
 
 struct Un5RowText
 {

@@ -110,15 +110,15 @@ namespace
 		for (int r = 0; r < kSettingRows; ++r)
 		{
 			const Un5RowText t = un5_row_text(s, r, true);
-			const float y = 146.0f + r * 70.0f;
+			const float y = 140.0f + r * 61.0f;
 			const bool sel = r == selected;
-			c.dl->AddRectFilled(c.at(140, y), c.at(1140, y + 62), sel ? tile_sel : tile);
+			c.dl->AddRectFilled(c.at(140, y), c.at(1140, y + 55), sel ? tile_sel : tile);
 			if (sel)
-				frame(140, y, 1000, 62);
-			c.text(170, y + 7, 21, sel ? cyan : fg, t.label);
+				frame(140, y, 1000, 55);
+			c.text(170, y + 5, 20, sel ? cyan : fg, t.label);
 			const std::string v = "<  " + t.value + "  >";
-			c.text(1110 - c.width(21, v.c_str()), y + 7, 21, fg, v.c_str());
-			c.text(170, y + 37, 16, muted, t.note.c_str());
+			c.text(1110 - c.width(20, v.c_str()), y + 5, 20, fg, v.c_str());
+			c.text(170, y + 32, 15, muted, t.note.c_str());
 		}
 		const auto button = [&](int index, float x, float w, const char* label, ImU32 fill) {
 			const bool sel = index == selected;

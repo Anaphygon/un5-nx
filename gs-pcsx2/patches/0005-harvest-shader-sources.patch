@@ -1,0 +1,17 @@
+--- a/pcsx2/GS/Renderers/OpenGL/GLShaderCache.cpp
++++ b/pcsx2/GS/Renderers/OpenGL/GLShaderCache.cpp
+@@ -280,10 +280,14 @@
+ 		~ProgramTime() { g_un5_program_ms += timer.GetTimeMilliseconds(); }
+ 	};
+ } // namespace
++
++// un5-nx: keeps every program's sources for the deko3d shader pack.
++void un5_shader_harvest(std::string_view vertex_shader, std::string_view fragment_shader);
+ 
+ std::optional<GLProgram> GLShaderCache::GetProgram(
+ 	const std::string_view vertex_shader, const std::string_view fragment_shader, const PreLinkCallback& callback)
+ {
++	un5_shader_harvest(vertex_shader, fragment_shader);
+ 	ProgramTime timed;
+ 	if (!m_program_binary_supported || !m_blob_file)
+ 	{

@@ -27,6 +27,11 @@ file(GLOB GS_RENDERERS
 list(FILTER GS_RENDERERS EXCLUDE REGEX "GSTextureReplacement|GSRendererHWMultiISA")
 
 file(GLOB GS_GLUE "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp")
+# The deko3d device (src/deko3d/), Switch only.
+if(NINTENDO_SWITCH OR CMAKE_SYSTEM_NAME STREQUAL "NintendoSwitch" OR DEFINED ENV{DEVKITPRO})
+  file(GLOB GS_DEKO3D "${CMAKE_CURRENT_SOURCE_DIR}/src/deko3d/*.cpp")
+  list(APPEND GS_GLUE ${GS_DEKO3D})
+endif()
 # PCSX2's common library, without what needs a desktop (HTTP, crash handler,
 # YAML, image codecs) and with the Switch's DynamicLibrary in src/.
 set(COMMON "${PCSX2_SRC}/common")
@@ -49,7 +54,7 @@ find_path(SWITCH_EGL_INCLUDE EGL/eglplatform.h REQUIRED)
 find_path(SWITCH_FREETYPE_INCLUDE ft2build.h PATH_SUFFIXES freetype2 REQUIRED)
 target_include_directories(pcsx2gs PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include")
 target_include_directories(pcsx2gs PRIVATE
-    "${CMAKE_CURRENT_SOURCE_DIR}/shim" "${SWITCH_EGL_INCLUDE}" "${SWITCH_FREETYPE_INCLUDE}"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src" "${CMAKE_CURRENT_SOURCE_DIR}/shim" "${SWITCH_EGL_INCLUDE}" "${SWITCH_FREETYPE_INCLUDE}"
     "${PCSX2_SRC}" "${PCSX2_SRC}/pcsx2" "${GS}"
     "${PCSX2_SRC}/3rdparty/fmt/include" "${PCSX2_SRC}/3rdparty/glad/include" "${PCSX2_SRC}/3rdparty/include" "${PCSX2_SRC}/3rdparty/fast_float/include" "${PCSX2_SRC}/3rdparty/imgui/include")
 target_compile_definitions(pcsx2gs PUBLIC ENABLE_OPENGL FMT_HEADER_ONLY)
