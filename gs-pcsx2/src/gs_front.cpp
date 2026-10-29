@@ -73,6 +73,8 @@ alignas(16) u8 s_privileged[0x2000];
 //                   sharp filter costs ~6 ms a frame at native, next to nothing at 2x)
 //   UN5GS_FILTER    screen filter: 0 off (sharp pixels), 1 smooth (PCSX2's
 //                   default, soft on an OLED), 2 sharp bilinear (default 2)
+//   UN5GS_HPO       half-pixel offset 0 off .. 5 (default 2, from PCSX2's game database)
+//   UN5GS_NATIVE_SCALING  native scaling 0 off .. 4 (default 2, from the game database)
 //   UN5GS_VSYNC     wait for the display's vertical blank when presenting (default 0:
 //                   the runner already paces frames, and the Switch shows 60 Hz to a
 //                   50 Hz game, so waiting stalls the render thread)
@@ -91,9 +93,17 @@ void apply_environment()
 		std::clamp(number("UN5GS_DOWNLOAD", static_cast<int>(GSConfig.HWDownloadMode)), 0, 4));
 	GSConfig.UpscaleMultiplier = static_cast<float>(std::clamp(number("UN5GS_UPSCALE", 2), 1, 3));
 	GSConfig.LinearPresent = static_cast<GSPostBilinearMode>(std::clamp(number("UN5GS_FILTER", 2), 0, 2));
-	Console.WriteLn("un5gs: texture preloading %d, blending %d, mipmap %d, dithering %d, download %d, upscale %.0fx, filter %d",
+	// PCSX2's game database fixes for SLES-55605, which matter once the game is
+	// upscaled: without them its full-screen effects (hit flashes, smoke) come
+	// out in horizontal stripes. Half-pixel offset "Special", native scaling
+	// "Aggressive".
+	GSConfig.UserHacks_HalfPixelOffset = static_cast<GSHalfPixelOffset>(std::clamp(number("UN5GS_HPO", 2), 0, 5));
+	GSConfig.UserHacks_NativeScaling = static_cast<GSNativeScaling>(std::clamp(number("UN5GS_NATIVE_SCALING", 2), 0, 4));
+	Console.WriteLn("un5gs: texture preloading %d, blending %d, mipmap %d, dithering %d, download %d, upscale %.0fx, filter %d, "
+					"half-pixel offset %d, native scaling %d",
 		static_cast<int>(GSConfig.TexturePreloading), static_cast<int>(GSConfig.AccurateBlendingUnit), GSConfig.HWMipmap ? 1 : 0,
-		GSConfig.Dithering, static_cast<int>(GSConfig.HWDownloadMode), GSConfig.UpscaleMultiplier, static_cast<int>(GSConfig.LinearPresent));
+		GSConfig.Dithering, static_cast<int>(GSConfig.HWDownloadMode), GSConfig.UpscaleMultiplier, static_cast<int>(GSConfig.LinearPresent),
+		static_cast<int>(GSConfig.UserHacks_HalfPixelOffset), static_cast<int>(GSConfig.UserHacks_NativeScaling));
 }
 
 // Shader compiles, counted from PCSX2's log into the speed line.
