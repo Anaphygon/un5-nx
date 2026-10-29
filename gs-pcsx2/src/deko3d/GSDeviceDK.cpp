@@ -1426,7 +1426,11 @@ void GSDeviceDK::Draw(const GSHWDrawConfig& config, int offset, int count)
 		}
 		else
 		{
-			dkCmdBufBindIdxBuffer(cmd, DkIdxFormat_Uint16, m_expand_ib_gpu);
+			// Points and sprites use the fixed expansion indices; lines use the
+			// draw's own (as GSDeviceOGL's VAOs do). Line expansion with the
+			// fixed buffer read vertices ~4 GB past the ring and faulted the GPU.
+			const DkGpuAddr ib = config.vs.UseFixedExpandIndexBuffer() ? m_expand_ib_gpu : m_index.addr;
+			dkCmdBufBindIdxBuffer(cmd, DkIdxFormat_Uint16, ib);
 			dkCmdBufDrawIndexed(cmd, m_topology, static_cast<u32>(count), 1, static_cast<u32>(offset), 0, 0);
 		}
 	}
