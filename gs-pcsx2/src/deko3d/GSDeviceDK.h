@@ -158,6 +158,7 @@ private:
 	bool IsBoundTextureUnit(const GSTextureDK* t) const;
 
 	// Hazards between draws, copies and sampling.
+	void HazardBarrier();
 	void Barrier(DkBarrier mode);
 	void TextureBarrier();
 	void BeforeTransfer(GSTextureDK* src, GSTextureDK* dst);

@@ -63,6 +63,7 @@ bool s_deko3d = false;
 #endif
 
 extern bool g_un5_honour_scanmsk; // pcsx2 GSState.cpp (patch 0006)
+extern bool g_un5_dk_full_barrier; // deko3d/GSDeviceDK.cpp
 
 namespace {
 alignas(16) u8 s_privileged[0x2000];
@@ -114,6 +115,7 @@ void apply_environment()
 	if (std::getenv("UN5GS_NATIVE_SCALING"))
 		GSConfig.UserHacks_NativeScaling = static_cast<GSNativeScaling>(std::clamp(number("UN5GS_NATIVE_SCALING", 2), 0, 4));
 	g_un5_honour_scanmsk = number("UN5GS_SCANMSK", 0) != 0;
+	g_un5_dk_full_barrier = number("UN5DK_BARRIER", 0) != 0;
 	Console.WriteLn("un5gs: texture preloading %d, blending %d, mipmap %d, dithering %d, download %d, upscale %.0fx, filter %d, "
 					"half-pixel offset %d, native scaling %d",
 		static_cast<int>(GSConfig.TexturePreloading), static_cast<int>(GSConfig.AccurateBlendingUnit), GSConfig.HWMipmap ? 1 : 0,
@@ -326,6 +328,38 @@ void log_speed()
 		g_perfmon.GetCounter(GSPerfMon::Draw), g_perfmon.GetCounter(GSPerfMon::DrawCalls), g_perfmon.GetCounter(GSPerfMon::TextureUploads),
 		g_perfmon.GetCounter(GSPerfMon::TextureCopies), g_perfmon.GetCounter(GSPerfMon::Readbacks), g_perfmon.GetCounter(GSPerfMon::Barriers));
 	log_draw_split(s_fields, Common::Timer::ConvertValueToSeconds(s_gs_ticks) * 1000.0);
+	// UN5GS_UPSCALE_CYCLE="2,1": the internal resolution steps through the list
+	// every 10 s (as PCSX2 changes it from its settings), to compare in one run.
+	static const char* s_upscale_cycle = std::getenv("UN5GS_UPSCALE_CYCLE");
+	static u32 s_upscale_windows = 0;
+	if (s_upscale_cycle && ++s_upscale_windows % 2 == 0)
+	{
+		std::vector<int> scales;
+		for (const char* p = s_upscale_cycle; *p;)
+		{
+			scales.push_back(std::clamp(std::atoi(p), 1, 3));
+			const char* comma = std::strchr(p, ',');
+			p = comma ? comma + 1 : p + std::strlen(p);
+		}
+		const int next = scales[(s_upscale_windows / 2) % scales.size()];
+		if (next != static_cast<int>(GSConfig.UpscaleMultiplier))
+		{
+			GSConfig.UpscaleMultiplier = static_cast<float>(next);
+			g_gs_renderer->PurgeTextureCache(true, true, true);
+			g_gs_device->ClearCurrent();
+			g_gs_device->PurgePool();
+		}
+		Console.WriteLn("[gs] upscale now %dx", next);
+	}
+	// UN5DK_BARRIER_CYCLE=1: deko3d's hazard barrier alternates between
+	// fragments and full every 30 s, to compare them in one run.
+	static const bool s_barrier_cycle = std::getenv("UN5DK_BARRIER_CYCLE") != nullptr;
+	static u32 s_windows = 0;
+	if (s_barrier_cycle && ++s_windows % 6 == 0)
+	{
+		g_un5_dk_full_barrier = !g_un5_dk_full_barrier;
+		Console.WriteLn("[dk] hazard barrier now %s", g_un5_dk_full_barrier ? "full" : "fragments");
+	}
 	s_shader_compiles = 0;
 	g_un5_program_ms = 0.0;
 	s_start = now;

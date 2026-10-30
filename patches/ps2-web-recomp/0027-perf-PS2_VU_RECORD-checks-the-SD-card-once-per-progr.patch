@@ -1,0 +1,30 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 30 Oct 2026 16:10:21 +0700
+Subject: [PATCH 27/28] perf: PS2_VU_RECORD checks the SD card once per program
+
+A file check on every lookup of an untranslated program was slow on a
+console's SD card, while the game recorded new programs in play.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ runtime/src/vu_micro.cpp | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/runtime/src/vu_micro.cpp b/runtime/src/vu_micro.cpp
+index 6812322..259091a 100644
+--- a/runtime/src/vu_micro.cpp
++++ b/runtime/src/vu_micro.cpp
+@@ -1141,6 +1141,9 @@ ProgramFn lookup(std::uint32_t address) {
+             if (reported.insert(name).second) g_options.on_vu_program(name, g_vu1_code, 16384);
+             return e.function;
+         }
++        // Once per program: a file check per lookup is slow on a console's SD card.
++        static std::unordered_set<std::string> recorded;
++        if (!recorded.insert(name).second) return e.function;
+         const std::filesystem::path path = std::filesystem::path(record) / name;
+         if (!std::filesystem::exists(path)) {
+             std::filesystem::create_directories(record);
+-- 
+2.54.0 (Apple Git-157)
+

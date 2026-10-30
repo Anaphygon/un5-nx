@@ -1,0 +1,69 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 30 Oct 2026 16:10:21 +0700
+Subject: [PATCH 28/28] perf: the frame pacer lets a late game catch up
+
+pace() started over from every late frame, so the quick frames after it
+slept to a full period while the game was behind on average. Frame costs
+vary, so the EE thread slept 14% of a battle at ~40 fps while the VU and GS
+threads waited for work, and no thread was full.
+
+A late frame now keeps its debt and the next frames run without sleeping
+until the game is back on the clock; a debt of more than three frames
+(PS2_PACE_CATCH_UP) is forgiven instead. On a Switch, in the same replayed
+battle with alternating 20 s windows, the windows without catch-up ran
+39-42 fps and the ones with it ran 45-49, with the VU thread at 97-99%.
+PS2_PACE_CYCLE=1 runs that comparison.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ host/window.cpp | 30 ++++++++++++++++++++++++++----
+ 1 file changed, 26 insertions(+), 4 deletions(-)
+
+diff --git a/host/window.cpp b/host/window.cpp
+index 21bc3bb..148d637 100644
+--- a/host/window.cpp
++++ b/host/window.cpp
+@@ -270,13 +270,35 @@ void pace() {
+         else if (queued > 90) period += period / 100;
+         else if (queued < 60) period -= period / 100;
+     }
++    // g_last is when this frame is due. A late frame keeps its debt, so the
++    // quick frames after it run without sleeping until the game is back on
++    // the clock: frame costs vary, and starting over from every late frame
++    // slept on the quick ones while the VU and GS threads waited for work
++    // (a battle held near 40 fps with no thread full). A debt over three
++    // frames is forgiven instead of being run off as a burst.
+     const std::uint64_t now = SDL_GetPerformanceCounter();
+-    if (g_last && now - g_last < period) {
+-        SDL_Delay(static_cast<Uint32>((period - (now - g_last)) * 1000 / frequency));
+-        g_last += period;
+-    } else {
++    static std::uint64_t catch_up = [] {
++        const char *e = std::getenv("PS2_PACE_CATCH_UP");
++        return static_cast<std::uint64_t>(e ? std::atoi(e) : 3);
++    }();
++    // PS2_PACE_CYCLE=1: 20 s without catching up (0), 20 s with 3, and so on.
++    static const bool cycle = std::getenv("PS2_PACE_CYCLE") != nullptr;
++    static std::uint64_t cycle_start = 0;
++    if (cycle) {
++        if (!cycle_start) cycle_start = now;
++        const std::uint64_t want = ((now - cycle_start) / (frequency * 20)) % 2 ? 3 : 0;
++        if (want != catch_up) {
++            catch_up = want;
++            std::fprintf(stderr, "[pace] catching up %llu frames\n", static_cast<unsigned long long>(catch_up));
++        }
++    }
++    if (!g_last) {
+         g_last = now;
++        return;
+     }
++    g_last += period;
++    if (now < g_last) SDL_Delay(static_cast<Uint32>((g_last - now) * 1000 / frequency));
++    else if (now - g_last > catch_up * period) g_last = now;
+ }
+ 
+ double process_cpu_seconds() {
+-- 
+2.54.0 (Apple Git-157)
+

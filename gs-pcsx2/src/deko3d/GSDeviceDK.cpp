@@ -898,9 +898,21 @@ void GSDeviceDK::Barrier(DkBarrier mode)
 	g_perfmon.Put(GSPerfMon::Barriers, 1);
 }
 
+// The barrier before a draw that reads what was just written. A full one after
+// a copy or upload (b638b02) was a guess at the frame ultimates left on
+// screen; that turned out to be the game's SCANMSK (PCSX2 patch 0006), and a
+// full barrier stalls the GPU hundreds of times a frame. UN5DK_BARRIER=1
+// brings it back for comparison.
+bool g_un5_dk_full_barrier = false;
+
+void GSDeviceDK::HazardBarrier()
+{
+	Barrier(g_un5_dk_full_barrier && m_transfers_since_barrier ? DkBarrier_Full : DkBarrier_Fragments);
+}
+
 void GSDeviceDK::TextureBarrier()
 {
-	Barrier(m_transfers_since_barrier ? DkBarrier_Full : DkBarrier_Fragments);
+	HazardBarrier();
 }
 
 void GSDeviceDK::BeforeTransfer(GSTextureDK* src, GSTextureDK* dst)
@@ -973,11 +985,8 @@ void GSDeviceDK::FlushState()
 		if (t && ((m_transfers_since_barrier && t->m_last_write == m_epoch) || (t->m_last_read == m_epoch && !IsBoundTextureUnit(t))))
 			hazard = true;
 	}
-	// A copy or upload since the last barrier ran on a copy engine, which a
-	// fragments barrier does not wait for: an effect copied into a texture then
-	// read the old contents and stayed on screen (ultimates, on hardware).
 	if (hazard)
-		Barrier(m_transfers_since_barrier ? DkBarrier_Full : DkBarrier_Fragments);
+		HazardBarrier();
 	for (GSTextureDK* t : m_textures)
 	{
 		if (t)
