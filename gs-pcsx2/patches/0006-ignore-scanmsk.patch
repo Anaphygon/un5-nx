@@ -1,0 +1,27 @@
+--- a/pcsx2/GS/GSState.cpp
++++ b/pcsx2/GS/GSState.cpp
+@@ -1962,9 +1962,24 @@
+ 	m_env.TEXCLUT = r->TEXCLUT;
+ }
+ 
++// un5-nx: UN5's ultimates turn SCANMSK on (draw every other line) and the
++// game never turns it off again, so every later frame redraws half its lines
++// and the other half keep the ultimate's last picture (a stuck afterimage, or
++// black stripes once the cache is dropped), on every renderer and scale. The
++// port shows whole frames, so the mask is dropped unless g_un5_honour_scanmsk.
++bool g_un5_honour_scanmsk = false;
++
+ void GSState::GIFRegHandlerSCANMSK(const GIFReg* RESTRICT r)
+ {
++	static u32 s_last_msk = 0;
++	if (r->SCANMSK.MSK != s_last_msk)
++	{
++		Console.WriteLn("[scanmsk] game sets %u (%s)", r->SCANMSK.MSK, g_un5_honour_scanmsk ? "honoured" : "ignored");
++		s_last_msk = r->SCANMSK.MSK;
++	}
+ 	m_env.SCANMSK = r->SCANMSK;
++	if (!g_un5_honour_scanmsk)
++		m_env.SCANMSK.MSK = 0;
+ 
+ 	if (m_env.SCANMSK.MSK & 2)
+ 		m_scanmask_used = 2;

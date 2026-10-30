@@ -62,6 +62,8 @@ int s_glthread_core = 1;
 bool s_deko3d = false;
 #endif
 
+extern bool g_un5_honour_scanmsk; // pcsx2 GSState.cpp (patch 0006)
+
 namespace {
 alignas(16) u8 s_privileged[0x2000];
 
@@ -81,6 +83,9 @@ alignas(16) u8 s_privileged[0x2000];
 //                   default, soft on an OLED), 2 sharp bilinear (default 2)
 //   UN5GS_HPO       half-pixel offset 0 off .. 5 (default 2, from PCSX2's game database)
 //   UN5GS_NATIVE_SCALING  native scaling 0 off .. 4 (default 2, from the game database)
+//   UN5GS_SCANMSK   1 honours the game's SCANMSK (draw every other line); default 0
+//                   ignores it: UN5's ultimates left it set, and later frames kept
+//                   half their lines from the ultimate (a stuck afterimage, stripes)
 //   UN5GS_VSYNC     wait for the display's vertical blank when presenting (default 0:
 //                   the runner already paces frames, and the Switch shows 60 Hz to a
 //                   50 Hz game, so waiting stalls the render thread)
@@ -108,6 +113,7 @@ void apply_environment()
 		GSConfig.UserHacks_HalfPixelOffset = static_cast<GSHalfPixelOffset>(std::clamp(number("UN5GS_HPO", 2), 0, 5));
 	if (std::getenv("UN5GS_NATIVE_SCALING"))
 		GSConfig.UserHacks_NativeScaling = static_cast<GSNativeScaling>(std::clamp(number("UN5GS_NATIVE_SCALING", 2), 0, 4));
+	g_un5_honour_scanmsk = number("UN5GS_SCANMSK", 0) != 0;
 	Console.WriteLn("un5gs: texture preloading %d, blending %d, mipmap %d, dithering %d, download %d, upscale %.0fx, filter %d, "
 					"half-pixel offset %d, native scaling %d",
 		static_cast<int>(GSConfig.TexturePreloading), static_cast<int>(GSConfig.AccurateBlendingUnit), GSConfig.HWMipmap ? 1 : 0,
@@ -276,6 +282,25 @@ void log_draw_split(u32 fields, double gs_ms)
 	std::fill(std::begin(g_un5_split), std::end(g_un5_split), 0);
 	g_un5_indices = 0;
 	g_un5_draw_ms = g_un5_render_ms = 0.0;
+}
+
+// The PCRTC registers whenever they change, with the field they changed on
+// (UN5 sets them once: both circuits a line apart, its flicker filter).
+void log_display_registers()
+{
+	static u32 s_field = 0;
+	static u64 s_last[10] = {};
+	const GSPrivRegSet& regs = *g_gs_renderer->m_regs;
+	const u64 now[10] = {regs.PMODE.U64, regs.SMODE2.U64, regs.DISP[0].DISPFB.U64, regs.DISP[0].DISPLAY.U64,
+		regs.DISP[1].DISPFB.U64, regs.DISP[1].DISPLAY.U64, regs.EXTBUF.U64, regs.EXTDATA.U64, regs.EXTWRITE.U64,
+		regs.BGCOLOR.U64};
+	++s_field;
+	if (std::equal(std::begin(now), std::end(now), std::begin(s_last)))
+		return;
+	std::copy(std::begin(now), std::end(now), std::begin(s_last));
+	Console.WriteLn("[pcrtc] field %u: PMODE %llx SMODE2 %llx DISPFB1 %llx DISPLAY1 %llx DISPFB2 %llx DISPLAY2 %llx "
+					"EXTBUF %llx EXTDATA %llx EXTWRITE %llx BGCOLOR %llx",
+		s_field, now[0], now[1], now[2], now[3], now[4], now[5], now[6], now[7], now[8], now[9]);
 }
 
 // Fields per second and the GS's share of the time, every 5 s: the Switch
@@ -447,6 +472,7 @@ void vsync(std::uint32_t field, bool registers_written)
 		~VsyncTime() { s_vsync_ticks += Common::Timer::GetCurrentValue() - start; }
 	} vsync_timed{vsync_start};
 	GSRenderer& r = *g_gs_renderer;
+	log_display_registers();
 	r.PCRTCDisplays.SetVideoMode(r.GetVideoMode());
 	r.PCRTCDisplays.EnableDisplays(r.m_regs->PMODE, r.m_regs->SMODE2, r.isReallyInterlaced());
 	r.PCRTCDisplays.SetRects(0, r.m_regs->DISP[0].DISPLAY, r.m_regs->DISP[0].DISPFB);
