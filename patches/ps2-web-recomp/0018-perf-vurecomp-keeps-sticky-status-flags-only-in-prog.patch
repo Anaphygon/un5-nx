@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Thu, 29 Oct 2026 13:14:10 +0700
-Subject: [PATCH 18/28] perf: vurecomp keeps sticky status flags only in
+Subject: [PATCH 18/31] perf: vurecomp keeps sticky status flags only in
  programs that read them
 
 A single status read (FSAND, FSEQ, FSOR, FSSET) used to make every flag-setting op of its program compute flags, for the sticky bits. Status is now live exactly where MAC is unless the program reads a sticky bit, or some program reads one it did not set first. In UN5 four programs test sticky sign (FSAND 0x80), each after clearing it with FSSET, so the other programs drop to MAC liveness.

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Thu, 29 Oct 2026 16:05:27 +0700
-Subject: [PATCH 26/28] feat: a port launcher hook, an in-game stop, and audio
+Subject: [PATCH 26/31] feat: a port launcher hook, an in-game stop, and audio
  that does not crackle when the game falls behind
 
 set_port_launcher lets a port show a screen before the game when the Switch NRO starts from the homebrew menu without args.txt; request_stop ends the run at the next frame, as --frames does. Below 45 ms of queued sound the window host now repeats the last 10 ms of it, cross-faded over 2 ms, so a game running below full speed no longer leaves gaps (heard as crackles) and the pitch stays; audio_stretch()/set_audio_stretch() switch it (PS2_AUDIO_STRETCH at start). Every 5 s the log gets the queue's low point, empty batches and the stretch used.

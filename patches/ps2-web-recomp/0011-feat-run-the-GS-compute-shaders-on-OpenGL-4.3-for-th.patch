@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Tue, 27 Oct 2026 21:48:54 +0700
-Subject: [PATCH 11/28] feat: run the GS compute shaders on OpenGL 4.3 for the
+Subject: [PATCH 11/31] feat: run the GS compute shaders on OpenGL 4.3 for the
  Switch
 
 The Switch has no WebGPU. gl_device.inc and gl_public.inc give gpu.cpp an OpenGL device: its own surfaceless EGL context (made current around GL work, so SDL keeps its own), storage buffers at the WGSL bindings, the parameter record bound per dispatch, a memory barrier between dispatches, zeroed buffers, synchronous read back, and GL_TIME_ELAPSED queries feeding busy_ms. The shaders are gs.wgsl translated by scripts/glsl.sh and committed under glsl/, so a build needs no naga. gpu.cpp's WebGPU-only parts sit behind PS2_GL; the WebGPU build gives byte-identical frames on a UN5 battle replay.

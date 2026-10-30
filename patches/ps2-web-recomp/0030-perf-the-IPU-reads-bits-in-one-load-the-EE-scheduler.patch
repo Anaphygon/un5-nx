@@ -1,0 +1,146 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 30 Oct 2026 18:16:43 +0700
+Subject: [PATCH 30/31] perf: the IPU reads bits in one load; the EE scheduler
+ walks a flat list
+
+Movies keep the EE thread busy (the intro runs ~13 fps on a Switch). The IPU
+bit reader assembled every peek from eight bounds-checked bytes; it now loads
+eight bytes at once when they are there. The EE scheduler walked the thread
+map on every switch, and a movie switches thousands of times a second; it now
+walks a list of the map's nodes, rebuilt when a thread is made or removed.
+Both behave as before; the intro went from ~12.7 to ~13.1 fps.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ runtime/src/ipu/ipu.cpp |  9 ++++++++-
+ runtime/src/kernel.cpp  | 37 +++++++++++++++++++++++++++++++------
+ 2 files changed, 39 insertions(+), 7 deletions(-)
+
+diff --git a/runtime/src/ipu/ipu.cpp b/runtime/src/ipu/ipu.cpp
+index 4e5a1a1..e5d64e2 100644
+--- a/runtime/src/ipu/ipu.cpp
++++ b/runtime/src/ipu/ipu.cpp
+@@ -135,7 +135,14 @@ std::uint32_t bits_at(std::size_t bit, unsigned n) {
+     if (!n) return 0;
+     std::uint64_t v = 0;
+     const std::size_t byte = bit >> 3;
+-    for (std::size_t i = 0; i < 8; ++i) v = (v << 8) | (byte + i < g_in.size() ? g_in[byte + i] : 0u);
++    if (byte + 8 <= g_in.size()) {
++        // One load instead of eight bounds-checked bytes: every VLC peek of a
++        // movie goes through here.
++        std::memcpy(&v, g_in.data() + byte, 8);
++        v = __builtin_bswap64(v);
++    } else {
++        for (std::size_t i = 0; i < 8; ++i) v = (v << 8) | (byte + i < g_in.size() ? g_in[byte + i] : 0u);
++    }
+     return static_cast<std::uint32_t>((v << (bit & 7u)) >> (64 - n));
+ }
+ 
+diff --git a/runtime/src/kernel.cpp b/runtime/src/kernel.cpp
+index ed6fbed..67690ec 100644
+--- a/runtime/src/kernel.cpp
++++ b/runtime/src/kernel.cpp
+@@ -74,6 +74,21 @@ struct Alarm {
+ };
+ 
+ std::map<int, Thread> g_threads;
++// The threads as a flat list, for the scheduler, which walks them on every
++// switch (a movie switches threads thousands of times a second and walking
++// the map showed in profiles). Rebuilt when g_threads_changed is set;
++// map nodes keep their address, so the pointers stay valid until then.
++bool g_threads_changed = true;
++
++const std::vector<Thread *> &thread_list() {
++    static std::vector<Thread *> list;
++    if (g_threads_changed) {
++        list.clear();
++        for (auto &[id, t] : g_threads) list.push_back(&t);
++        g_threads_changed = false;
++    }
++    return list;
++}
+ std::map<int, Semaphore> g_semas;
+ std::vector<Handler> g_intc_handlers;
+ std::vector<Handler> g_dmac_handlers;
+@@ -99,8 +114,9 @@ std::uint32_t arg(const Cpu &c, int i) { return c.r[4 + i].w[0]; }
+ void ret(Cpu &c, std::int64_t v) { c.r[2].sd[0] = v; }
+ 
+ Thread *current() {
+-    auto it = g_threads.find(g_current);
+-    return it == g_threads.end() ? nullptr : &it->second;
++    for (Thread *t : thread_list())
++        if (t->id == g_current) return t;
++    return nullptr;
+ }
+ 
+ Thread *thread(int id) {
+@@ -117,9 +133,9 @@ void make_ready(Thread &t) {
+ 
+ Thread *best_ready() {
+     Thread *best = nullptr;
+-    for (auto &[id, t] : g_threads) {
+-        if (t.status != kReady && t.status != kRun) continue;
+-        if (!best || t.priority < best->priority || (t.priority == best->priority && t.order < best->order)) best = &t;
++    for (Thread *t : thread_list()) {
++        if (t->status != kReady && t->status != kRun) continue;
++        if (!best || t->priority < best->priority || (t->priority == best->priority && t->order < best->order)) best = t;
+     }
+     return best;
+ }
+@@ -283,6 +299,7 @@ int create_thread(Cpu &c) {
+     t.option = ld32(p + 32);
+     t.heap = current() ? current()->heap : 0;
+     g_threads[t.id] = t;
++    g_threads_changed = true;
+     if (g_options.trace_threads)
+         std::fprintf(stderr, "[thread] create %d entry 0x%08X stack 0x%08X+0x%X prio %d\n", t.id, t.entry, t.stack, t.stack_size, t.priority);
+     return t.id;
+@@ -306,6 +323,7 @@ void exit_current(Cpu &c, bool remove) {
+     t->status = kDormant;
+     if (remove) {
+         g_threads.erase(t->id);
++        g_threads_changed = true;
+         g_current = 0;
+     }
+     reschedule(c);
+@@ -372,6 +390,7 @@ const char *syscall_name(std::uint32_t n);
+ 
+ void reset() {
+     g_threads.clear();
++    g_threads_changed = true;
+     g_semas.clear();
+     g_intc_handlers.clear();
+     g_dmac_handlers.clear();
+@@ -395,6 +414,7 @@ void start_main_thread(std::uint32_t entry, std::uint32_t gp, std::uint32_t argc
+     t.entry = entry;
+     t.gp = gp;
+     g_threads[t.id] = t;
++    g_threads_changed = true;
+     g_current = t.id;
+     Cpu &c = g_cpu;
+     std::memset(&c, 0, sizeof c);
+@@ -498,7 +518,11 @@ void handle_syscall(Cpu &c, std::uint32_t pc) {
+     }
+     case 0x19: case 0x1F: case 0xFD: case 0xFF: g_alarms.erase(static_cast<int>(arg(c, 0))); ret(c, 0); break;
+     case 0x20: ret(c, create_thread(c)); break;
+-    case 0x21: g_threads.erase(static_cast<int>(arg(c, 0))); ret(c, 0); break;
++    case 0x21:
++        g_threads.erase(static_cast<int>(arg(c, 0)));
++        g_threads_changed = true;
++        ret(c, 0);
++        break;
+     case 0x22: {
+         Thread *t = thread(static_cast<int>(arg(c, 0)));
+         if (!t) { ret(c, -1); break; }
+@@ -866,6 +890,7 @@ void state(ps2::state::Stream &s) {
+     s.tag("eekern");
+     if (s.saving() && (g_in_handler || !g_guest_calls.empty())) throw std::runtime_error("the EE is inside an interrupt handler");
+     s.map(g_threads);
++    g_threads_changed = true;
+     s.map(g_semas, [&s](Semaphore &v) {
+         s.pod(v.count);
+         s.pod(v.max);
+-- 
+2.54.0 (Apple Git-157)
+

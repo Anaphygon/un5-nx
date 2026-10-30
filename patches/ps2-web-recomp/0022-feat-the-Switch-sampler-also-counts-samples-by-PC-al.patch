@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Thu, 29 Oct 2026 13:49:47 +0700
-Subject: [PATCH 22/28] feat: the Switch sampler also counts samples by PC
+Subject: [PATCH 22/31] feat: the Switch sampler also counts samples by PC
  alone
 
 A second table keyed by thread and PC gives a line-level profile (addr2line -i on the hottest PCs), which the per-stack table could not: the VU thread's samples spread over thousands of distinct stacks.

@@ -1,0 +1,75 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 30 Oct 2026 18:16:43 +0700
+Subject: [PATCH 31/31] perf: the pacer caps its debt at three frames instead
+ of forgiving it
+
+After a debt over three frames the pacer started over, so vblanks that came
+together after a long stall each slept a period. Capping the debt keeps it
+from sleeping while the game is behind. The [audio] line now says how long
+pace() slept, which showed that movies, at ~13 fps, never sleep: they are
+bound by the EE thread alone.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ host/window.cpp | 23 +++++++++++++++++------
+ 1 file changed, 17 insertions(+), 6 deletions(-)
+
+diff --git a/host/window.cpp b/host/window.cpp
+index 148d637..2b09712 100644
+--- a/host/window.cpp
++++ b/host/window.cpp
+@@ -66,6 +66,8 @@ SDL_AudioDeviceID g_audio = 0;
+ SDL_GameController *g_pads[2] = {};
+ std::uint32_t g_tex_w = 0, g_tex_h = 0;
+ std::uint64_t g_last = 0;
++// How often and how long pace() slept, for the [audio] line.
++std::uint32_t g_pace_sleeps = 0, g_pace_slept_ms = 0;
+ std::vector<std::uint32_t> g_pixels;
+ bool g_gpu_present = false;
+ 
+@@ -274,8 +276,10 @@ void pace() {
+     // quick frames after it run without sleeping until the game is back on
+     // the clock: frame costs vary, and starting over from every late frame
+     // slept on the quick ones while the VU and GS threads waited for work
+-    // (a battle held near 40 fps with no thread full). A debt over three
+-    // frames is forgiven instead of being run off as a burst.
++    // (a battle held near 40 fps with no thread full). The debt is capped at
++    // three frames rather than forgiven: after a long movie decode the
++    // vblanks it held back arrive together, and a forgiven debt slept a
++    // whole period on each of them (15% of the EE thread in a movie).
+     const std::uint64_t now = SDL_GetPerformanceCounter();
+     static std::uint64_t catch_up = [] {
+         const char *e = std::getenv("PS2_PACE_CATCH_UP");
+@@ -297,8 +301,13 @@ void pace() {
+         return;
+     }
+     g_last += period;
+-    if (now < g_last) SDL_Delay(static_cast<Uint32>((g_last - now) * 1000 / frequency));
+-    else if (now - g_last > catch_up * period) g_last = now;
++    if (now < g_last) {
++        const Uint32 ms = static_cast<Uint32>((g_last - now) * 1000 / frequency);
++        g_pace_sleeps++;
++        g_pace_slept_ms += ms;
++        SDL_Delay(ms);
++    }
++    else if (now - g_last > catch_up * period) g_last = now - catch_up * period;
+ }
+ 
+ double process_cpu_seconds() {
+@@ -396,8 +405,10 @@ void queue_audio(const std::int16_t *samples, std::size_t frames) {
+     const std::uint64_t now = SDL_GetTicks64();
+     if (!a.since) a.since = now;
+     if (now - a.since >= 5000) {
+-        std::fprintf(stderr, "[audio] queue low %u ms, average %.0f ms; %u of %u batches found it empty; stretch %.3f\n", a.queued_min,
+-                     a.queued_sum / a.batches, a.starved, a.batches, a.in_frames ? a.out_frames / a.in_frames : 1.0);
++        std::fprintf(stderr, "[audio] queue low %u ms, average %.0f ms; %u of %u batches found it empty; stretch %.3f; pace slept %u ms in %u waits\n",
++                     a.queued_min, a.queued_sum / a.batches, a.starved, a.batches, a.in_frames ? a.out_frames / a.in_frames : 1.0,
++                     g_pace_slept_ms, g_pace_sleeps);
++        g_pace_slept_ms = g_pace_sleeps = 0;
+         a = AudioStats{};
+         a.since = now;
+     }
+-- 
+2.54.0 (Apple Git-157)
+

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Thu, 29 Oct 2026 13:14:10 +0700
-Subject: [PATCH 20/28] feat: move a placed Switch thread between cores; write
+Subject: [PATCH 20/31] feat: move a placed Switch thread between cores; write
  the sampler report at once
 
 ps2_switch_move_placed_thread() moves the last thread started on a chosen core, so a port can compare cores for a thread it does not own (Mesa's glthread worker) within one run. The sampler builds its report in memory and writes it with one call: line by line to the SD card through unbuffered stderr it took long enough to look like a hang.

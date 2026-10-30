@@ -1,0 +1,60 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 30 Oct 2026 18:16:43 +0700
+Subject: [PATCH 29/31] feat: PS2_DUMP_ON_MISS and PS2_MISSES, for a port that
+ sets no arguments
+
+A port's runner has no command line, so --misses and PS2_DUMP (which writes
+at every exit) did not fit a console. PS2_DUMP_ON_MISS writes the RAM dump
+only when the game halted on untranslated code, and PS2_MISSES stands in for
+--misses. un5-nx turns both on and translates what they catch afterwards (the
+shop's overlay).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ runtime/src/dispatch.cpp | 4 ++++
+ runtime/src/system.cpp   | 6 +++++-
+ 2 files changed, 9 insertions(+), 1 deletion(-)
+
+diff --git a/runtime/src/dispatch.cpp b/runtime/src/dispatch.cpp
+index 258da94..425f17f 100644
+--- a/runtime/src/dispatch.cpp
++++ b/runtime/src/dispatch.cpp
+@@ -3,6 +3,7 @@
+ 
+ #include <algorithm>
+ #include <cstdio>
++#include <cstdlib>
+ #include <fstream>
+ #include <set>
+ #include <string>
+@@ -104,6 +105,9 @@ const UnitInfo *unit_for(std::uint32_t pc) {
+ }
+ 
+ void record_miss(std::uint32_t pc) {
++    // PS2_MISSES stands in for --misses where a port sets no arguments.
++    if (g_options.misses_path.empty())
++        if (const char *path = std::getenv("PS2_MISSES")) g_options.misses_path = path;
+     if (const Instance *m = instance_for(pc)) {
+         char token[96];
+         std::snprintf(token, sizeof token, "%s:%x", m->module->name, pc - m->base);
+diff --git a/runtime/src/system.cpp b/runtime/src/system.cpp
+index ced9d90..ea0ad9a 100644
+--- a/runtime/src/system.cpp
++++ b/runtime/src/system.cpp
+@@ -478,7 +478,11 @@ int run() {
+                 std::fprintf(stderr, "\n");
+             }
+     }
+-    if (const char *path = std::getenv("PS2_DUMP")) {
++    // PS2_DUMP_ON_MISS: the same dump, written only when the game reached code
++    // with no translation, for a port to translate it afterwards.
++    const char *dump = std::getenv("PS2_DUMP");
++    if (!dump && g_halted && g_halt_reason.rfind("missing code", 0) == 0) dump = std::getenv("PS2_DUMP_ON_MISS");
++    if (const char *path = dump) {
+         if (std::FILE *f = std::fopen(path, "wb")) {
+             std::fwrite(g_ram, 1, kRamSize, f);
+             std::fwrite(iop::ram_ptr(0), 1, iop::kRamSize, f);
+-- 
+2.54.0 (Apple Git-157)
+

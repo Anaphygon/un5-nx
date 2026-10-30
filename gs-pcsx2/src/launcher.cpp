@@ -282,6 +282,13 @@ bool un5_launcher(const char* dir)
 	const std::string vu_dir = g_dir + "vu1-new";
 	mkdir(vu_dir.c_str(), 0777);
 	setenv("PS2_VU_RECORD", vu_dir.c_str(), 0);
+	// Code the game reaches with no translation (a shop's overlay never played
+	// on the Mac) halts it; the runner then leaves its RAM and the missed
+	// entries here, and tools/code_sync.sh translates them.
+	const std::string miss_dir = g_dir + "code-miss";
+	mkdir(miss_dir.c_str(), 0777);
+	setenv("PS2_DUMP_ON_MISS", (miss_dir + "/ram.bin").c_str(), 0);
+	setenv("PS2_MISSES", (miss_dir + "/misses.txt").c_str(), 0);
 	if (s.preset)
 		set_clocks(s.preset);
 	std::fprintf(stderr, "[launcher] preset %s, resolution %dx, filter %d, blending %s, audio stretching %s, renderer %s\n",
