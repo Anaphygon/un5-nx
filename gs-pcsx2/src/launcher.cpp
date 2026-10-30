@@ -10,6 +10,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <sys/stat.h>
 
 #include "launcher_gfx.h"
 #include "menu_art.h"
@@ -273,6 +274,14 @@ bool un5_launcher(const char* dir)
 	setenv("UN5_SHOW_FPS", s.show_fps ? "1" : "0", 1);
 	setenv("UN5GS_RENDERER", s.deko3d ? "dk" : "gl", 1);
 	setenv("UN5GS_FIX", std::to_string(s.upscale_fix).c_str(), 1);
+	// VU1 programs with no translation run in the interpreter, about ten times
+	// slower (a battle with new characters fell to 42 fps with the VU thread at
+	// 99%). The runner keeps each new one here; tools/vu_sync.sh translates
+	// them into the next build. The folder must exist: the runner's
+	// std::filesystem cannot create "sdmc:" itself.
+	const std::string vu_dir = g_dir + "vu1-new";
+	mkdir(vu_dir.c_str(), 0777);
+	setenv("PS2_VU_RECORD", vu_dir.c_str(), 0);
 	if (s.preset)
 		set_clocks(s.preset);
 	std::fprintf(stderr, "[launcher] preset %s, resolution %dx, filter %d, blending %s, audio stretching %s, renderer %s\n",
