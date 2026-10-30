@@ -9,6 +9,7 @@
 #include "common/Timer.h"
 #include "imgui.h"
 #include "imgui_internal.h"
+#include "menu_art.h"
 #include "un5_settings.h"
 
 #include <cfloat>
@@ -54,6 +55,8 @@ namespace
 		io.LogFilename = nullptr;
 		// GSDevice::UpdateImGuiTextures creates and fills the font atlas.
 		io.BackendFlags |= ImGuiBackendFlags_RendererHasTextures;
+		// The menu's paper and ink run past 64K vertices; both devices draw with the offset.
+		io.BackendFlags |= ImGuiBackendFlags_RendererHasVtxOffset;
 		ImFontConfig config;
 		config.FontDataOwnedByAtlas = false;
 		io.Fonts->AddFontFromMemoryTTF(const_cast<void*>(font), static_cast<int>(size), 30.0f, &config);
@@ -62,9 +65,7 @@ namespace
 
 	constexpr int kResume = kSettingRows, kQuit = kSettingRows + 1, kRowCount = kSettingRows + 2;
 
-	// Drawn like the launcher (launcher.cpp), in 1280x720 units scaled to the
-	// screen: tiles, a cyan-to-green frame on the selection, notes under the
-	// values.
+	// Drawn like the launcher (menu_art.cpp), in 1280x720 units scaled to the screen.
 	ImU32 rgb(int r, int g, int b, int a = 255) { return IM_COL32(r, g, b, a); }
 
 	struct Canvas
@@ -91,48 +92,55 @@ namespace
 			(io.DisplaySize.y - 720.0f * k) * 0.5f};
 	}
 
+	class ImGuiPainter : public Un5Painter
+	{
+	public:
+		explicit ImGuiPainter(const Canvas& c) : m_c(c) {}
+		void rect(int x, int y, int w, int h, uint32_t c) override { m_c.dl->AddRectFilled(m_c.at(x, y), m_c.at(x + w, y + h), c); }
+		void shade(int x, int y, int w, int h, uint32_t c, int a) override
+		{
+			m_c.dl->AddRectFilled(m_c.at(x, y), m_c.at(x + w, y + h), (c & 0x00FFFFFFu) | (static_cast<uint32_t>(a) << 24));
+		}
+		void text(int x, int y, int px, uint32_t c, const char* t) override { m_c.text(x, y, px, c, t); }
+		int width(int px, const char* t) override { return static_cast<int>(m_c.width(px, t)); }
+
+	private:
+		const Canvas& m_c;
+	};
+
 	void draw(int selected, const Un5Settings& s)
 	{
 		const Canvas c = begin_frame();
-		const ImU32 bg = rgb(16, 30, 39, 238), tile = rgb(18, 36, 48), tile_sel = rgb(22, 47, 66), line = rgb(52, 78, 92),
-					fg = rgb(240, 244, 246), muted = rgb(138, 158, 170), cyan = rgb(90, 210, 225), green = rgb(100, 245, 156),
-					accent = rgb(255, 150, 60);
-		c.dl->AddRectFilled(ImVec2(0, 0), ImGui::GetIO().DisplaySize, bg);
-		c.text(140, 34, 36, fg, "Paused");
-		c.text(140, 84, 20, muted, "un5-nx  \xc2\xb7  changes take effect when you resume");
-		c.dl->AddRectFilled(c.at(30, 130), c.at(1250, 131), line);
-		const auto frame = [&](float x, float y, float w, float h) {
-			c.dl->AddRectFilled(c.at(x - 4, y - 4), c.at(x + w + 4, y), cyan);
-			c.dl->AddRectFilled(c.at(x - 4, y + h), c.at(x + w + 4, y + h + 4), green);
-			c.dl->AddRectFilledMultiColor(c.at(x - 4, y), c.at(x, y + h), cyan, cyan, green, green);
-			c.dl->AddRectFilledMultiColor(c.at(x + w, y), c.at(x + w + 4, y + h), cyan, cyan, green, green);
-		};
+		Un5MenuScreen screen{"Paused  \xc2\xb7  changes take effect when you resume", {}, selected, {}, {}, {}, {}};
 		for (int r = 0; r < kSettingRows; ++r)
 		{
 			const Un5RowText t = un5_row_text(s, r, true);
-			const float y = 138.0f + r * 54.0f;
-			const bool sel = r == selected;
-			c.dl->AddRectFilled(c.at(140, y), c.at(1140, y + 49), sel ? tile_sel : tile);
-			if (sel)
-				frame(140, y, 1000, 49);
-			c.text(170, y + 3, 19, sel ? cyan : fg, t.label);
-			const std::string v = "<  " + t.value + "  >";
-			c.text(1110 - c.width(19, v.c_str()), y + 3, 19, fg, v.c_str());
-			c.text(170, y + 28, 14, muted, t.note.c_str());
+			screen.items.push_back({t.label, t.value});
 		}
-		const auto button = [&](int index, float x, float w, const char* label, ImU32 fill) {
-			const bool sel = index == selected;
-			c.dl->AddRectFilled(c.at(x, 574), c.at(x + w, 630), sel ? fill : tile, 12 * c.k);
-			if (sel)
-				frame(x, 574, w, 56);
-			c.text(x + w / 2 - c.width(26, label) / 2, 586, 26, sel ? rgb(20, 20, 20) : fg, label);
-		};
-		button(kResume, 140, 640, "Resume", accent);
-		button(kQuit, 800, 340, "Quit game", rgb(255, 96, 86));
-		c.dl->AddRectFilled(c.at(30, 646), c.at(1250, 647), line);
-		c.text(80, 668, 18, muted, "Quit ends the game and gives the clocks back to the clock service.");
-		const char* hints = "A choose   B resume";
-		c.text(1200 - c.width(24, hints), 664, 24, fg, hints);
+		screen.items.push_back({"Resume", ""});
+		screen.items.push_back({"Quit game", ""});
+		if (selected == kResume)
+		{
+			screen.heading = "Paused";
+			screen.value = "Resume";
+			screen.note = "Back to the game, with the settings on the left. Resolution and renderer change at the next start.";
+		}
+		else if (selected == kQuit)
+		{
+			screen.heading = "Leave";
+			screen.value = "Quit game";
+			screen.note = "Ends the game and gives the clocks back to the clock service. Save in the game first.";
+		}
+		else
+		{
+			const Un5RowText t = un5_row_text(s, selected, true);
+			screen.heading = t.label;
+			screen.value = "<  " + t.value + "  >";
+			screen.note = t.note;
+		}
+		screen.hints = "Up/Down choose    Left/Right change    A select    B resume";
+		ImGuiPainter painter(c);
+		un5_draw_menu(painter, screen);
 	}
 
 	// The settings a resume puts in force at once (resolution waits for a restart).
@@ -197,14 +205,12 @@ void un5_menu_poll()
 		if (down & kB)
 			break;
 		if (down & kUp)
-			selected = selected == kQuit ? kSettingRows - 1 : (selected + kRowCount - 1) % kRowCount;
+			selected = (selected + kRowCount - 1) % kRowCount;
 		if (down & kDown)
-			selected = selected == kResume ? 0 : (selected + 1) % kRowCount;
+			selected = (selected + 1) % kRowCount;
 		const int dx = (down & kRight) ? 1 : (down & kLeft) ? -1 : 0;
 		if (selected >= kResume)
 		{
-			if (dx)
-				selected = selected == kResume ? kQuit : kResume;
 			if (down & kA)
 			{
 				quit = selected == kQuit;

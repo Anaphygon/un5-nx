@@ -12,6 +12,7 @@
 #include <string>
 
 #include "launcher_gfx.h"
+#include "menu_art.h"
 #include "un5_settings.h"
 
 bool un5_hoc_open();
@@ -21,10 +22,6 @@ const char* un5_clock_service_name();
 
 namespace
 {
-	constexpr Color kBg = RGB(16, 30, 39), kTile = RGB(18, 36, 48), kTileSel = RGB(22, 47, 66), kLine = RGB(52, 78, 92),
-					kText = RGB(240, 244, 246), kMuted = RGB(138, 158, 170), kCyan = RGB(90, 210, 225), kGreen = RGB(100, 245, 156),
-					kAccent = RGB(255, 150, 60);
-
 	struct Preset
 	{
 		const char* name;
@@ -101,40 +98,44 @@ namespace
 	}
 
 	constexpr int kStart = kSettingRows; // the launcher's last row
-	constexpr int kRowsTop = 138, kRowStep = 54, kRowH = 49;
 
-	void row(int index, int selected, const Un5RowText& t)
+	class FramebufferPainter : public Un5Painter
 	{
-		const int y = kRowsTop + index * kRowStep;
-		const bool sel = index == selected;
-		gfx_rect(140, y, 1000, kRowH, sel ? kTileSel : kTile);
-		if (sel)
-			gfx_border(136, y - 4, 1008, kRowH + 8, 4, kCyan, kGreen);
-		gfx_text(170, y + 3, 19, sel ? kCyan : kText, t.label);
-		const std::string v = std::string("<  ") + t.value + "  >";
-		gfx_text(1110 - gfx_text_width(19, v.c_str()), y + 3, 19, kText, v.c_str());
-		gfx_text_fit(170, y + 28, 14, kMuted, t.note.c_str(), 940);
-	}
+	public:
+		void rect(int x, int y, int w, int h, uint32_t c) override { gfx_rect(x, y, w, h, c); }
+		void shade(int x, int y, int w, int h, uint32_t c, int a) override { gfx_shade(x, y, w, h, c, a); }
+		void text(int x, int y, int px, uint32_t c, const char* t) override { gfx_text(x, y, px, c, t); }
+		int width(int px, const char* t) override { return gfx_text_width(px, t); }
+	};
 
 	void draw(const Un5Settings& s, int selected)
 	{
-		gfx_begin();
-		gfx_clear(kBg);
-		gfx_text(140, 34, 36, kText, "Naruto Shippuden: Ultimate Ninja 5");
-		gfx_text(140, 84, 20, kMuted, "un5-nx  ·  native port  ·  settings before the game starts");
-		gfx_rect(30, 130, 1220, 1, kLine);
+		Un5MenuScreen screen{"un5-nx  \xc2\xb7  recompiled port for the Switch", {}, selected, {}, {}, {}, {}};
 		for (int r = 0; r < kSettingRows; ++r)
-			row(r, selected, un5_row_text(s, r, false));
-		const bool sel = selected == kStart;
-		gfx_round(140, 574, 1000, 56, 12, sel ? kAccent : kTile);
-		if (sel)
-			gfx_border(136, 570, 1008, 64, 4, kCyan, kGreen);
-		const char* start = "Start game";
-		gfx_text(640 - gfx_text_width(26, start) / 2, 586, 26, sel ? RGB(20, 20, 20) : kText, start);
-		gfx_rect(30, 646, 1220, 1, kLine);
-		gfx_text_fit(80, 668, 18, kMuted, "L3+R3 in the game opens these settings; its Quit gives the clocks back. Closed from HOME, they stay until changed.", 820);
-		std::string hints = std::string(GLYPH_A[0] ? GLYPH_A : "A") + " Start   " + (GLYPH_PLUS[0] ? GLYPH_PLUS : "+") + " Quit";
-		gfx_text(1200 - gfx_text_width(24, hints.c_str()), 664, 24, kText, hints.c_str());
+		{
+			const Un5RowText t = un5_row_text(s, r, false);
+			screen.items.push_back({t.label, t.value});
+		}
+		screen.items.push_back({"Start game", ""});
+		if (selected == kStart)
+		{
+			screen.heading = "Ready";
+			screen.value = "Start game";
+			screen.note = "The settings on the left are kept for next time. In the game, L3+R3 opens them again; its Quit "
+						  "gives the clocks back to the clock service.";
+		}
+		else
+		{
+			const Un5RowText t = un5_row_text(s, selected, false);
+			screen.heading = t.label;
+			screen.value = "<  " + t.value + "  >";
+			screen.note = t.note;
+		}
+		const std::string a = GLYPH_A[0] ? GLYPH_A : "A", plus = GLYPH_PLUS[0] ? GLYPH_PLUS : "+";
+		screen.hints = "Up/Down choose    Left/Right change    " + a + " start    " + plus + " quit";
+		FramebufferPainter painter;
+		gfx_begin();
+		un5_draw_menu(painter, screen);
 		gfx_end();
 	}
 } // namespace
