@@ -1,6 +1,7 @@
-#!/bin/sh
+#!/usr/bin/env bash
 # Fetch ps2-web-recomp at the pinned commit, apply this project's patches on a
-# branch named un5-nx, and port your disc with it (native build only).
+# branch named un5-nx, translate your disc with tools/un5_from_iso.sh and build
+# the native player (macOS).
 #
 #   tools/setup_ps2webrecomp.sh <your UN5 PAL ISO>
 #                                   -> third_party/ps2-web-recomp (branch un5-nx)
@@ -26,25 +27,16 @@ if ! git -C "$WEB" rev-parse --verify -q un5-nx >/dev/null; then
     echo "ps2-web-recomp $PIN + $(ls "$ROOT"/patches/ps2-web-recomp/*.patch | wc -l | tr -d ' ') patches on branch un5-nx"
 fi
 
-# The static constructors are reached only through a table, so seed them
-# before the first exploring run.
-mkdir -p "$WEB/games/un5"
-grep -v '^#' "$ROOT/ports/un5/entries.txt" > "$WEB/games/un5/entries.txt"
-
 # ps2-web-recomp's own builds take every core; ninja honours this wrapper.
 BIN=$(mktemp -d)
 printf '#!/bin/sh\nexec %s -j%s "$@"\n' "$(command -v ninja)" "$JOBS" > "$BIN/ninja"
 chmod +x "$BIN/ninja"
 
+(cd "$WEB" && PATH=$BIN:$PATH bash scripts/setup.sh --native-only)
+PS2WEB=$WEB "$ROOT/tools/un5_from_iso.sh" "$ISO"
 cd "$WEB"
-PATH=$BIN:$PATH bash scripts/setup.sh --native-only
-presses=""
-f=600
-while [ $f -lt 9000 ]; do
-    presses="$presses --press ${f}:cross --press $((f + 150)):start"
-    f=$((f + 300))
-done
-# shellcheck disable=SC2086
-PATH=$BIN:$PATH bash scripts/port.sh un5 "$ISO" --native-only --frames 9000 --rounds 16 $presses
+. scripts/cxx.sh
+cmake -S . -B build/native-un5 -G Ninja -DCMAKE_BUILD_TYPE=Release "${cxx_flags[@]}" -DPS2_GENERATED="$WEB/generated/un5" > /dev/null
+PATH=$BIN:$PATH ninja -C build/native-un5 ps2run | tail -1
 rm -rf "$BIN"
 echo "Play it with tools/un5_play.sh"

@@ -3,12 +3,10 @@
 #
 #   tools/un5_play.sh [runner options, e.g. --widescreen]
 #
-# The run records its misses, a RAM dump and the VU1 programs it uploads. If
-# the game halts on code that is not translated yet, the overlay images in the
-# dump are captured and the misses and every function pointer into an overlay
-# are added as entries (tools/un5_seed.py). Either way, code and VU1 programs
-# seen for the first time are translated and the runner is built again: VU1
-# programs left to the interpreter cost a battle about 40% of its frame time.
+# The game is translated from the disc (tools/un5_from_iso.sh), so this should
+# never stop on missing code. If it does, the misses join ports/un5/entries.txt
+# (tools/un5_misses.py), VU1 programs the run recorded join the ones built from
+# the executable, the game is translated again and the runner rebuilt.
 # F5 and F9 save and load quicksave.state. PS2_SCALE=2 or 3 raises the
 # internal resolution.
 set -eu
@@ -28,18 +26,16 @@ PS2_DUMP=$G/play_ram.bin PS2_VU_RECORD=$G/vu1 build/native-un5/ps2run "$ELF" --d
 
 rebuild=0
 if grep -q '^\[ee\] halted: missing code' "$G/play.log"; then
-    echo "== stopped on untranslated code; translating what this run reached"
-    python3 -I scripts/windows.py capture "$ELF" "$G/play_ram.bin" "$G/overlays" "$G/misses.txt"
-    python3 -I "$ROOT/tools/un5_seed.py" "$ELF" "$G/entries.txt" "$G/overlays" "$G/misses.txt"
-    build/tools/eerecomp "$ELF" --entries "$G/entries.txt" --overlays "$G/overlays" --out generated/un5 | tail -1
+    echo "== stopped on untranslated code; adding it to ports/un5/entries.txt"
+    python3 -I "$ROOT/tools/un5_misses.py" "$G/play_ram.bin" "$G/misses.txt" >>"$ROOT/ports/un5/entries.txt"
     rebuild=1
 fi
 vu_after=$(ls "$G/vu1" | wc -l)
 if [ "$vu_after" -gt "$vu_before" ]; then
-    echo "== $((vu_after - vu_before)) new VU1 programs; translating them"
-    build/tools/vurecomp --rz "$G/vu1" generated/un5 | tail -1
+    echo "== $((vu_after - vu_before)) VU1 programs ran interpreted; adding them"
     rebuild=1
 fi
+[ "$rebuild" = 1 ] && PS2WEB=$WEB "$ROOT/tools/un5_from_iso.sh" "$G/disc.iso" | tail -1
 [ "$rebuild" = 1 ] || exit 0
 ninja -C build/native-un5 -j"$JOBS" ps2run > build/native-un5/ninja.log 2>&1 || { tail -20 build/native-un5/ninja.log; exit 1; }
 echo "== built; run tools/un5_play.sh again"

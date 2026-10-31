@@ -47,23 +47,16 @@ dt get "$remote/ram.bin" "$work/ram.bin" >/dev/null
 dt get "$remote/misses.txt" "$work/misses.txt" >/dev/null 2>&1 || : >"$work/misses.txt"
 # A jump through a null pointer reports address 0, which is no entry.
 grep -vx '0' "$work/misses.txt" >"$work/misses" || true
+if [ ! -s "$work/misses" ]; then
+	echo "The game jumped to address 0: a bug, not untranslated code. Read sdmc:/switch/un5-nx/ps2run.log."
+	exit 1
+fi
 echo "Missed: $(tr '\n' ' ' <"$work/misses")"
 
 # A miss in the overlay window names the overlay the RAM holds (its header's
 # kind: 1 BTL, 2 ADV, 3 ETC), as tools/un5_from_iso.sh names the images. The
 # entries join ports/un5/entries.txt, and the whole game is translated again.
-python3 -I - "$work/ram.bin" "$work/misses" >>"$root/ports/un5/entries.txt" <<'PY'
-import struct, sys
-ram, misses = open(sys.argv[1], 'rb').read(), open(sys.argv[2]).read().split()
-base, kinds = 0x6C6D00, {1: 'BTL', 2: 'ADV', 3: 'ETC'}
-for token in misses:
-    if ':' in token:
-        print(token)
-        continue
-    pc = int(token, 16)
-    kind = kinds.get(struct.unpack_from('<I', ram, base + 4)[0])
-    print('%08X_%s:%x' % (base, kind, pc - base) if kind and base <= pc < 0x8F3D00 else '%x' % pc)
-PY
+python3 -I "$here/un5_misses.py" "$work/ram.bin" "$work/misses" >>"$root/ports/un5/entries.txt"
 "$here/un5_from_iso.sh" "$G/disc.iso" | tail -1
 
 echo "Building the NRO..."
