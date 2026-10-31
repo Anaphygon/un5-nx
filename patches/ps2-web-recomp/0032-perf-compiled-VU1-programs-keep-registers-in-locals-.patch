@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Sat, 31 Oct 2026 08:15:29 +0700
-Subject: [PATCH 32/34] perf: compiled VU1 programs keep registers in locals
+Subject: [PATCH 32/35] perf: compiled VU1 programs keep registers in locals
  and work out flags only when read
 
 vurecomp now holds the VF registers and ACC a program uses in locals and writes them back where it leaves, as it already did for VI. In VU memory every instruction stored and reloaded them, and a lane written alone and then read with the others stalled the load on the store.

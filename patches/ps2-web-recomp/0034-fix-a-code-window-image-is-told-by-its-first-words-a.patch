@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Sat, 31 Oct 2026 16:56:48 +0700
-Subject: [PATCH 34/34] fix: a code window image is told by its first words and
+Subject: [PATCH 34/35] fix: a code window image is told by its first words and
  tolerates data words
 
 UN5 loads its shop (ETC) over the battle overlay (BTL) at 0x6C6D00 and leaves

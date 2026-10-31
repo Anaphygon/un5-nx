@@ -1,0 +1,54 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 31 Oct 2026 19:12:32 +0700
+Subject: [PATCH 35/35] fix: a code window image may differ in one check word
+ in 64
+
+On a Switch, Master Mode's image went from 6 to 11 to 12 differing data
+words in one session, close to the fixed 16. Measured over UN5's images, one
+overlay's images differ in up to ~1200 check words on shared offsets (data
+the recompiler took for code), different overlays in over 36,000, and those
+already fail the leading words. The limit is now one check word in 64, at
+least 16.
+
+Battle replay and intro movie frames identical; shop after Free Battle and
+Master Mode run on the Mac.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ runtime/src/dispatch.cpp | 13 ++++++++-----
+ 1 file changed, 8 insertions(+), 5 deletions(-)
+
+diff --git a/runtime/src/dispatch.cpp b/runtime/src/dispatch.cpp
+index 19f0d57..5fd695d 100644
+--- a/runtime/src/dispatch.cpp
++++ b/runtime/src/dispatch.cpp
+@@ -77,17 +77,20 @@ const Instance *in_place(const Instance &i) {
+ // The recompiler takes for code some words that are data: UN5's battle overlay
+ // holds a table of heap pointers among its functions, which every battle
+ // fills differently, and the shop, loaded over it, keeps them. A window image
+-// whose leading words are in place may differ from memory in up to
+-// kStaleWords such words; an image of other content differs in thousands.
+-// The image differing least serves, and its differing words are not checked.
+-constexpr std::uint32_t kStaleWords = 16;
++// whose leading words are in place may differ from memory in up to one check
++// word in kStaleShare. UN5's images of one overlay differ in up to ~1200 such
++// words (of 300,000-500,000), and Master Mode rewrites more as it is played;
++// images of different overlays differ in over 36,000. The image differing
++// least serves, and its differing words are not checked.
++constexpr std::uint32_t kStaleShare = 64;
+ 
+ bool window_image(const ModuleInfo &m, Instance &out) {
+     if (!leads_in_place(m, m.fixed_base)) return false;
++    const std::uint32_t limit = std::max(16u, m.check_count / kStaleShare);
+     std::vector<std::uint32_t> stale;
+     for (std::uint32_t k = 0; k < m.check_count; ++k) {
+         if (ld32(m.fixed_base + m.checks[2 * k]) == m.checks[2 * k + 1]) continue;
+-        if (stale.size() == kStaleWords) return false;
++        if (stale.size() == limit || (out.module && stale.size() >= out.stale.size())) return false;
+         stale.push_back(k);
+     }
+     if (out.module && out.stale.size() <= stale.size()) return false;
+-- 
+2.54.0 (Apple Git-157)
+

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Fri, 30 Oct 2026 16:10:21 +0700
-Subject: [PATCH 27/34] perf: PS2_VU_RECORD checks the SD card once per program
+Subject: [PATCH 27/35] perf: PS2_VU_RECORD checks the SD card once per program
 
 A file check on every lookup of an untranslated program was slow on a
 console's SD card, while the game recorded new programs in play.

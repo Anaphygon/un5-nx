@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Thu, 29 Oct 2026 12:40:13 +0700
-Subject: [PATCH 17/34] feat: Switch thread placement and a sampling profiler
+Subject: [PATCH 17/35] feat: Switch thread placement and a sampling profiler
 
 host/switch_threads.cpp wraps libnx's threadCreate (-Wl,--wrap) so every
 thread is seen, and lets the runner place them: the emulation thread on

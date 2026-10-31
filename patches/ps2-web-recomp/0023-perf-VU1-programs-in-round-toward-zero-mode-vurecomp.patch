@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Thu, 29 Oct 2026 14:12:55 +0700
-Subject: [PATCH 23/34] perf: VU1 programs in round-toward-zero mode (vurecomp
+Subject: [PATCH 23/35] perf: VU1 programs in round-toward-zero mode (vurecomp
  --rz), and a bench for them
 
 With --rz, compiled programs leave arithmetic results to the host, which the runtime switches to round-toward-zero and flush-to-zero around each compiled program (FPCR on ARM64, MXCSR on x86-64) and restores afterwards. A finite result then never overflows to infinity and a tiny one becomes a signed zero, which is what vfix did after every operation, and it is the VU's own rounding. Multiply-add products are kept from being fused into one FMA. Operands loaded from memory still go through vfix.
