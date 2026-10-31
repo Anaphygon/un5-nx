@@ -9,7 +9,7 @@
 struct Un5Settings
 {
 	int preset = 0;      // index into the performance presets; 0 leaves the clocks alone
-	int upscale = 2;     // internal resolution, 1 native .. 3 (2x: sharper, and Sharp is cheap there)
+	int upscale = 20;    // internal resolution in tenths: 10 native, 15, 20 (sharper, and Sharp is cheap there), 30
 	int filter = 2;      // screen filter: 0 off, 1 smooth, 2 sharp
 	bool min_blending = true;
 	bool audio_stretch = true;
@@ -39,8 +39,8 @@ Un5Settings un5_settings();
 // The upscale fixes, tried live from the menu: 0 the game database's (half-pixel
 // offset special, native scaling aggressive), 1 native scaling normal, 2 native
 // scaling off, 3 half-pixel offset native, 4 round sprite full, 5 adaptive
-// deinterlacing, 6 NetherSX2's (half-pixel normal, round sprite full, CPU CLUT
-// render, no native scaling). Applied to the GS config (gs_front.cpp).
+// deinterlacing, 6 NetherSX2's (half-pixel normal, round sprite full, no native
+// scaling). Applied to the GS config (gs_front.cpp).
 constexpr int kUpscaleFixes = 7;
 const char* un5_upscale_fix_name(int fix);
 void un5_apply_upscale_fix(int fix);

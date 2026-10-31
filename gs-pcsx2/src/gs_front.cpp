@@ -104,7 +104,9 @@ void apply_environment()
 	GSConfig.Dithering = static_cast<u8>(std::clamp(number("UN5GS_DITHER", GSConfig.Dithering), 0, 2));
 	GSConfig.HWDownloadMode = static_cast<GSHardwareDownloadMode>(
 		std::clamp(number("UN5GS_DOWNLOAD", static_cast<int>(GSConfig.HWDownloadMode)), 0, 4));
-	GSConfig.UpscaleMultiplier = static_cast<float>(std::clamp(number("UN5GS_UPSCALE", 2), 1, 3));
+	// A multiple of the PS2's resolution: 1, 1.5, 2 or 3.
+	const char* scale = std::getenv("UN5GS_UPSCALE");
+	GSConfig.UpscaleMultiplier = std::clamp(scale ? static_cast<float>(std::atof(scale)) : 2.0f, 1.0f, 3.0f);
 	GSConfig.LinearPresent = static_cast<GSPostBilinearMode>(std::clamp(number("UN5GS_FILTER", 2), 0, 2));
 	// PCSX2's game database fixes for SLES-55605, which matter once the game is
 	// upscaled: without them its full-screen effects (hit flashes, smoke) come
@@ -117,7 +119,7 @@ void apply_environment()
 		GSConfig.UserHacks_NativeScaling = static_cast<GSNativeScaling>(std::clamp(number("UN5GS_NATIVE_SCALING", 2), 0, 4));
 	g_un5_honour_scanmsk = number("UN5GS_SCANMSK", 0) != 0;
 	g_un5_dk_full_barrier = number("UN5DK_BARRIER", 0) != 0;
-	Console.WriteLn("un5gs: texture preloading %d, blending %d, mipmap %d, dithering %d, download %d, upscale %.0fx, filter %d, "
+	Console.WriteLn("un5gs: texture preloading %d, blending %d, mipmap %d, dithering %d, download %d, upscale %.1fx, filter %d, "
 					"half-pixel offset %d, native scaling %d",
 		static_cast<int>(GSConfig.TexturePreloading), static_cast<int>(GSConfig.AccurateBlendingUnit), GSConfig.HWMipmap ? 1 : 0,
 		GSConfig.Dithering, static_cast<int>(GSConfig.HWDownloadMode), GSConfig.UpscaleMultiplier, static_cast<int>(GSConfig.LinearPresent),
@@ -568,12 +570,12 @@ void un5_apply_upscale_fix(int fix)
 		case 6:
 			// NetherSX2's game database for SLES-55605 (its emucore_4248 build,
 			// from an older PCSX2 that has no native scaling): half-pixel offset
-			// normal, round sprite full, and palettes the game draws resolved on
-			// the CPU instead of as GPU draws.
+			// normal and round sprite full. Its third fix, CPU CLUT render, is
+			// left out: here it read render targets back from the GPU up to 32
+			// times a frame and stalled battles to ~30 fps.
 			GSConfig.UserHacks_HalfPixelOffset = GSHalfPixelOffset::Normal;
 			GSConfig.UserHacks_NativeScaling = GSNativeScaling::Off;
 			GSConfig.UserHacks_RoundSprite = 2;
-			GSConfig.UserHacks_CPUCLUTRender = 1;
 			break;
 		default: break;
 	}

@@ -54,8 +54,9 @@ namespace
 				int v = 0;
 				if (std::sscanf(line, "preset=%d", &v) == 1 && v >= 0 && v < kPresetCount)
 					s.preset = v;
-				else if (std::sscanf(line, "upscale=%d", &v) == 1 && v >= 1 && v <= 3)
-					s.upscale = v;
+				// Tenths since 1.5x; files written before hold 1-3.
+				else if (std::sscanf(line, "upscale=%d", &v) == 1 && ((v >= 1 && v <= 3) || v == 10 || v == 15 || v == 20 || v == 30))
+					s.upscale = v <= 3 ? v * 10 : v;
 				else if (std::sscanf(line, "filter=%d", &v) == 1 && v >= 0 && v <= 2)
 					s.filter = v;
 				else if (std::sscanf(line, "min_blending=%d", &v) == 1)
@@ -158,16 +159,17 @@ Un5RowText un5_row_text(const Un5Settings& s, int row, bool in_game)
 			return {"Performance", p.name, note};
 		}
 		case kRowUpscale:
-			return {"Resolution", s.upscale == 1 ? "Native" : std::to_string(s.upscale) + "x",
-				std::string(s.upscale == 1 ? "The PS2's own resolution: soft on a sharp screen, and the Sharp filter costs more here." :
-							s.upscale == 2 ? "Sharper, at about the same speed as Native: the best fit for the Switch." :
+			return {"Resolution", s.upscale == 10 ? "Native" : s.upscale == 15 ? "1.5x" : std::to_string(s.upscale / 10) + "x",
+				std::string(s.upscale == 10 ? "The PS2's own resolution: soft on a sharp screen, and the Sharp filter costs more here." :
+							s.upscale == 15 ? "What NetherSX2 uses: sharper than Native and lighter on the GPU than 2x." :
+							s.upscale == 20 ? "Sharper, at about the same speed as Native: the best fit for the Switch." :
 											  "Sharpest, but about 38-40 fps in battle at Fast instead of 44-49.") +
 					(in_game ? "  Takes effect next time the game starts." : "")};
 		case kRowFilter:
 			return {"Screen filter", kFilters[s.filter],
 				s.filter == 0 ? "No smoothing: the sharpest, blocky edges." :
 				s.filter == 1 ? "PCSX2's default smoothing: soft." :
-				s.upscale == 1 ? "Bilinear sharp: crisp, but at Native it costs about 6 ms a frame; use it with 2x or more." :
+				s.upscale == 10 ? "Bilinear sharp: crisp, but at Native it costs about 6 ms a frame; use it with 2x or more." :
 								 "Bilinear sharp: smooth scaling, crisper than Smooth."};
 		case kRowUpscaleFix:
 			return {"Upscale fix", un5_upscale_fix_name(s.upscale_fix),
@@ -199,7 +201,15 @@ void un5_row_step(Un5Settings& s, int row, int step)
 			if (un5_clock_service_name())
 				s.preset = (s.preset + kPresetCount + step) % kPresetCount;
 			break;
-		case kRowUpscale: s.upscale = (s.upscale - 1 + 3 + step) % 3 + 1; break;
+		case kRowUpscale:
+		{
+			static constexpr int kScales[] = {10, 15, 20, 30};
+			int i = 0;
+			while (i < 3 && kScales[i] != s.upscale)
+				++i;
+			s.upscale = kScales[(i + 4 + step) % 4];
+			break;
+		}
 		case kRowFilter: s.filter = (s.filter + 3 + step) % 3; break;
 		case kRowBlending: s.min_blending = !s.min_blending; break;
 		case kRowAudio: s.audio_stretch = !s.audio_stretch; break;
@@ -268,7 +278,9 @@ bool un5_launcher(const char* dir)
 	g_current = s;
 	save(s);
 	setenv("UN5GS_BLEND", s.min_blending ? "0" : "1", 1);
-	setenv("UN5GS_UPSCALE", std::to_string(s.upscale).c_str(), 1);
+	char scale[8];
+	std::snprintf(scale, sizeof scale, "%d.%d", s.upscale / 10, s.upscale % 10);
+	setenv("UN5GS_UPSCALE", scale, 1);
 	setenv("UN5GS_FILTER", std::to_string(s.filter).c_str(), 1);
 	setenv("PS2_AUDIO_STRETCH", s.audio_stretch ? "1" : "0", 1);
 	setenv("UN5_SHOW_FPS", s.show_fps ? "1" : "0", 1);
@@ -291,8 +303,8 @@ bool un5_launcher(const char* dir)
 	setenv("PS2_MISSES", (miss_dir + "/misses.txt").c_str(), 0);
 	if (s.preset)
 		set_clocks(s.preset);
-	std::fprintf(stderr, "[launcher] preset %s, resolution %dx, filter %d, blending %s, audio stretching %s, renderer %s\n",
-		kPresets[s.preset].name, s.upscale, s.filter, s.min_blending ? "minimum" : "basic", s.audio_stretch ? "on" : "off",
+	std::fprintf(stderr, "[launcher] preset %s, resolution %d.%dx, filter %d, blending %s, audio stretching %s, renderer %s\n",
+		kPresets[s.preset].name, s.upscale / 10, s.upscale % 10, s.filter, s.min_blending ? "minimum" : "basic", s.audio_stretch ? "on" : "off",
 		s.deko3d ? "deko3d" : "OpenGL");
 	return true;
 }
