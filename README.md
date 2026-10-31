@@ -14,14 +14,12 @@ and are kept in [`archive/ps2recomp`](archive/ps2recomp).
 > of the game. Everything derived from your disc is built on your own
 > computer and stays there.
 
-**Status: experimental, phase 4 of 8.** Playable on macOS (Apple silicon):
-intro movies, title, menus, battles and Master Mode with its story dialogue,
-with sound, mostly at 50 frames per second. Some jutsu sometimes leave the
-picture striped, and the frame rate drops now and then. See
-[`docs/PHASE3.md`](docs/PHASE3.md). On the **Switch** it builds into an NRO
-that reaches the game in an emulator, far too slowly to play yet (software
-GS on one core); see [`docs/PHASE4.md`](docs/PHASE4.md). Windows is not
-started.
+**Status: experimental, phase 4 of 8.** On the **Switch** (title override,
+PCSX2's hardware GS on the GPU through deko3d) it plays intro movies, menus,
+battles, the shop and Master Mode; battles run at the PAL cap of 50 frames per
+second most of the time, movies at 13-20. On **macOS** (Apple silicon) it plays
+the same at 50. See [`docs/PHASE3.md`](docs/PHASE3.md) and
+[`docs/PHASE4.md`](docs/PHASE4.md). Windows is not started.
 
 ## Read the plan
 
@@ -53,6 +51,19 @@ started.
   The sound driver runs its own RPC server loop and insists that `close`
   return the descriptor it closed.
 
+## Building for the Switch from your ISO
+
+Everything is translated from the disc alone: no playing first, nothing
+captured from a console. With Docker:
+
+```sh
+docker build -t un5-nx-builder -f docker/Dockerfile .
+docker run --rm -v "/path/to/your.iso:/in/game.iso:ro" -v "$PWD/out:/out" un5-nx-builder
+```
+
+then copy `out/switch/un5-nx` to `sdmc:/switch/un5-nx` with your ISO as
+`disc.iso`. See [`docker/README.md`](docker/README.md).
+
 ## Building (macOS, Apple silicon)
 
 Requirements: Xcode command line tools, CMake, Ninja, Python 3, and your own
@@ -83,7 +94,11 @@ Builds use half the CPU cores by default (`JOBS=` to change it).
 |---|---|
 | `tools/setup_ps2webrecomp.sh` | Clones ps2-web-recomp at the pinned commit, applies `patches/ps2-web-recomp` with `git am`, ports your disc |
 | `tools/un5_play.sh` | Plays the game; when it halts on untranslated code, captures the overlays, seeds entries and rebuilds |
+| `tools/un5_from_iso.sh` | Translates the game from the disc alone: executable, the overlays in `PRG/`, every VU1 program |
+| `tools/un5_entries.py` | Lists every function start of the executable and the overlays by their layout |
+| `tools/un5_vu1.py` | Rebuilds the VU1 programs from the MPG upload blocks in the executable, for `vurecomp --snapshots` |
 | `tools/un5_seed.py` | Finds overlay functions reached through pointers: vtables, constructor tables, `lui`/`addiu` |
+| `tools/code_sync.sh`, `tools/vu_sync.sh` | Safety net: translate code or VU1 programs a Switch reached without a translation, and reinstall |
 | `tools/elfinfo.py` | Segments, sections and symbol families of a PS2 ELF |
 | `tools/xref.py` | R5900-aware address cross-references and disassembly (rabbitizer) |
 | `tools/ghidra_export.sh` | Ghidra headless analysis of the executable (and the PS2Recomp function export) |
