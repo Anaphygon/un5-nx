@@ -52,6 +52,7 @@ bool un5_hoc_open();
 u32 un5_hoc_nearest_hz(u32 module, u32 mhz);
 bool un5_hoc_override(const u32 hz[3]);
 bool un5_hoc_status(int out[5]);
+bool un5_hoc_real_mhz(unsigned out[3]);
 // From ps2-web-recomp's host/switch_threads.cpp: the core for threads
 // created from now on (-1: libnx's default).
 extern "C" void ps2_switch_new_thread_core(int core);
@@ -231,6 +232,13 @@ void log_draw_split(u32 fields, double gs_ms)
 #ifdef __SWITCH__
 	Console.WriteLn("[clocks] cpu %u (measured %u) gpu %u mem %u MHz; glthread worker on core %d", un5_clock_mhz(0),
 		un5_measured_cpu_mhz(), un5_clock_mhz(1), un5_clock_mhz(2), s_glthread_core);
+	// What the hardware really runs at, and how hot and hungry it is: a run on
+	// a charger once measured 1833 MHz where 1963 was set, and dropped frames.
+	unsigned real[3];
+	int st[5];
+	if (un5_hoc_real_mhz(real) && un5_hoc_status(st))
+		Console.WriteLn("[thermal] real cpu %u gpu %u mem %u MHz; SoC %.1f, CPU %.1f, GPU %.1f C; %d mW (average %d)", real[0], real[1],
+			real[2], st[0] / 10.0, st[1] / 10.0, st[2] / 10.0, st[3], st[4]);
 	// UN5_CLOCK_CYCLE="1224/768/1600,1785/921/1600,...": the run sets CPU/GPU/
 	// memory itself through Horizon OC's override, each set for two 5 s
 	// windows (the first lets it settle), UN5_CLOCK_ROUNDS times over (default

@@ -143,16 +143,38 @@ bool un5_hoc_override(const u32 hz[3])
 	return ok;
 }
 
+namespace
+{
+	bool hoc_context(StableContext& c)
+	{
+		alignas(8) static u8 buffer[8192];
+		if (!g_hoc_open || !g_is_hoc || R_FAILED(serviceDispatch(&g_hoc, kGetCurrentContext,
+							   .buffer_attrs = {SfBufferAttr_HipcAutoSelect | SfBufferAttr_Out},
+							   .buffers = {{buffer, sizeof(buffer)}})))
+			return false;
+		std::memcpy(&c, buffer, sizeof c);
+		return true;
+	}
+} // namespace
+
+// The clocks the hardware runs at, as Horizon OC reads them back: CPU, GPU and
+// memory in MHz. They can sit below what was set (heat, a charger profile).
+bool un5_hoc_real_mhz(unsigned out[3])
+{
+	StableContext c;
+	if (!hoc_context(c))
+		return false;
+	for (u32 m = 0; m < kModules; ++m)
+		out[m] = c.real_freqs[m] / 1000000;
+	return true;
+}
+
 // SoC, CPU and GPU temperature in tenths of a degree, power draw in mW.
 bool un5_hoc_status(int out[5])
 {
-	alignas(8) static u8 buffer[8192];
-	if (!g_hoc_open || !g_is_hoc || R_FAILED(serviceDispatch(&g_hoc, kGetCurrentContext,
-						   .buffer_attrs = {SfBufferAttr_HipcAutoSelect | SfBufferAttr_Out},
-						   .buffers = {{buffer, sizeof(buffer)}})))
-		return false;
 	StableContext c;
-	std::memcpy(&c, buffer, sizeof c);
+	if (!hoc_context(c))
+		return false;
 	out[0] = c.temps[0] / 100;
 	out[1] = c.temps[5] / 100;
 	out[2] = c.temps[6] / 100;
