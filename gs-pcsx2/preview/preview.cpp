@@ -27,7 +27,7 @@ namespace
 const char* un5_upscale_fix_name(int fix)
 {
 	static const char* const kNames[] = {"Game database", "Native scaling normal", "Native scaling off", "Half-pixel native",
-		"Round sprite", "Deinterlace adaptive"};
+		"Round sprite", "Deinterlace adaptive", "NetherSX2"};
 	return kNames[fix];
 }
 bool un5_hoc_open() { return true; }

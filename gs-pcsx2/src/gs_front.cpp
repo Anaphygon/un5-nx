@@ -546,7 +546,7 @@ void read_fifo(void* data, std::uint32_t qwords)
 const char* un5_upscale_fix_name(int fix)
 {
 	static const char* const kNames[kUpscaleFixes] = {"Game database", "Native scaling normal", "Native scaling off",
-		"Half-pixel native", "Round sprite", "Deinterlace adaptive"};
+		"Half-pixel native", "Round sprite", "Deinterlace adaptive", "NetherSX2"};
 	return kNames[std::clamp(fix, 0, kUpscaleFixes - 1)];
 }
 
@@ -556,6 +556,7 @@ void un5_apply_upscale_fix(int fix)
 	GSConfig.UserHacks_HalfPixelOffset = GSHalfPixelOffset::Special;
 	GSConfig.UserHacks_NativeScaling = GSNativeScaling::Aggressive;
 	GSConfig.UserHacks_RoundSprite = 0;
+	GSConfig.UserHacks_CPUCLUTRender = 0;
 	GSConfig.InterlaceMode = GSInterlaceMode::Automatic;
 	switch (fix)
 	{
@@ -564,6 +565,16 @@ void un5_apply_upscale_fix(int fix)
 		case 3: GSConfig.UserHacks_HalfPixelOffset = GSHalfPixelOffset::Native; break;
 		case 4: GSConfig.UserHacks_RoundSprite = 2; break;
 		case 5: GSConfig.InterlaceMode = GSInterlaceMode::AdaptiveTFF; break;
+		case 6:
+			// NetherSX2's game database for SLES-55605 (its emucore_4248 build,
+			// from an older PCSX2 that has no native scaling): half-pixel offset
+			// normal, round sprite full, and palettes the game draws resolved on
+			// the CPU instead of as GPU draws.
+			GSConfig.UserHacks_HalfPixelOffset = GSHalfPixelOffset::Normal;
+			GSConfig.UserHacks_NativeScaling = GSNativeScaling::Off;
+			GSConfig.UserHacks_RoundSprite = 2;
+			GSConfig.UserHacks_CPUCLUTRender = 1;
+			break;
 		default: break;
 	}
 	Console.WriteLn("un5gs: upscale fix %s", un5_upscale_fix_name(fix));

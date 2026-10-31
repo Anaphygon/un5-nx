@@ -39,8 +39,9 @@ Un5Settings un5_settings();
 // The upscale fixes, tried live from the menu: 0 the game database's (half-pixel
 // offset special, native scaling aggressive), 1 native scaling normal, 2 native
 // scaling off, 3 half-pixel offset native, 4 round sprite full, 5 adaptive
-// deinterlacing. Applied to the GS config (gs_front.cpp).
-constexpr int kUpscaleFixes = 6;
+// deinterlacing, 6 NetherSX2's (half-pixel normal, round sprite full, CPU CLUT
+// render, no native scaling). Applied to the GS config (gs_front.cpp).
+constexpr int kUpscaleFixes = 7;
 const char* un5_upscale_fix_name(int fix);
 void un5_apply_upscale_fix(int fix);
 void un5_settings_change(const Un5Settings& s);
