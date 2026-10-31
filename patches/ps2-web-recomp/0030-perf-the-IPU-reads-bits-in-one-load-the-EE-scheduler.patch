@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Fri, 30 Oct 2026 18:16:43 +0700
-Subject: [PATCH 30/31] perf: the IPU reads bits in one load; the EE scheduler
+Subject: [PATCH 30/33] perf: the IPU reads bits in one load; the EE scheduler
  walks a flat list
 
 Movies keep the EE thread busy (the intro runs ~13 fps on a Switch). The IPU

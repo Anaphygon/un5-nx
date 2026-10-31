@@ -1,0 +1,278 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 31 Oct 2026 08:15:29 +0700
+Subject: [PATCH 32/33] perf: compiled VU1 programs keep registers in locals
+ and work out flags only when read
+
+vurecomp now holds the VF registers and ACC a program uses in locals and writes them back where it leaves, as it already did for VI. In VU memory every instruction stored and reloaded them, and a lane written alone and then read with the others stalled the load on the store.
+
+In programs that never read a sticky status bit (all but the four that clear them with FSSET first), an op whose flags are live no longer computes them: FlagPipe::set_lazy keeps the result and the lanes, and mac(), status() and FSSET work the flags out from them when read. fl.commit brings r.mac and r.status up to date on the way out. Their sticky bits then miss the ops in between, which no UN5 program can see. efu takes VF[fs] by value so it reads the local.
+
+UN5 battle replay on the Mac: the three hottest programs from 1.58/1.28/1.64 to 0.99/0.93/0.98 us per run. Frames are byte-identical. PS2_VU_CHECK still differs from the interpreter only in flags: MAC as before, and status only in sticky bits (0 differences in bits 0-5, battle and boot). Its report now prints which flag bits differ.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ recomp/vurecomp.cpp            | 39 ++++++++++++++---
+ runtime/include/ps2/vu_ops.hpp | 80 ++++++++++++++++++++++++++--------
+ runtime/src/vu_micro.cpp       |  5 ++-
+ 3 files changed, 96 insertions(+), 28 deletions(-)
+
+diff --git a/recomp/vurecomp.cpp b/recomp/vurecomp.cpp
+index ced762e..d24982d 100644
+--- a/recomp/vurecomp.cpp
++++ b/recomp/vurecomp.cpp
+@@ -8,6 +8,7 @@
+ #include <format>
+ #include <fstream>
+ #include <map>
++#include <regex>
+ #include <set>
+ #include <string>
+ #include <vector>
+@@ -395,7 +396,7 @@ Lower lower(std::uint32_t w, std::uint32_t pc) {
+         case 0x69: c = std::format("set_vi(r, {}, vu::itop()); ", it); break;
+         case 0x6C: c = std::format("vu::kick(1, r.vi[{}]); ", is); break;
+         case 0x70: case 0x71: case 0x72: case 0x73: case 0x74: case 0x75: case 0x76: case 0x78: case 0x79: case 0x7A: case 0x7C: case 0x7D: case 0x7E:
+-            c = std::format("efu(r, {}u, {}u, {}u); ", index, fs, fsf);
++            c = std::format("efu(r, {}u, r.vf[{}], {}u); ", index, fs, fsf);
+             break;
+         case 0x7B: break;
+         default: l.supported = false; break;
+@@ -434,7 +435,7 @@ Lower lower(std::uint32_t w, std::uint32_t pc) {
+     case 0x12: c = std::format("set_vi(r, 1, (fl.clip() & {}u) ? 1u : 0u); ", w & 0xFFFFFFu); break;
+     case 0x13: c = std::format("set_vi(r, 1, ((fl.clip() | {}u) & 0xFFFFFFu) == 0xFFFFFFu ? 1u : 0u); ", w & 0xFFFFFFu); break;
+     case 0x14: c = std::format("set_vi(r, {}, (fl.status() & 0xFFFu) == {}u ? 1u : 0u); ", it, imm12); l.reads_flags = l.reads_status = l.reads_sticky = true; break;
+-    case 0x15: c = std::format("r.status = (fl.status() & 0x3Fu) | ({}u & 0xFC0u); fl.force_mac(r.mac, r.status); ", imm12); l.reads_flags = l.reads_status = true; break;
++    case 0x15: c = std::format("r.status = (fl.status() & 0x3Fu) | ({}u & 0xFC0u); fl.force_mac(fl.newest_mac(r), r.status); ", imm12); l.reads_flags = l.reads_status = true; break;
+     case 0x16:
+         c = std::format("set_vi(r, {}, fl.status() & {}u); ", it, imm12);
+         l.reads_flags = l.reads_status = true;
+@@ -470,8 +471,22 @@ void replace_all(std::string &s, const std::string &from, const std::string &to)
+     for (std::size_t at = s.find(from); at != std::string::npos; at = s.find(from, at + to.size())) s.replace(at, from.size(), to);
+ }
+ 
+-std::string local_vi(std::string o) {
+-    std::string declare, sync;
++// Keeps the VU registers a program uses in locals, which the host compiler
++// holds in its own registers, and writes them back where the program leaves
++// (to the interpreter, or at its end). In VU memory the VF registers cost a
++// store and a reload around every instruction, and a lane written alone then
++// read with the others stalls the load until the store is done.
++std::string local_regs(std::string o) {
++    std::string declare, sync, declare_vf;
++    for (int n = 0; n <= 32; ++n) {
++        const std::string reg = n == 32 ? "r.acc" : std::format("r.vf[{}]", n), local = n == 32 ? "facc" : std::format("f{}", n);
++        if (o.find(reg) == std::string::npos) continue;
++        replace_all(o, reg, local);
++        declare_vf += std::format("    Reg128 {} = {};\n", local, reg);
++        if (n) sync += std::format("{} = {}; ", reg, local);
++    }
++    const std::string start = "    fl.start(r);\n";
++    o.insert(o.find(start) + start.size(), declare_vf);
+     replace_all(o, "set_vi(r, 0, ", "drop_vi(");
+     replace_all(o, "r.vi[0]", "0u");
+     for (int n = 1; n < 16; ++n) {
+@@ -525,7 +540,7 @@ std::string generate(const Program &p, std::string &name, bool sticky_live) {
+     const std::vector<std::uint32_t> pcs = ps2::vu::reachable(p.code.data(), kMask, p.entry);
+     std::set<std::uint32_t> in(pcs.begin(), pcs.end());
+     std::map<std::uint32_t, Lower> lowers;
+-    bool any_status = false, any_flags = false, any_q = false;
++    bool any_status = false, any_flags = false, any_q = false, lazy = false;
+     for (std::uint32_t pc : pcs) {
+         const std::uint32_t lo = word(p.code, pc), hi = word(p.code, pc + 4);
+         Lower l;
+@@ -612,7 +627,13 @@ std::string generate(const Program &p, std::string &name, bool sticky_live) {
+         const std::uint32_t lo = word(p.code, pc), hi = word(p.code, pc + 4);
+         bool out_live = false;
+         for (std::int64_t s : successors(pc)) out_live = out_live || s < 0 || !in.count(static_cast<std::uint32_t>(s)) || live_in[static_cast<std::uint32_t>(s)];
+-        const Upper u = upper(hi, (any_status && sticky_live) ? true : (any_flags && out_live));
++        const bool exact = any_status && sticky_live;
++        Upper u = upper(hi, exact ? true : (any_flags && out_live));
++        if (!exact && u.post.find("flags(r, ") != std::string::npos) {
++            static const std::regex eager(R"(flags\(r, ([^,]+), (\d+u)\); fl\.set_mac\(r\.mac, r\.status\);)");
++            u.post = std::regex_replace(u.post, eager, "fl.set_lazy(vload($1), $2, r.status);");
++            lazy = true;
++        }
+         const Lower &l = lowers[pc];
+         std::string body;
+         if (keep_bk.count(pc)) body += std::format("next_bk = r.vi[{}]; ", def[pc]);
+@@ -666,7 +687,11 @@ std::string generate(const Program &p, std::string &name, bool sticky_live) {
+         replace_all(o, "vu::interpret(", "fl.flush_q(r); vu::interpret(");
+         replace_all(o, "r.tpc = ", "fl.flush_q(r); r.tpc = ");
+     }
+-    return local_vi(o);
++    if (lazy) {
++        replace_all(o, "vu::interpret(", "fl.commit(r); vu::interpret(");
++        replace_all(o, "r.tpc = ", "fl.commit(r); r.tpc = ");
++    }
++    return local_regs(o);
+ }
+ 
+ }
+diff --git a/runtime/include/ps2/vu_ops.hpp b/runtime/include/ps2/vu_ops.hpp
+index 28ce9b3..4d0e6c7 100644
+--- a/runtime/include/ps2/vu_ops.hpp
++++ b/runtime/include/ps2/vu_ops.hpp
+@@ -456,25 +456,33 @@ PS2_VU_INLINE v4u vitof(v4u x, int fraction) {
+     return (v4u)(f * (1.0f / static_cast<float>(1u << fraction)));
+ }
+ 
+-PS2_VU_INLINE void flags(Vu0Regs &r, const Reg128 &v, unsigned dest) {
++// The MAC flags of a result x written to the lanes in dest.
++PS2_VU_INLINE std::uint32_t mac_of(v4u x, unsigned dest) {
+     // All four lanes at once: lane i (x, y, z, w) owns bit 3 - i of the zero,
+     // sign and overflow nibbles; lanes outside dest contribute nothing.
+-    const v4u x = vload(v);
+     const v4u lane = {8u, 4u, 2u, 1u};
+     const v4u sel = lane & (v4u)((lane & dest) != 0);
+     const v4u zero = (v4u)((x & 0x7F800000u) == 0) & sel;
+     const v4u sign = (v4u)((x >> 31) != 0) & sel;
+     const v4u over = (v4u)((x & 0x7FFFFFFFu) == 0x7FFFFFFFu) & sel;
+     const v4u m = zero | (sign << 4) | (over << 12);
+-    const std::uint32_t mac = m[0] | m[1] | m[2] | m[3];
+-    r.mac = mac;
+-    std::uint32_t status = r.status & 0xFF0u;
++    return m[0] | m[1] | m[2] | m[3];
++}
++
++// The status flags after an op that set mac, from the status before it.
++PS2_VU_INLINE std::uint32_t status_of(std::uint32_t mac, std::uint32_t before) {
++    std::uint32_t status = before & 0xFF0u;
+     status |= (mac & 0x000Fu) ? 0x1u : 0u;
+     status |= (mac & 0x00F0u) ? 0x2u : 0u;
+     status |= (mac & 0x0F00u) ? 0x4u : 0u;
+     status |= (mac & 0xF000u) ? 0x8u : 0u;
+     status |= (status & 0xFu) << 6;
+-    r.status = (status & ~0x30u) | (r.status & 0x30u);
++    return (status & ~0x30u) | (before & 0x30u);
++}
++
++PS2_VU_INLINE void flags(Vu0Regs &r, const Reg128 &v, unsigned dest) {
++    r.mac = mac_of(vload(v), dest);
++    r.status = status_of(r.mac, r.status);
+ }
+ 
+ PS2_VU_INLINE std::uint32_t clip_value(const Vu0Regs &r, const Reg128 &s, std::uint32_t w) {
+@@ -499,9 +507,18 @@ PS2_VU_INLINE void clip(Vu0Regs &r, const Reg128 &s, std::uint32_t w) {
+     r.clip = ((r.clip << 6) | f) & 0xFFFFFFu;
+ }
+ 
++// The MAC, status and clip flags as the program reads them: each set lands
++// in a ring with its time, and a read sees the newest one old enough.
++// set_lazy keeps the result instead of the flags and works them out only
++// if they are read, which few are. It takes the status before the op from
++// r.status, which the program then no longer updates: its sticky bits miss
++// the ops in between, so vurecomp uses it only in programs that never read
++// a sticky bit. commit brings r.mac and r.status up to date on the way out.
+ struct FlagPipe {
+     std::uint32_t t = 16;
+     std::uint32_t mac_ts[8] = {}, mac_v[8] = {}, status_v[8] = {}, clip_ts[8] = {}, clip_v[8] = {};
++    v4u lazy_v[8];
++    std::uint32_t lazy_d[8] = {};  // 0: mac_v and status_v hold the flags
+     unsigned mh = 0, ch = 0;
+     std::uint32_t q_value = 0, q_ready = 0;
+     bool q_pending = false;
+@@ -538,6 +555,28 @@ struct FlagPipe {
+         mac_ts[i] = t;
+         mac_v[i] = mac;
+         status_v[i] = status;
++        lazy_d[i] = 0;
++    }
++    PS2_VU_INLINE void set_lazy(v4u result, unsigned dest, std::uint32_t status_before) {
++        const unsigned i = mh++ & 7u;
++        mac_ts[i] = t;
++        lazy_v[i] = result;
++        lazy_d[i] = dest;
++        status_v[i] = status_before;
++    }
++    PS2_VU_INLINE std::uint32_t mac_at(unsigned i) const { return lazy_d[i] ? mac_of(lazy_v[i], lazy_d[i]) : mac_v[i]; }
++    PS2_VU_INLINE std::uint32_t status_at(unsigned i) const {
++        return lazy_d[i] ? status_of(mac_of(lazy_v[i], lazy_d[i]), status_v[i]) : status_v[i];
++    }
++    // The newest MAC flags, whatever their age (FSSET keeps them).
++    PS2_VU_INLINE std::uint32_t newest_mac(const Vu0Regs &r) const {
++        const unsigned i = (mh - 1) & 7u;
++        return lazy_d[i] ? mac_at(i) : r.mac;
++    }
++    PS2_VU_INLINE void commit(Vu0Regs &r) const {
++        const unsigned i = (mh - 1) & 7u;
++        r.mac = mac_at(i);
++        r.status = (status_at(i) & ~0x30u) | (r.status & 0x30u);
+     }
+     PS2_VU_INLINE void set_clip(std::uint32_t clip, std::uint32_t at) {
+         const unsigned i = ch++ & 7u;
+@@ -555,8 +594,8 @@ struct FlagPipe {
+         }
+         return (mh - 8) & 7u;
+     }
+-    PS2_VU_INLINE std::uint32_t mac() const { return mac_v[mac_slot()]; }
+-    PS2_VU_INLINE std::uint32_t status() const { return status_v[mac_slot()]; }
++    PS2_VU_INLINE std::uint32_t mac() const { return mac_at(mac_slot()); }
++    PS2_VU_INLINE std::uint32_t status() const { return status_at(mac_slot()); }
+     PS2_VU_INLINE std::uint32_t clip() const {
+         for (unsigned k = 1; k <= 8; ++k) {
+             const unsigned i = (ch - k) & 7u;
+@@ -587,10 +626,11 @@ PS2_VU_INLINE float u2f(std::uint32_t v) {
+     return f;
+ }
+ 
+-inline void efu(Vu0Regs &r, unsigned index, unsigned fs, unsigned fsf) {
++// s is VF[fs]; compiled programs pass their local copy of it.
++inline void efu(Vu0Regs &r, unsigned index, const Reg128 &s, unsigned fsf) {
+     switch (index) {
+     case 0x70: case 0x71: case 0x72: case 0x73: {
+-        const float x = u2f(r.vf[fs].w[0]), y = u2f(r.vf[fs].w[1]), z = u2f(r.vf[fs].w[2]);
++        const float x = u2f(s.w[0]), y = u2f(s.w[1]), z = u2f(s.w[2]);
+         const float sum = x * x + y * y + z * z;
+         float p = sum;
+         if (index == 0x71) p = sum != 0.0f ? 1.0f / sum : 3.4e38f;
+@@ -599,17 +639,19 @@ inline void efu(Vu0Regs &r, unsigned index, unsigned fs, unsigned fsf) {
+         r.p = f2u(p);
+         break;
+     }
+-    case 0x74: r.p = f2u(std::atan2(u2f(r.vf[fs].w[1]), u2f(r.vf[fs].w[0]))); break;
+-    case 0x75: r.p = f2u(std::atan2(u2f(r.vf[fs].w[2]), u2f(r.vf[fs].w[0]))); break;
+-    case 0x76: r.p = f2u(u2f(r.vf[fs].w[0]) + u2f(r.vf[fs].w[1]) + u2f(r.vf[fs].w[2]) + u2f(r.vf[fs].w[3])); break;
+-    case 0x78: r.p = f2u(std::sqrt(std::fabs(u2f(r.vf[fs].w[fsf])))); break;
+-    case 0x79: { const float v = std::sqrt(std::fabs(u2f(r.vf[fs].w[fsf]))); r.p = f2u(v != 0.0f ? 1.0f / v : 3.4e38f); break; }
+-    case 0x7A: { const float v = u2f(r.vf[fs].w[fsf]); r.p = f2u(v != 0.0f ? 1.0f / v : 3.4e38f); break; }
+-    case 0x7C: r.p = f2u(std::sin(u2f(r.vf[fs].w[fsf]))); break;
+-    case 0x7D: r.p = f2u(std::atan(u2f(r.vf[fs].w[fsf]))); break;
+-    case 0x7E: r.p = f2u(std::exp(-u2f(r.vf[fs].w[fsf]))); break;
++    case 0x74: r.p = f2u(std::atan2(u2f(s.w[1]), u2f(s.w[0]))); break;
++    case 0x75: r.p = f2u(std::atan2(u2f(s.w[2]), u2f(s.w[0]))); break;
++    case 0x76: r.p = f2u(u2f(s.w[0]) + u2f(s.w[1]) + u2f(s.w[2]) + u2f(s.w[3])); break;
++    case 0x78: r.p = f2u(std::sqrt(std::fabs(u2f(s.w[fsf])))); break;
++    case 0x79: { const float v = std::sqrt(std::fabs(u2f(s.w[fsf]))); r.p = f2u(v != 0.0f ? 1.0f / v : 3.4e38f); break; }
++    case 0x7A: { const float v = u2f(s.w[fsf]); r.p = f2u(v != 0.0f ? 1.0f / v : 3.4e38f); break; }
++    case 0x7C: r.p = f2u(std::sin(u2f(s.w[fsf]))); break;
++    case 0x7D: r.p = f2u(std::atan(u2f(s.w[fsf]))); break;
++    case 0x7E: r.p = f2u(std::exp(-u2f(s.w[fsf]))); break;
+     default: break;
+     }
+ }
+ 
++inline void efu(Vu0Regs &r, unsigned index, unsigned fs, unsigned fsf) { efu(r, index, r.vf[fs], fsf); }
++
+ }
+diff --git a/runtime/src/vu_micro.cpp b/runtime/src/vu_micro.cpp
+index 259091a..93c7bfc 100644
+--- a/runtime/src/vu_micro.cpp
++++ b/runtime/src/vu_micro.cpp
+@@ -1073,10 +1073,11 @@ void run_entry(int unit, std::uint32_t pc) {
+                             if (after.vi[i] != g_vu1.vi[i]) vi = i;
+                         std::uint32_t word = ~0u;
+                         for (int i = 0; i < 16384 && word == ~0u; ++i) word = run_mem[i] ^ g_vu1_mem[i] ? i : ~0u;
+-                        std::fprintf(stderr, "[vu-check] key %016llX entry %04X call %llu: vf%d vi%d q/p/i/r %d flags %d mem %d\n", static_cast<unsigned long long>(key),
++                        std::fprintf(stderr, "[vu-check] key %016llX entry %04X call %llu: vf%d vi%d q/p/i/r %d flags %d mem %d (mac ^%X status ^%X clip ^%X)\n", static_cast<unsigned long long>(key),
+                                      pc & 16383u, static_cast<unsigned long long>(checked), vf, vi,
+                                      after.q != g_vu1.q || after.p != g_vu1.p || after.i != g_vu1.i || after.r != g_vu1.r,
+-                                     after.mac != g_vu1.mac || after.status != g_vu1.status || after.clip != g_vu1.clip, word == ~0u ? -1 : static_cast<int>(word));
++                                     after.mac != g_vu1.mac || after.status != g_vu1.status || after.clip != g_vu1.clip, word == ~0u ? -1 : static_cast<int>(word),
++                                     after.mac ^ g_vu1.mac, after.status ^ g_vu1.status, after.clip ^ g_vu1.clip);
+                     }
+                 }
+                 ++checked;
+-- 
+2.54.0 (Apple Git-157)
+

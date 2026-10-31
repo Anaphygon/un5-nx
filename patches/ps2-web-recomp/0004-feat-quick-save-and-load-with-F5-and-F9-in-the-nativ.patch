@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Tue, 27 Oct 2026 11:37:56 +0700
-Subject: [PATCH 04/31] feat: quick save and load with F5 and F9 in the native
+Subject: [PATCH 04/33] feat: quick save and load with F5 and F9 in the native
  window
 
 The web page has quick state buttons; the native runner could only save at a frame given on the command line. Used to capture a battle in UN5 and replay it headless with both GS renderers.

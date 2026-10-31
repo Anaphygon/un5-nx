@@ -1,0 +1,210 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 31 Oct 2026 08:15:29 +0700
+Subject: [PATCH 33/33] perf: the IPU's IDCT sums only coefficients that are
+ not zero; colour conversion and bit reads without branches
+
+The reference IDCT left out of its sums the terms of zero coefficients and the rows that are all zero, keeping the order of the rest, so its output is the same to the bit; the sums run across x, which the compiler vectorizes. Colour conversion does a row of 16 pixels without branches into the output buffer. The bit reader's fast path is inline, with refilling and the FIFO tail out of line.
+
+Intro movie on the Mac: IPU samples from 680 to about 540; all 100 sampled frames byte-identical.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ runtime/src/ipu/ipu.cpp | 117 +++++++++++++++++++++++++---------------
+ 1 file changed, 75 insertions(+), 42 deletions(-)
+
+diff --git a/runtime/src/ipu/ipu.cpp b/runtime/src/ipu/ipu.cpp
+index e5d64e2..d5bd9bd 100644
+--- a/runtime/src/ipu/ipu.cpp
++++ b/runtime/src/ipu/ipu.cpp
+@@ -83,12 +83,13 @@ struct Tables {
+     Lookup motion = build(kMotionCode), dmv = build(kDmVector), dc_luma = build(kDcSizeLuma), dc_chroma = build(kDcSizeChroma);
+     Lookup cbp = build(kCodedBlockPattern);
+     DctLookup dct0 = build(kDctTable0), dct1 = build(kDctTable1);
+-    double cosines[8][8];
++    double cosines[8][8];  // [x][u]
++    double by_frequency[8][8];  // the same, [u][x]
+ 
+     Tables() {
+         for (int x = 0; x < 8; ++x)
+             for (int u = 0; u < 8; ++u)
+-                cosines[x][u] = (u ? 0.5 : 0.5 / std::sqrt(2.0)) * std::cos((2 * x + 1) * u * 3.14159265358979323846 / 16.0);
++                by_frequency[u][x] = cosines[x][u] = (u ? 0.5 : 0.5 / std::sqrt(2.0)) * std::cos((2 * x + 1) * u * 3.14159265358979323846 / 16.0);
+     }
+ };
+ 
+@@ -123,46 +124,60 @@ bool pull() {
+     return true;
+ }
+ 
+-bool have(std::size_t bits) {
++[[gnu::noinline]] bool fill(std::size_t bits) {
+     while (g_in.size() * 8 < g_bit + bits)
+         if (!pull()) return false;
+     return true;
+ }
+ 
++// Inline when the FIFO already holds the bits, as it nearly always does.
++inline bool have(std::size_t bits) { return g_in.size() * 8 >= g_bit + bits || fill(bits); }
++
+ std::size_t available() { return g_in.size() * 8 > g_bit ? g_in.size() * 8 - g_bit : 0; }
+ 
+-std::uint32_t bits_at(std::size_t bit, unsigned n) {
++// The last bytes of the FIFO, zeros past its end.
++[[gnu::noinline]] std::uint64_t tail_bytes(std::size_t byte) {
++    std::uint8_t b[8] = {};
++    if (byte < g_in.size()) std::memcpy(b, g_in.data() + byte, std::min<std::size_t>(8, g_in.size() - byte));
++    std::uint64_t v;
++    std::memcpy(&v, b, 8);
++    return __builtin_bswap64(v);
++}
++
++inline std::uint32_t bits_at(std::size_t bit, unsigned n) {
+     if (!n) return 0;
+-    std::uint64_t v = 0;
++    std::uint64_t v;
+     const std::size_t byte = bit >> 3;
+-    if (byte + 8 <= g_in.size()) {
++    if (byte + 8 <= g_in.size()) [[likely]] {
+         // One load instead of eight bounds-checked bytes: every VLC peek of a
+         // movie goes through here.
+         std::memcpy(&v, g_in.data() + byte, 8);
+         v = __builtin_bswap64(v);
+     } else {
+-        for (std::size_t i = 0; i < 8; ++i) v = (v << 8) | (byte + i < g_in.size() ? g_in[byte + i] : 0u);
++        v = tail_bytes(byte);
+     }
+     return static_cast<std::uint32_t>((v << (bit & 7u)) >> (64 - n));
+ }
+ 
+-std::uint32_t peek(unsigned n) {
+-    if (!have(n)) throw NeedData{};
++[[noreturn, gnu::noinline]] void need_data() { throw NeedData{}; }
++
++inline std::uint32_t peek(unsigned n) {
++    if (!have(n)) need_data();
+     return bits_at(g_bit, n);
+ }
+ 
+-std::uint32_t get(unsigned n) {
++inline std::uint32_t get(unsigned n) {
+     const std::uint32_t v = peek(n);
+     g_bit += n;
+     return v;
+ }
+ 
+-void skip(unsigned n) {
+-    if (!have(n)) throw NeedData{};
++inline void skip(unsigned n) {
++    if (!have(n)) need_data();
+     g_bit += n;
+ }
+ 
+-std::uint32_t peek_soft(unsigned n, std::size_t &avail) {
++inline std::uint32_t peek_soft(unsigned n, std::size_t &avail) {
+     have(n);
+     avail = available();
+     return bits_at(g_bit, n);
+@@ -237,21 +252,38 @@ bool read_coefficient(const DctLookup &l, int &run, int &level) {
+     return true;
+ }
+ 
++// The separable reference IDCT, in doubles. A block has few coefficients
++// that are not zero, so only those are summed: a zero term leaves a sum as it
++// was, and the others are added in the same order as before, so the result
++// does not change by a bit. Each sum runs across x, eight at once, which the
++// compiler vectorizes.
+ void idct(const int *in, std::int16_t *out) {
+-    const auto &c = tables().cosines;
++    const Tables &t = tables();
+     double rows[8][8];
+-    for (int v = 0; v < 8; ++v)
+-        for (int x = 0; x < 8; ++x) {
+-            double s = 0;
+-            for (int u = 0; u < 8; ++u) s += c[x][u] * in[v * 8 + u];
+-            rows[v][x] = s;
++    int used[8], count = 0;
++    for (int v = 0; v < 8; ++v) {
++        double *row = rows[v];
++        bool any = false;
++        for (int x = 0; x < 8; ++x) row[x] = 0;
++        for (int u = 0; u < 8; ++u) {
++            const int k = in[v * 8 + u];
++            if (!k) continue;
++            any = true;
++            const double d = k;
++            const double *c = t.by_frequency[u];
++            for (int x = 0; x < 8; ++x) row[x] += c[x] * d;
+         }
+-    for (int y = 0; y < 8; ++y)
+-        for (int x = 0; x < 8; ++x) {
+-            double s = 0;
+-            for (int v = 0; v < 8; ++v) s += c[y][v] * rows[v][x];
+-            out[y * 8 + x] = static_cast<std::int16_t>(std::clamp(static_cast<int>(std::floor(s + 0.5)), -256, 255));
++        if (any) used[count++] = v;
++    }
++    for (int y = 0; y < 8; ++y) {
++        double s[8] = {};
++        for (int i = 0; i < count; ++i) {
++            const int v = used[i];
++            const double c = t.cosines[y][v];
++            for (int x = 0; x < 8; ++x) s[x] += c * rows[v][x];
+         }
++        for (int x = 0; x < 8; ++x) out[y * 8 + x] = static_cast<std::int16_t>(std::clamp(static_cast<int>(std::floor(s[x] + 0.5)), -256, 255));
++    }
+ }
+ 
+ void decode_block(std::int16_t *out, int channel, bool intra, std::uint32_t qsc) {
+@@ -322,30 +354,31 @@ void decode_macroblock(std::int16_t *raw, bool intra, bool field, bool dc_reset,
+     std::memcpy(raw + 320, blocks[5], 128);
+ }
+ 
++// A row of 16 pixels at a time, without branches, so the compiler
++// vectorizes it.
+ void convert(const std::uint8_t *raw, bool rgb16) {
+-    std::uint8_t pixels[1024];
+-    std::size_t size = 0;
+-    for (int y = 0; y < 16; ++y)
++    const int th0 = g_th0, th1 = g_th1;
++    const std::size_t at = g_out.size();
++    g_out.resize(at + (rgb16 ? 512 : 1024));
++    std::uint8_t *pixels = g_out.data() + at;
++    for (int y = 0; y < 16; ++y) {
++        const std::uint8_t *luma = raw + y * 16, *cbs = raw + 256 + (y / 2) * 8, *crs = raw + 320 + (y / 2) * 8;
++        std::uint32_t out32[16];
++        std::uint16_t out16[16];
+         for (int x = 0; x < 16; ++x) {
+-            const int lum = 149 * std::max(0, raw[y * 16 + x] - 16);
+-            const int cb = raw[256 + (y / 2) * 8 + x / 2] - 128, cr = raw[320 + (y / 2) * 8 + x / 2] - 128;
++            const int lum = 149 * std::max(0, luma[x] - 16);
++            const int cb = cbs[x / 2] - 128, cr = crs[x / 2] - 128;
+             const int r = std::clamp((lum + 204 * cr + 64) >> 7, 0, 255);
+             const int g = std::clamp((lum - 50 * cb - 104 * cr + 64) >> 7, 0, 255);
+             const int b = std::clamp((lum + 258 * cb + 64) >> 7, 0, 255);
+-            int a = 0x80;
+-            if (r < g_th0 && g < g_th0 && b < g_th0) a = 0;
+-            else if (r < g_th1 && g < g_th1 && b < g_th1) a = 0x40;
+-            if (rgb16) {
+-                const std::uint16_t p = static_cast<std::uint16_t>((r >> 3) | ((g >> 3) << 5) | ((b >> 3) << 10) | (a & 0x80 ? 0x8000 : 0));
+-                std::memcpy(pixels + size, &p, 2);
+-                size += 2;
+-            } else {
+-                const std::uint8_t p[4] = {static_cast<std::uint8_t>(r), static_cast<std::uint8_t>(g), static_cast<std::uint8_t>(b), static_cast<std::uint8_t>(a)};
+-                std::memcpy(pixels + size, p, 4);
+-                size += 4;
+-            }
++            const int top = std::max(r, std::max(g, b));
++            const int a = top < th0 ? 0 : top < th1 ? 0x40 : 0x80;
++            out32[x] = static_cast<std::uint32_t>(r | (g << 8) | (b << 16) | (a << 24));
++            out16[x] = static_cast<std::uint16_t>((r >> 3) | ((g >> 3) << 5) | ((b >> 3) << 10) | (a & 0x80 ? 0x8000 : 0));
+         }
+-    g_out.insert(g_out.end(), pixels, pixels + size);
++        if (rgb16) std::memcpy(pixels + y * 32, out16, 32);
++        else std::memcpy(pixels + y * 64, out32, 64);
++    }
+ }
+ 
+ void emit_raw16(const std::int16_t *raw) {
+-- 
+2.54.0 (Apple Git-157)
+
