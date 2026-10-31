@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Sat, 31 Oct 2026 19:12:32 +0700
-Subject: [PATCH 35/36] fix: a code window image may differ in one check word
+Subject: [PATCH 35/39] fix: a code window image may differ in one check word
  in 64
 
 On a Switch, Master Mode's image went from 6 to 11 to 12 differing data

@@ -1,0 +1,112 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 1 Nov 2026 04:15:42 +0700
+Subject: [PATCH 39/39] feat: PS2_PROFILE samples on macOS arm64 too
+
+The SIGPROF sampler takes the PC and link register from the arm64 thread
+state and offsets from the executable's Mach-O header, which is what
+atos -l expects. Built with -gline-tables-only, its samples resolve to
+generated source lines and so to the guest labels above them.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ CMakeLists.txt   |  3 ++-
+ host/profile.cpp | 26 ++++++++++++++++++++++++++
+ 2 files changed, 28 insertions(+), 1 deletion(-)
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 8a3aded..b18fae6 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -134,7 +134,8 @@ if(PS2_GENERATED)
+ 
+     add_executable(ps2run host/main.cpp)
+     target_link_libraries(ps2run PRIVATE ps2game ps2runtime)
+-    if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
++    if((CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
++       OR (APPLE AND CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64"))
+         target_sources(ps2run PRIVATE host/profile.cpp)
+         target_compile_definitions(ps2run PRIVATE PS2_PROFILE)
+     endif()
+diff --git a/host/profile.cpp b/host/profile.cpp
+index d5e5110..f6c9de0 100644
+--- a/host/profile.cpp
++++ b/host/profile.cpp
+@@ -8,11 +8,19 @@
+ #include <cstdlib>
+ #include <dlfcn.h>
+ #include <functional>
++#ifdef __APPLE__
++#include <mach-o/dyld.h>
++#else
+ #include <link.h>
++#endif
+ #include <map>
+ #include <string>
+ #include <sys/time.h>
++#ifdef __APPLE__
++#include <sys/ucontext.h>
++#else
+ #include <ucontext.h>
++#endif
+ 
+ namespace {
+ 
+@@ -28,14 +36,24 @@ std::uint64_t g_from = 0;
+ 
+ void sample(int, siginfo_t *, void *context) {
+     const auto *uc = static_cast<const ucontext_t *>(context);
++#if defined(__APPLE__) && defined(__aarch64__)
++    const std::uintptr_t pc = static_cast<std::uintptr_t>(uc->uc_mcontext->__ss.__pc);
++    const std::uintptr_t lr = static_cast<std::uintptr_t>(uc->uc_mcontext->__ss.__lr);
++#else
+     const std::uintptr_t pc = static_cast<std::uintptr_t>(uc->uc_mcontext.gregs[REG_RIP]);
++#endif
+     ++g_samples;
+     const std::uintptr_t offset = (pc - g_base) >> 4;
+     if (pc >= g_base && offset < kSlots) {
+         ++g_hits[offset];
+         return;
+     }
++#if defined(__APPLE__) && defined(__aarch64__)
++    // A leaf's return address is still in the link register.
++    const std::uintptr_t caller = lr;
++#else
+     const std::uintptr_t caller = *reinterpret_cast<const std::uintptr_t *>(uc->uc_mcontext.gregs[REG_RSP]);
++#endif
+     const std::uintptr_t coff = (caller - g_base) >> 4;
+     if (caller >= g_base && coff < kSlots) ++g_caller_hits[coff];
+     const std::uintptr_t key = pc >> 4;
+@@ -46,6 +64,7 @@ void sample(int, siginfo_t *, void *context) {
+     ++g_lost;
+ }
+ 
++#ifndef __APPLE__
+ int find_base(dl_phdr_info *info, std::size_t, void *) {
+     if (!info->dlpi_name || !info->dlpi_name[0]) {
+         g_base = info->dlpi_addr;
+@@ -54,6 +73,8 @@ int find_base(dl_phdr_info *info, std::size_t, void *) {
+     return 0;
+ }
+ 
++#endif
++
+ void arm() {
+     struct sigaction sa{};
+     sa.sa_sigaction = sample;
+@@ -68,7 +89,12 @@ void arm() {
+ }
+ 
+ void start_profile(std::uint64_t from_frame) {
++#ifdef __APPLE__
++    // Offsets are from the executable's Mach-O header, as atos -l takes it.
++    g_base = reinterpret_cast<std::uintptr_t>(_dyld_get_image_header(0));
++#else
+     dl_iterate_phdr(find_base, nullptr);
++#endif
+     g_from = from_frame;
+     if (!g_from) {
+         arm();
+-- 
+2.54.0 (Apple Git-157)
+

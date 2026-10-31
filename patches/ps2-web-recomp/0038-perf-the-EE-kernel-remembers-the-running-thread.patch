@@ -1,0 +1,64 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 1 Nov 2026 04:15:42 +0700
+Subject: [PATCH 38/39] perf: the EE kernel remembers the running thread
+
+current() walked the thread list on every syscall and switch, thousands of
+times a frame in a movie (3.5% of a movie on the Mac). It now keeps its last
+answer until the running thread or the list changes: the intro run goes
+from 23.7 to 22.5 s. Frames identical.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ runtime/src/kernel.cpp | 20 +++++++++++++++++---
+ 1 file changed, 17 insertions(+), 3 deletions(-)
+
+diff --git a/runtime/src/kernel.cpp b/runtime/src/kernel.cpp
+index 67690ec..7e34e74 100644
+--- a/runtime/src/kernel.cpp
++++ b/runtime/src/kernel.cpp
+@@ -79,6 +79,8 @@ std::map<int, Thread> g_threads;
+ // the map showed in profiles). Rebuilt when g_threads_changed is set;
+ // map nodes keep their address, so the pointers stay valid until then.
+ bool g_threads_changed = true;
++// Counts the rebuilds, so a pointer found in one list is known to be stale.
++std::uint64_t g_threads_generation = 0;
+ 
+ const std::vector<Thread *> &thread_list() {
+     static std::vector<Thread *> list;
+@@ -86,6 +88,7 @@ const std::vector<Thread *> &thread_list() {
+         list.clear();
+         for (auto &[id, t] : g_threads) list.push_back(&t);
+         g_threads_changed = false;
++        ++g_threads_generation;
+     }
+     return list;
+ }
+@@ -113,10 +116,21 @@ int lowest_free(const Map &map, int limit, int first = 1) {
+ std::uint32_t arg(const Cpu &c, int i) { return c.r[4 + i].w[0]; }
+ void ret(Cpu &c, std::int64_t v) { c.r[2].sd[0] = v; }
+ 
++// The running thread is asked for on every syscall and switch (thousands of
++// times a frame in a movie), so the last answer is kept until the thread or
++// the list changes.
+ Thread *current() {
+-    for (Thread *t : thread_list())
+-        if (t->id == g_current) return t;
+-    return nullptr;
++    static int cached_id = -1;
++    static Thread *cached = nullptr;
++    static std::uint64_t cached_generation = 0;
++    const std::vector<Thread *> &list = thread_list();
++    if (g_current == cached_id && cached_generation == g_threads_generation) return cached;
++    cached = nullptr;
++    for (Thread *t : list)
++        if (t->id == g_current) cached = t;
++    cached_id = g_current;
++    cached_generation = g_threads_generation;
++    return cached;
+ }
+ 
+ Thread *thread(int id) {
+-- 
+2.54.0 (Apple Git-157)
+

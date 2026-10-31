@@ -1,0 +1,104 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 1 Nov 2026 04:15:42 +0700
+Subject: [PATCH 37/39] perf: the translated code's loads and stores are always
+ inlined
+
+Every load and store of the generated code goes through ld*/st*. In UN5's
+big generated units clang called them out of line; [[gnu::always_inline]]
+makes a battle replay 36% faster (13.65 to 8.76 s) and the intro 11% faster
+(22.5 to 20.0 s) on the Mac, for 20% more code (80 to 96 MB of text).
+Frames identical.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ runtime/include/ps2/memory.hpp | 26 +++++++++++++++-----------
+ 1 file changed, 15 insertions(+), 11 deletions(-)
+
+diff --git a/runtime/include/ps2/memory.hpp b/runtime/include/ps2/memory.hpp
+index 6a919d2..5121027 100644
+--- a/runtime/include/ps2/memory.hpp
++++ b/runtime/include/ps2/memory.hpp
+@@ -38,7 +38,7 @@ void slow_st64(std::uint32_t a, std::uint64_t v);
+ void slow_st128(std::uint32_t a, const Reg128 &v);
+ 
+ template <typename T>
+-inline T *fast(std::uint32_t a) {
++[[gnu::always_inline]] inline T *fast(std::uint32_t a) {
+     if (a < kRamSize) [[likely]] return reinterpret_cast<T *>(g_ram + a);
+     if ((a >> 14) == (kScratchpadBase >> 14)) return reinterpret_cast<T *>(g_spr + (a & (kScratchpadSize - 1)));
+     return nullptr;
+@@ -54,56 +54,60 @@ inline T load(const void *p) {
+ template <typename T>
+ inline void store(void *p, T v) { std::memcpy(p, &v, sizeof v); }
+ 
+-inline std::uint8_t ld8(std::uint32_t a) {
++// Every load and store of the translated code comes through these. Left to
++// itself the compiler calls them out of line in big generated units (clang
++// did in UN5's): forcing them inline made a UN5 battle replay 36% faster and
++// its intro 11% faster on the Mac, for 20% more code.
++[[gnu::always_inline]] inline std::uint8_t ld8(std::uint32_t a) {
+     if (auto *p = fast<std::uint8_t>(a)) return *p;
+     return slow_ld8(a);
+ }
+ 
+-inline std::uint16_t ld16(std::uint32_t a) {
++[[gnu::always_inline]] inline std::uint16_t ld16(std::uint32_t a) {
+     if (auto *p = fast<std::uint8_t>(a)) return load<std::uint16_t>(p);
+     return slow_ld16(a);
+ }
+ 
+-inline std::uint32_t ld32(std::uint32_t a) {
++[[gnu::always_inline]] inline std::uint32_t ld32(std::uint32_t a) {
+     if (auto *p = fast<std::uint8_t>(a)) return load<std::uint32_t>(p);
+     return slow_ld32(a);
+ }
+ 
+-inline std::uint64_t ld64(std::uint32_t a) {
++[[gnu::always_inline]] inline std::uint64_t ld64(std::uint32_t a) {
+     if (auto *p = fast<std::uint8_t>(a)) return load<std::uint64_t>(p);
+     return slow_ld64(a);
+ }
+ 
+-inline void ld128(std::uint32_t a, Reg128 &out) {
++[[gnu::always_inline]] inline void ld128(std::uint32_t a, Reg128 &out) {
+     if (auto *p = fast<std::uint8_t>(a)) { std::memcpy(&out, p, 16); return; }
+     slow_ld128(a, out);
+ }
+ 
+-inline void st8(std::uint32_t a, std::uint8_t v) {
++[[gnu::always_inline]] inline void st8(std::uint32_t a, std::uint8_t v) {
+     watched<std::uint8_t>(a, v);
+     if (auto *p = fast<std::uint8_t>(a)) { *p = v; return; }
+     slow_st8(a, v);
+ }
+ 
+-inline void st16(std::uint32_t a, std::uint16_t v) {
++[[gnu::always_inline]] inline void st16(std::uint32_t a, std::uint16_t v) {
+     watched<std::uint16_t>(a, v);
+     if (auto *p = fast<std::uint8_t>(a)) { store(p, v); return; }
+     slow_st16(a, v);
+ }
+ 
+-inline void st32(std::uint32_t a, std::uint32_t v) {
++[[gnu::always_inline]] inline void st32(std::uint32_t a, std::uint32_t v) {
+     watched<std::uint32_t>(a, v);
+     if (auto *p = fast<std::uint8_t>(a)) { store(p, v); return; }
+     slow_st32(a, v);
+ }
+ 
+-inline void st64(std::uint32_t a, std::uint64_t v) {
++[[gnu::always_inline]] inline void st64(std::uint32_t a, std::uint64_t v) {
+     watched<std::uint32_t>(a, static_cast<std::uint32_t>(v));
+     if (auto *p = fast<std::uint8_t>(a)) { store(p, v); return; }
+     slow_st64(a, v);
+ }
+ 
+-inline void st128(std::uint32_t a, const Reg128 &v) {
++[[gnu::always_inline]] inline void st128(std::uint32_t a, const Reg128 &v) {
+     watched<std::uint32_t>(a, v.w[0]);
+     if (auto *p = fast<std::uint8_t>(a)) { std::memcpy(p, &v, 16); return; }
+     slow_st128(a, v);
+-- 
+2.54.0 (Apple Git-157)
+
