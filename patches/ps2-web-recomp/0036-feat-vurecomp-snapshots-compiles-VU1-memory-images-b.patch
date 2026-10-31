@@ -1,0 +1,127 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 1 Nov 2026 03:32:02 +0700
+Subject: [PATCH 36/36] feat: vurecomp --snapshots compiles VU1 memory images
+ built from the executable
+
+A port can now take its VU1 programs from the game's executable instead of
+recording them as the game runs: --snapshots reads images named
+<anything>_<entry>.bin, or <anything>.bin with its entries listed in
+<anything>.entries, computes each program's key and keeps one program per key.
+Recorded programs (the default) compile as before, byte for byte.
+
+Code built that way may start inside data, where a branch can sit in a
+branch's delay slot with its target unreached; the generated code now leaves
+such a branch to the interpreter instead of jumping to a label it never wrote.
+
+UN5: the executable alone gives 2489 programs, 133 of the 134 recorded ones
+(the other is a jump target into code left behind by an earlier upload);
+no program ran interpreted in the Mac regression runs.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ recomp/vurecomp.cpp | 70 +++++++++++++++++++++++++++++++++------------
+ 1 file changed, 52 insertions(+), 18 deletions(-)
+
+diff --git a/recomp/vurecomp.cpp b/recomp/vurecomp.cpp
+index d24982d..a2b10b8 100644
+--- a/recomp/vurecomp.cpp
++++ b/recomp/vurecomp.cpp
+@@ -676,7 +676,11 @@ std::string generate(const Program &p, std::string &name, bool sticky_live) {
+                 const std::string tpc = pl.branch ? std::format("pend ? {}u : {}", pl.target & kMask, after) : pl.jump ? "pendj ? jpc : " + after : after;
+                 o += std::format("    if (ending) {{ r.tpc = {}; return; }}\n", tpc);
+             }
+-            if (pl.branch) o += std::format("    if (pend) {{ pend = false; goto {}; }}\n", label(pl.target));
++            // A branch in a branch's delay slot (code built from the game's
++            // executable may start inside data) can leave its target
++            // unreached: the interpreter goes on from there.
++            if (pl.branch && in.count(pl.target & kMask)) o += std::format("    if (pend) {{ pend = false; goto {}; }}\n", label(pl.target));
++            else if (pl.branch) o += std::format("    if (pend) {{ vu::interpret(1, {}u); return; }}\n", pl.target & kMask);
+             if (pl.jump) o += "    if (pendj) { pendj = false; goto dispatch; }\n";
+         }
+         const std::uint32_t next = (pc + 8u) & kMask;
+@@ -697,34 +701,64 @@ std::string generate(const Program &p, std::string &name, bool sticky_live) {
+ }
+ 
+ int main(int argc, char **argv) {
+-    if (argc > 1 && std::string(argv[1]) == "--rz") {
+-        g_rz = true;
+-        --argc;
+-        ++argv;
++    // --snapshots: the files are VU1 memory images built from the game's
++    // executable rather than recorded, named <anything>_<entry>.bin, or
++    // <anything>.bin with the entries (hex byte addresses) listed in
++    // <anything>.entries. Each program's key is computed, and images giving
++    // one key are one program.
++    bool snapshots = false;
++    for (; argc > 1 && argv[1][0] == '-'; --argc, ++argv) {
++        if (std::string(argv[1]) == "--rz") g_rz = true;
++        else if (std::string(argv[1]) == "--snapshots") snapshots = true;
++        else break;
+     }
+     if (argc < 3) {
+-        std::fprintf(stderr, "usage: vurecomp [--rz] <recorded programs dir> <out dir>\n");
++        std::fprintf(stderr, "usage: vurecomp [--rz] [--snapshots] <recorded programs dir> <out dir>\n");
+         return 1;
+     }
+     const fs::path in_dir = argv[1], out_dir = argv[2];
+     std::vector<Program> programs;
+-    for (const auto &e : fs::directory_iterator(in_dir)) {
+-        if (e.path().extension() != ".bin") continue;
++    std::set<std::uint64_t> keys;
++    std::vector<fs::path> files;
++    for (const auto &e : fs::directory_iterator(in_dir))
++        if (e.path().extension() == ".bin") files.push_back(e.path());
++    std::sort(files.begin(), files.end());
++    for (const fs::path &path : files) {
++        const std::string stem = path.stem().string();
+         unsigned long long key = 0;
++        std::vector<unsigned> entries;
+         unsigned entry = 0;
+-        if (std::sscanf(e.path().stem().string().c_str(), "%llx_%x", &key, &entry) != 2) continue;
+-        std::ifstream f(e.path(), std::ios::binary);
+-        Program p{key, entry, std::vector<std::uint8_t>(kMask + 1)};
+-        f.read(reinterpret_cast<char *>(p.code.data()), static_cast<std::streamsize>(p.code.size()));
+-        const auto pcs = ps2::vu::reachable(p.code.data(), kMask, entry);
+-        if (ps2::vu::program_key(p.code.data(), pcs, entry) != key) {
+-            std::fprintf(stderr, "%s: key mismatch, skipped\n", e.path().filename().c_str());
++        if (snapshots) {
++            fs::path list = path;
++            list.replace_extension(".entries");
++            if (std::ifstream in(list); in) {
++                for (std::string token; in >> token;) entries.push_back(static_cast<unsigned>(std::stoul(token, nullptr, 16)));
++            } else {
++                const auto split = stem.rfind('_');
++                if (split == std::string::npos || std::sscanf(stem.c_str() + split + 1, "%x", &entry) != 1) continue;
++                entries.push_back(entry);
++            }
++        } else if (std::sscanf(stem.c_str(), "%llx_%x", &key, &entry) != 2) {
+             continue;
++        } else {
++            entries.push_back(entry);
++        }
++        std::vector<std::uint8_t> code(kMask + 1);
++        std::ifstream(path, std::ios::binary).read(reinterpret_cast<char *>(code.data()), static_cast<std::streamsize>(code.size()));
++        for (const unsigned at : entries) {
++            Program p{key, at & kMask, code};
++            const auto pcs = ps2::vu::reachable(p.code.data(), kMask, p.entry);
++            const std::uint64_t computed = ps2::vu::program_key(p.code.data(), pcs, p.entry);
++            if (snapshots) {
++                p.key = computed;
++            } else if (computed != key) {
++                std::fprintf(stderr, "%s: key mismatch, skipped\n", path.filename().c_str());
++                continue;
++            }
++            if (!keys.insert(p.key).second) continue;
++            programs.push_back(std::move(p));
+         }
+-        programs.push_back(std::move(p));
+     }
+-    std::set<std::uint64_t> keys;
+-    for (const Program &p : programs) keys.insert(p.key);
+     const std::size_t recorded = programs.size();
+     for (std::size_t i = 0; i < recorded; ++i) {
+         std::set<std::uint32_t> targets;
+-- 
+2.54.0 (Apple Git-157)
+
