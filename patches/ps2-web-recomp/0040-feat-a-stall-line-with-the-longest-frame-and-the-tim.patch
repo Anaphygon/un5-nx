@@ -1,0 +1,127 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 1 Nov 2026 05:27:36 +0700
+Subject: [PATCH 40/40] feat: a [stall] line, with the longest frame and the
+ time spent reading the disc
+
+Every 5 s, next to [audio]: the longest gap between two frames, how many
+frames took over 40 ms, and how many disc reads there were, how much they
+read and how long they blocked the EE thread (the longest of them too).
+On a Switch a UN5 battle fell to 28 fps in a 5 s window with neither the
+VU nor the GS thread busy; this tells a freeze reading the ISO from the
+SD card from a slow stretch.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ host/window.cpp              | 21 +++++++++++++++++++++
+ runtime/include/ps2/disc.hpp | 10 ++++++++++
+ runtime/src/disc.cpp         | 15 +++++++++++++++
+ 3 files changed, 46 insertions(+)
+
+diff --git a/host/window.cpp b/host/window.cpp
+index 2b09712..ed56890 100644
+--- a/host/window.cpp
++++ b/host/window.cpp
+@@ -4,6 +4,7 @@
+ #endif
+ #include "window.hpp"
+ 
++#include "ps2/disc.hpp"
+ #include "ps2/external_gs.hpp"
+ #include "ps2/state_request.hpp"
+ #include "ps2/system.hpp"
+@@ -255,8 +256,23 @@ void present() {
+ 
+ constexpr Uint32 kAudioBytesPerMs = 48 * 4;
+ 
++// The longest gap between two frames and how many ran over 40 ms (two PAL
++// frames), for the [stall] line: a 5 s average hides a freeze of a second.
++double g_frame_longest_ms = 0;
++std::uint32_t g_frames_over_40 = 0;
++
+ void pace() {
+     const std::uint64_t frequency = SDL_GetPerformanceFrequency();
++    {
++        static std::uint64_t previous = 0;
++        const std::uint64_t t = SDL_GetPerformanceCounter();
++        if (previous) {
++            const double gap = static_cast<double>(t - previous) * 1000.0 / static_cast<double>(frequency);
++            g_frame_longest_ms = std::max(g_frame_longest_ms, gap);
++            g_frames_over_40 += gap > 40.0;
++        }
++        previous = t;
++    }
+     std::uint64_t period = frequency / (ps2::g_options.pal ? 50 : 60);
+     if (g_audio) {
+         // Frames follow the wall clock, and the queued sound only nudges the
+@@ -409,6 +425,11 @@ void queue_audio(const std::int16_t *samples, std::size_t frames) {
+                      a.queued_min, a.queued_sum / a.batches, a.starved, a.batches, a.in_frames ? a.out_frames / a.in_frames : 1.0,
+                      g_pace_slept_ms, g_pace_sleeps);
+         g_pace_slept_ms = g_pace_sleeps = 0;
++        const ps2::disc::ReadStats d = ps2::disc::take_read_stats();
++        std::fprintf(stderr, "[stall] longest frame %.0f ms, %u frames over 40 ms; disc %u reads, %.1f MB in %.0f ms (longest %.0f ms)\n",
++                     g_frame_longest_ms, g_frames_over_40, d.reads, static_cast<double>(d.bytes) / 1048576.0, d.ms, d.longest_ms);
++        g_frame_longest_ms = 0;
++        g_frames_over_40 = 0;
+         a = AudioStats{};
+         a.since = now;
+     }
+diff --git a/runtime/include/ps2/disc.hpp b/runtime/include/ps2/disc.hpp
+index 0f1af64..f3fec47 100644
+--- a/runtime/include/ps2/disc.hpp
++++ b/runtime/include/ps2/disc.hpp
+@@ -29,4 +29,14 @@ std::optional<Entry> find(const std::string &path);
+ std::uint32_t layer1_start();
+ std::uint64_t sector_count();
+ 
++// Time the emulation spent reading the disc image since the last call: the
++// reads block the EE thread, and on a console's SD card a long one shows as
++// a stall.
++struct ReadStats {
++    std::uint32_t reads = 0;
++    std::uint64_t bytes = 0;
++    double ms = 0, longest_ms = 0;
++};
++ReadStats take_read_stats();
++
+ }
+diff --git a/runtime/src/disc.cpp b/runtime/src/disc.cpp
+index 4491f35..b25e357 100644
+--- a/runtime/src/disc.cpp
++++ b/runtime/src/disc.cpp
+@@ -1,6 +1,7 @@
+ #include "ps2/disc.hpp"
+ 
+ #include <algorithm>
++#include <chrono>
+ #include <cctype>
+ #include <cstdio>
+ #include <cstring>
+@@ -107,10 +108,24 @@ bool open(const std::string &name, std::uint64_t size, Reader reader, Probe prob
+ 
+ bool is_open() { return static_cast<bool>(g_reader); }
+ 
++ReadStats g_read_stats;
++
++ReadStats take_read_stats() {
++    const ReadStats s = g_read_stats;
++    g_read_stats = {};
++    return s;
++}
++
+ bool read(std::uint32_t sector, std::uint32_t count, void *out) {
+     if (!g_reader) return false;
+     const std::size_t want = static_cast<std::size_t>(count) * kSector;
++    const auto start = std::chrono::steady_clock::now();
+     const std::size_t got = g_reader(static_cast<std::uint64_t>(sector) * kSector, out, want);
++    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
++    ++g_read_stats.reads;
++    g_read_stats.bytes += want;
++    g_read_stats.ms += ms;
++    g_read_stats.longest_ms = std::max(g_read_stats.longest_ms, ms);
+     if (got < want) std::memset(static_cast<std::uint8_t *>(out) + got, 0, want - got);
+     return got > 0 || !count;
+ }
+-- 
+2.54.0 (Apple Git-157)
+

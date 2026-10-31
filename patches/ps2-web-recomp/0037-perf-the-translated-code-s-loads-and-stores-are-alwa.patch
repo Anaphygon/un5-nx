@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Sun, 1 Nov 2026 04:15:42 +0700
-Subject: [PATCH 37/39] perf: the translated code's loads and stores are always
+Subject: [PATCH 37/40] perf: the translated code's loads and stores are always
  inlined
 
 Every load and store of the generated code goes through ld*/st*. In UN5's

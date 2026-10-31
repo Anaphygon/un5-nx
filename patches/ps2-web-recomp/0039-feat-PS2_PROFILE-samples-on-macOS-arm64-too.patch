@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Sun, 1 Nov 2026 04:15:42 +0700
-Subject: [PATCH 39/39] feat: PS2_PROFILE samples on macOS arm64 too
+Subject: [PATCH 39/40] feat: PS2_PROFILE samples on macOS arm64 too
 
 The SIGPROF sampler takes the PC and link register from the arm64 thread
 state and offsets from the executable's Mach-O header, which is what
