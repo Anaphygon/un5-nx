@@ -58,5 +58,8 @@ echo "Translating the EE code..."
 
 echo "Translating the VU1 programs..."
 python3 -I "$here/un5_vu1.py" "$G/disc/SLES_556.05" "$work/vu1"
+# Programs the Switch recorded (tools/vu_sync.sh) join them: code an earlier,
+# longer upload left in VU memory is out of the executable's reach.
+if [ -d "$G/vu1" ]; then cp "$G"/vu1/*.bin "$work/vu1/" 2>/dev/null || true; fi
 (cd "$web" && build/tools/vurecomp --rz --snapshots "$work/vu1" generated/un5 | tail -1)
 echo "Done: $web/generated/un5"

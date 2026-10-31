@@ -5,7 +5,8 @@
 # PS2_VU_RECORD on); left to the interpreter they are about ten times slower.
 # This pulls them (switch-devtools running, over USB or Wi-Fi), adds them to
 # the game's VU1 programs, translates them with vurecomp, builds the NRO,
-# installs it on the Switch and empties the folder.
+# installs it on the Switch and empties the folder. They join the programs
+# tools/un5_from_iso.sh builds from the executable.
 #
 #   tools/vu_sync.sh
 #
@@ -46,7 +47,7 @@ if [ "$new" -eq 0 ]; then
 	exit 0
 fi
 echo "$new new VU1 program(s); translating..."
-(cd "$web" && build/tools/vurecomp --rz "$programs" generated/un5 | tail -1)
+"$(dirname "$0")/un5_from_iso.sh" "$web/games/un5/disc.iso" | tail -1
 
 echo "Building the NRO..."
 export PATH="$HOME/SwitchDev/.tools:/opt/devkitpro/devkitA64/bin:/opt/devkitpro/tools/bin:$PATH"

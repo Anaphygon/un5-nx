@@ -4,9 +4,10 @@
 # game halts on such code (the shop's overlay, say, never played on the Mac),
 # the runner leaves its RAM and the missed entries in
 # sdmc:/switch/un5-nx/code-miss/. This pulls them (switch-devtools running),
-# captures the overlay images in the RAM and seeds their entries as
-# tools/un5_play.sh does after a halt on the Mac, translates with eerecomp,
-# builds the NRO, installs it and empties the folder.
+# adds the missed entries to ports/un5/entries.txt, translates the game again
+# with tools/un5_from_iso.sh, builds the NRO, installs it and empties the
+# folder. Commit ports/un5/entries.txt afterwards: the entries are addresses,
+# not game data.
 #
 #   tools/code_sync.sh
 #
@@ -16,6 +17,7 @@
 set -euo pipefail
 
 here="$(cd "$(dirname "$0")" && pwd)"
+root="$(dirname "$here")"
 devtools="${DEVTOOLS:-$HOME/SwitchDev/nxdev/tools/devtools.py}"
 web="${PS2WEB:-$HOME/SwitchDev/ps2-web-recomp}"
 build="${BUILD:-$web/build/switch-un5}"
@@ -47,10 +49,22 @@ dt get "$remote/misses.txt" "$work/misses.txt" >/dev/null 2>&1 || : >"$work/miss
 grep -vx '0' "$work/misses.txt" >"$work/misses" || true
 echo "Missed: $(tr '\n' ' ' <"$work/misses")"
 
-cd "$web"
-python3 -I scripts/windows.py capture "$ELF" "$work/ram.bin" "$G/overlays" "$work/misses"
-python3 -I "$here/un5_seed.py" "$ELF" "$G/entries.txt" "$G/overlays" "$work/misses"
-build/tools/eerecomp "$ELF" --entries "$G/entries.txt" --overlays "$G/overlays" --out generated/un5 | tail -1
+# A miss in the overlay window names the overlay the RAM holds (its header's
+# kind: 1 BTL, 2 ADV, 3 ETC), as tools/un5_from_iso.sh names the images. The
+# entries join ports/un5/entries.txt, and the whole game is translated again.
+python3 -I - "$work/ram.bin" "$work/misses" >>"$root/ports/un5/entries.txt" <<'PY'
+import struct, sys
+ram, misses = open(sys.argv[1], 'rb').read(), open(sys.argv[2]).read().split()
+base, kinds = 0x6C6D00, {1: 'BTL', 2: 'ADV', 3: 'ETC'}
+for token in misses:
+    if ':' in token:
+        print(token)
+        continue
+    pc = int(token, 16)
+    kind = kinds.get(struct.unpack_from('<I', ram, base + 4)[0])
+    print('%08X_%s:%x' % (base, kind, pc - base) if kind and base <= pc < 0x8F3D00 else '%x' % pc)
+PY
+"$here/un5_from_iso.sh" "$G/disc.iso" | tail -1
 
 echo "Building the NRO..."
 export PATH="$HOME/SwitchDev/.tools:/opt/devkitpro/devkitA64/bin:/opt/devkitpro/tools/bin:$PATH"
