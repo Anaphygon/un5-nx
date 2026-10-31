@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Fri, 30 Oct 2026 18:16:43 +0700
-Subject: [PATCH 31/33] perf: the pacer caps its debt at three frames instead
+Subject: [PATCH 31/34] perf: the pacer caps its debt at three frames instead
  of forgiving it
 
 After a debt over three frames the pacer started over, so vblanks that came

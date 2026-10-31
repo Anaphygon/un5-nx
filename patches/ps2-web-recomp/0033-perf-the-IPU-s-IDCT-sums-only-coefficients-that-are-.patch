@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Sat, 31 Oct 2026 08:15:29 +0700
-Subject: [PATCH 33/33] perf: the IPU's IDCT sums only coefficients that are
+Subject: [PATCH 33/34] perf: the IPU's IDCT sums only coefficients that are
  not zero; colour conversion and bit reads without branches
 
 The reference IDCT left out of its sums the terms of zero coefficients and the rows that are all zero, keeping the order of the rest, so its output is the same to the bit; the sums run across x, which the compiler vectorizes. Colour conversion does a row of 16 pixels without branches into the output buffer. The bit reader's fast path is inline, with refilling and the FIFO tail out of line.

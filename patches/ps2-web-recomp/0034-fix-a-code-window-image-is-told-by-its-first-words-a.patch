@@ -1,0 +1,126 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 31 Oct 2026 16:56:48 +0700
+Subject: [PATCH 34/34] fix: a code window image is told by its first words and
+ tolerates data words
+
+UN5 loads its shop (ETC) over the battle overlay (BTL) at 0x6C6D00 and leaves
+the battle's tail in place. On a Switch the shop crashed after a battle: the
+cached battle image passed the one turning check word per call (the images
+share ~92% of their words), so battle code ran over the shop and overwrote a
+saved return address with 1, a jump to 0.
+
+Two causes, two changes:
+- Every call into a window image also checks the image's first four code
+  words, which each load of the window rewrites, so a stale image is dropped
+  on the first call after a load.
+- The recompiler takes some data for code: BTL keeps a table of heap pointers
+  among its functions, filled differently by each battle, and the shop keeps
+  them. An image whose first words are in place may now differ in up to 16
+  words; the one differing least serves and those words are not checked.
+  Before, the shop image never matched after another battle, and ADV served
+  only while the turning check missed its 6 such words.
+
+Battle replay, intro movie: frames identical. Shop after Free Battle and
+Master Mode from a save run on the Mac.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ runtime/src/dispatch.cpp | 58 +++++++++++++++++++++++++++++++++++-----
+ 1 file changed, 51 insertions(+), 7 deletions(-)
+
+diff --git a/runtime/src/dispatch.cpp b/runtime/src/dispatch.cpp
+index 425f17f..19f0d57 100644
+--- a/runtime/src/dispatch.cpp
++++ b/runtime/src/dispatch.cpp
+@@ -25,6 +25,9 @@ constexpr std::uint32_t kModuleMagic = 0x32524E53u;
+ struct Instance {
+     std::uint32_t base;
+     const ModuleInfo *module;
++    // Check words a window image was taken with although they differ in
++    // memory: data the recompiler took for code (see window_image).
++    std::vector<std::uint32_t> stale;
+ };
+ 
+ const ModuleInfo *g_modules = nullptr;
+@@ -48,16 +51,52 @@ bool loaded_at(const ModuleInfo &m, std::uint32_t base) {
+ // cheap while even a one word change of the image is caught in time.
+ std::uint32_t g_spot_cursor = 0;
+ 
++// Images of one window can share most of their words: UN5 loads its shop over
++// the battle overlay and leaves the battle's tail in place, so the turning
++// word passed for the battle image for many calls into the shop, which ran
++// battle code and wrecked its stack. Every call therefore also checks the
++// image's first code words, which every load of the window rewrites.
++constexpr std::uint32_t kLeadWords = 4;
++
++bool leads_in_place(const ModuleInfo &m, std::uint32_t base) {
++    for (std::uint32_t k = 0; k < std::min(m.check_count, kLeadWords); ++k)
++        if (ld32(base + m.checks[2 * k]) != m.checks[2 * k + 1]) return false;
++    return true;
++}
++
+ const Instance *in_place(const Instance &i) {
+     static const bool full = std::getenv("PS2_WINDOW_FULL") != nullptr;
+     if (full || !i.module->fixed_base) return loaded_at(*i.module, i.base) ? &i : nullptr;
+     if (!i.module->check_count) return &i;
++    if (!leads_in_place(*i.module, i.base)) return nullptr;
+     const std::uint32_t c = g_spot_cursor++ % i.module->check_count;
+-    return ld32(i.base + i.module->checks[2 * c]) == i.module->checks[2 * c + 1] ? &i : nullptr;
++    if (ld32(i.base + i.module->checks[2 * c]) == i.module->checks[2 * c + 1]) return &i;
++    return std::binary_search(i.stale.begin(), i.stale.end(), c) ? &i : nullptr;
++}
++
++// The recompiler takes for code some words that are data: UN5's battle overlay
++// holds a table of heap pointers among its functions, which every battle
++// fills differently, and the shop, loaded over it, keeps them. A window image
++// whose leading words are in place may differ from memory in up to
++// kStaleWords such words; an image of other content differs in thousands.
++// The image differing least serves, and its differing words are not checked.
++constexpr std::uint32_t kStaleWords = 16;
++
++bool window_image(const ModuleInfo &m, Instance &out) {
++    if (!leads_in_place(m, m.fixed_base)) return false;
++    std::vector<std::uint32_t> stale;
++    for (std::uint32_t k = 0; k < m.check_count; ++k) {
++        if (ld32(m.fixed_base + m.checks[2 * k]) == m.checks[2 * k + 1]) continue;
++        if (stale.size() == kStaleWords) return false;
++        stale.push_back(k);
++    }
++    if (out.module && out.stale.size() <= stale.size()) return false;
++    out = {m.fixed_base, &m, std::move(stale)};
++    return true;
+ }
+ 
+ Instance make_instance(std::uint32_t base, const ModuleInfo *m) {
+-    return {base, m};
++    return {base, m, {}};
+ }
+ 
+ const Instance *instance_for(std::uint32_t pc) {
+@@ -71,12 +110,17 @@ const Instance *instance_for(std::uint32_t pc) {
+     if (!g_module_count || pc >= kRamSize) return nullptr;
+     // A code window rewritten by the game holds fixed base modules, each an
+     // image of one content. The one whose check words are in place serves it.
+-    for (std::uint32_t k = 0; k < g_module_count; ++k) {
++    Instance best{0, nullptr, {}};
++    for (std::uint32_t k = 0; k < g_module_count && !(best.module && best.stale.empty()); ++k) {
+         const ModuleInfo &m = g_modules[k];
+-        if (m.fixed_base && pc - m.fixed_base < m.size && loaded_at(m, m.fixed_base)) {
+-            g_instances.push_back(make_instance(m.fixed_base, &m));
+-            return &g_instances.back();
+-        }
++        if (m.fixed_base && pc - m.fixed_base < m.size) window_image(m, best);
++    }
++    if (best.module) {
++        if (!best.stale.empty())
++            std::fprintf(stderr, "[ee] window image %s serves with %zu data words differing (first at +0x%X)\n", best.module->name,
++                         best.stale.size(), best.module->checks[2 * best.stale.front()]);
++        g_instances.push_back(std::move(best));
++        return &g_instances.back();
+     }
+     for (std::uint32_t at = pc & ~15u; pc - at < g_module_span; at -= 16) {
+         if (ld32(at) == kModuleMagic) {
+-- 
+2.54.0 (Apple Git-157)
+
