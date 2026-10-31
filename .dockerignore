@@ -1,0 +1,9 @@
+# The builder takes sources only; local builds and third-party checkouts stay out.
+.git
+out
+third_party
+gs-pcsx2/build
+gs-pcsx2/preview/launcher-preview
+**/*.log
+**/__pycache__
+**/.DS_Store
