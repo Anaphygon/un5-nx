@@ -8,7 +8,8 @@ writes comes from your disc: keep it on your machine.
 
 The layout, as read from UN5 (SLES-55605); see tools/ccs_dump.py for chunks:
 - clump 0x0900: id, node count, node object ids, then per node a local
-  transform: position, rotation (degrees, X then Y then Z), scale.
+  transform: position, rotation (degrees, matrix Rx * Ry * Rz), scale.
+  World space is Z-up.
 - object 0x0100: id, parent object, model, shadow model, root.
 - model 0x0800: id, scale, type, primitive count, draw flags, u16, lookup
   count (u8 of a word), two UN5 words, then for skinned models (type bit 2)
@@ -140,17 +141,39 @@ def mat_mul(a, b):
     return [sum(a[r * 4 + k] * b[k * 4 + c] for k in range(4)) for r in range(4) for c in range(4)]
 
 
-def local_matrix(pose):
-    px, py, pz, rx, ry, rz, sx, sy, sz = pose
-    cx, sx_ = math.cos(math.radians(rx)), math.sin(math.radians(rx))
-    cy, sy_ = math.cos(math.radians(ry)), math.sin(math.radians(ry))
-    cz, sz_ = math.cos(math.radians(rz)), math.sin(math.radians(rz))
-    mx = [1, 0, 0, 0, 0, cx, -sx_, 0, 0, sx_, cx, 0, 0, 0, 0, 1]
-    my = [cy, 0, sy_, 0, 0, 1, 0, 0, -sy_, 0, cy, 0, 0, 0, 0, 1]
-    mz = [cz, -sz_, 0, 0, sz_, cz, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]
-    r = mat_mul(mz, mat_mul(my, mx))
-    m = [r[0] * sx, r[1] * sy, r[2] * sz, px, r[4] * sx, r[5] * sy, r[6] * sz, py, r[8] * sx, r[9] * sy, r[10] * sz, pz, 0, 0, 0, 1]
-    return m
+def euler_matrix(rx: float, ry: float, rz: float) -> list:
+    """Rx * Ry * Rz of angles in degrees. Checked on Anko: only this order
+    stands the bind pose and the battle motions upright on world Z."""
+    cx, sx = math.cos(math.radians(rx)), math.sin(math.radians(rx))
+    cy, sy = math.cos(math.radians(ry)), math.sin(math.radians(ry))
+    cz, sz = math.cos(math.radians(rz)), math.sin(math.radians(rz))
+    mx = [1, 0, 0, 0, 0, cx, -sx, 0, 0, sx, cx, 0, 0, 0, 0, 1]
+    my = [cy, 0, sy, 0, 0, 1, 0, 0, -sy, 0, cy, 0, 0, 0, 0, 1]
+    mz = [cz, -sz, 0, 0, sz, cz, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]
+    return mat_mul(mx, mat_mul(my, mz))
+
+
+def quat_matrix(x: float, y: float, z: float, w: float) -> list:
+    """A stored quaternion (x, y, z, w) as a matrix. 3ds Max stores the
+    inverse rotation, so the vector part is negated."""
+    n = math.sqrt(x * x + y * y + z * z + w * w) or 1.0
+    x, y, z, w = -x / n, -y / n, -z / n, w / n
+    return [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w), 0,
+            2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w), 0,
+            2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y), 0,
+            0, 0, 0, 1]
+
+
+def trs_matrix(pos, rot: list, scale) -> list:
+    """Translation, rotation matrix and scale composed into one local matrix."""
+    sx, sy, sz = scale
+    r = rot
+    return [r[0] * sx, r[1] * sy, r[2] * sz, pos[0], r[4] * sx, r[5] * sy, r[6] * sz, pos[1],
+            r[8] * sx, r[9] * sy, r[10] * sz, pos[2], 0, 0, 0, 1]
+
+
+def local_matrix(pose) -> list:
+    return trs_matrix(pose[0:3], euler_matrix(*pose[3:6]), pose[6:9])
 
 
 def apply(m, v):
@@ -158,8 +181,11 @@ def apply(m, v):
     return (m[0] * x + m[1] * y + m[2] * z + m[3], m[4] * x + m[5] * y + m[6] * z + m[7], m[8] * x + m[9] * y + m[10] * z + m[11])
 
 
-def world_matrices(ccs: dict, clump: dict) -> dict:
-    local = dict(zip(clump['nodes'], (local_matrix(p) for p in clump['pose'])))
+def world_matrices(ccs: dict, clump: dict, local: dict | None = None) -> dict:
+    """World matrix of every clump node from local matrices by object id;
+    the clump's bind pose by default."""
+    if local is None:
+        local = dict(zip(clump['nodes'], (local_matrix(p) for p in clump['pose'])))
     world: dict = {}
 
     def get(oid):
@@ -199,10 +225,10 @@ def write_png(path: str, w: int, h: int, rgba: bytes) -> None:
                             + chunk(b'IDAT', zlib.compress(rows, 9)) + chunk(b'IEND', b''))
 
 
-def export_clump(ccs: dict, clump: dict, out: str) -> str:
+def export_clump(ccs: dict, clump: dict, out: str, local: dict | None = None, tag: str = '') -> str:
     names = ccs['names']
-    base = names[clump['id']].replace(' ', '_') or 'clump%d' % clump['id']
-    world = world_matrices(ccs, clump)
+    base = (names[clump['id']].replace(' ', '_') or 'clump%d' % clump['id']) + tag
+    world = world_matrices(ccs, clump, local)
     obj, mtl, used = [], [], set()
     nv = 0
     for oid in clump['nodes']:
