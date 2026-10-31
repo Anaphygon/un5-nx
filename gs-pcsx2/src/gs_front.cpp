@@ -377,13 +377,34 @@ void log_speed()
 	s_gs_ticks = 0;
 }
 
-// PCSX2 logs through Console; the runner's log is stderr.
-void log_to_stderr(LOGLEVEL, ConsoleColors, std::string_view message)
+// PCSX2 logs through Console; the runner's log is stderr, unbuffered, on the
+// SD card. Developer messages are kept to 10 a second: the texture cache warns
+// "Uneven pages mess up" on every draw of some UN5 effects, up to 1500 lines a
+// session, and writing them stalled the GS thread for up to a second.
+void log_to_stderr(LOGLEVEL level, ConsoleColors, std::string_view message)
 {
 	if (message.find("Compiling new") != std::string_view::npos)
 	{
 		++s_shader_compiles;
 		return;
+	}
+	if (level >= LOGLEVEL_DEV)
+	{
+		static Common::Timer::Value second = 0;
+		static u32 written = 0, dropped = 0;
+		const Common::Timer::Value now = Common::Timer::GetCurrentValue();
+		if (Common::Timer::ConvertValueToSeconds(now - second) >= 1.0)
+		{
+			if (dropped)
+				std::fprintf(stderr, "[log] %u developer messages dropped\n", dropped);
+			second = now;
+			written = dropped = 0;
+		}
+		if (++written > 10)
+		{
+			++dropped;
+			return;
+		}
 	}
 	std::fwrite(message.data(), 1, message.size(), stderr);
 	if (message.empty() || message.back() != '\n')
