@@ -1,0 +1,203 @@
+From c1c0a3bcb2207cdbb705e26d06e53962c5da10b8 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 1 Nov 2026 07:19:40 +0700
+Subject: [PATCH] feat: native VU1 stand-ins run in place of compiled programs
+
+register_native stand-ins were only timed by PS2_VU_BENCH; now the first
+one registered for a program key runs instead of the compiled program.
+A stand-in may hand a call back to the compiled program through
+vu::native_fallback() for cases it does not cover.
+
+- PS2_VU_NATIVE=0 keeps the compiled programs; PS2_VU_NATIVE=alt takes
+  native and compiled in turn, call by call, so PS2_VU_PROFILE times both
+  on the same scenes (natives are marked N in its program list).
+- PS2_VU_NATIVE_CHECK=1 runs the compiled program first on every call,
+  muted, and compares VU memory and VI/VF registers with the native run.
+- PS2_VU_BENCH_SKIP=n benches a later call than the first.
+- A port's native_*.cpp in the generated folder is built into ps2run
+  itself: they register from static initialisers nothing references, so
+  the linker would drop them from the game library.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ CMakeLists.txt                 |  8 ++++
+ runtime/include/ps2/vu_ops.hpp |  7 ++-
+ runtime/src/vu_micro.cpp       | 80 +++++++++++++++++++++++++++++++++-
+ 3 files changed, 93 insertions(+), 2 deletions(-)
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index b18fae6..6a0f530 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -107,6 +107,10 @@ endif()
+ 
+ if(PS2_GENERATED)
+     file(GLOB PS2_UNITS CONFIGURE_DEPENDS "${PS2_GENERATED}/*.cpp")
++    file(GLOB PS2_NATIVES CONFIGURE_DEPENDS "${PS2_GENERATED}/native_*.cpp")
++    if(PS2_NATIVES)
++        list(REMOVE_ITEM PS2_UNITS ${PS2_NATIVES})
++    endif()
+     add_library(ps2game STATIC ${PS2_UNITS})
+     target_include_directories(ps2game PRIVATE "${PS2_GENERATED}")
+     target_link_libraries(ps2game PUBLIC ps2runtime)
+@@ -134,6 +138,10 @@ if(PS2_GENERATED)
+ 
+     add_executable(ps2run host/main.cpp)
+     target_link_libraries(ps2run PRIVATE ps2game ps2runtime)
++    # A port's native VU1 stand-ins (native_*.cpp) register themselves from
++    # static initialisers nothing else references: built into the executable,
++    # not the library, so the linker keeps them.
++    target_sources(ps2run PRIVATE ${PS2_NATIVES})
+     if((CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
+        OR (APPLE AND CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64"))
+         target_sources(ps2run PRIVATE host/profile.cpp)
+diff --git a/runtime/include/ps2/vu_ops.hpp b/runtime/include/ps2/vu_ops.hpp
+index 4d0e6c7..a234d5e 100644
+--- a/runtime/include/ps2/vu_ops.hpp
++++ b/runtime/include/ps2/vu_ops.hpp
+@@ -31,8 +31,13 @@ struct Program {
+ void register_programs(const Program *programs, std::uint32_t count, bool round_to_zero = false);
+ // A hand-written stand-in for the compiled program with this key, compared
+ // with it by PS2_VU_BENCH. Several may be registered; they are timed in the
+-// order they were registered.
++// order they were registered. The first one runs in place of the compiled
++// program (PS2_VU_NATIVE=0 keeps the compiled one; PS2_VU_NATIVE_CHECK=1
++// runs both on every call and reports where they differ).
+ void register_native(std::uint64_t key, ProgramFn function);
++// Inside a native stand-in: the compiled program it replaces, for the cases
++// the native code leaves to it.
++ProgramFn native_fallback();
+ 
+ inline std::uint32_t lower_major(std::uint32_t lo) { return lo >> 25; }
+ // Flag reads bypass the one-instruction VI delay seen by branch operands.
+diff --git a/runtime/src/vu_micro.cpp b/runtime/src/vu_micro.cpp
+index 93c7bfc..32addbe 100644
+--- a/runtime/src/vu_micro.cpp
++++ b/runtime/src/vu_micro.cpp
+@@ -781,6 +781,9 @@ std::unordered_map<std::uint64_t, std::vector<ProgramFn>> &natives() {
+     return map;
+ }
+ 
++// The compiled program the running native stand-in falls back to.
++ProgramFn g_native_fallback = nullptr;
++
+ std::uint64_t key_of(ProgramFn fn) {
+     for (const auto &[k, f] : g_programs)
+         if (f == fn) return k;
+@@ -792,6 +795,9 @@ void bench(ProgramFn fn) {
+     static bool done = false;
+     if (!want || done) return;
+     if (key_of(fn) != std::strtoull(want, nullptr, 16)) return;
++    // PS2_VU_BENCH_SKIP=n: time the program's call n + 1 instead of its first.
++    static long skip = std::getenv("PS2_VU_BENCH_SKIP") ? std::atol(std::getenv("PS2_VU_BENCH_SKIP")) : 0;
++    if (skip-- > 0) return;
+     done = true;
+     const auto native = natives().find(key_of(fn));
+     static Vu0Regs start, after_c, after_n;
+@@ -814,6 +820,7 @@ void bench(ProgramFn fn) {
+     };
+     const double us_c = time(fn, after_c, mem_c);
+     std::fprintf(stderr, "[vu-bench] %s compiled: %.2f us per run\n", want, us_c);
++    g_native_fallback = fn;
+     for (std::size_t v = 0; native != natives().end() && v < native->second.size(); ++v) {
+         const double us_n = time(native->second[v], after_n, mem_n);
+         const bool same_mem = std::memcmp(mem_c, mem_n, sizeof mem_c) == 0;
+@@ -908,6 +915,67 @@ void register_programs(const Program *programs, std::uint32_t count, bool round_
+ 
+ void register_native(std::uint64_t key, ProgramFn function) { natives()[key].push_back(function); }
+ 
++ProgramFn native_fallback() { return g_native_fallback; }
++
++// The native stand-in registered for the program at this entry, if natives
++// are on; sets the compiled program it falls back to.
++ProgramFn native_for(std::uint32_t pc, ProgramFn compiled) {
++    // PS2_VU_NATIVE=alt takes the native and the compiled program in turn,
++    // call by call, so PS2_VU_PROFILE times both on the same scenes.
++    static const int mode = [] {
++        const char *v = std::getenv("PS2_VU_NATIVE");
++        return !v ? 1 : v[0] == '0' ? 0 : std::strcmp(v, "alt") == 0 ? 2 : 1;
++    }();
++    static std::uint64_t turn = 0;
++    if (mode == 0 || natives().empty() || (mode == 2 && ++turn % 2 == 0)) return nullptr;
++    const auto it = natives().find(g_entries[(pc & 16383u) >> 3].key);
++    if (it == natives().end() || it->second.empty()) return nullptr;
++    g_native_fallback = compiled;
++    return it->second.front();
++}
++
++// PS2_VU_NATIVE_CHECK: the compiled program runs first on the same state,
++// muted, as the reference; the native one then runs for real. Calls whose
++// VU memory or integer/float registers differ are counted and the first
++// ones reported, with the first differing byte.
++void run_native_checked(ProgramFn native, ProgramFn compiled, std::uint32_t pc) {
++    static std::uint64_t calls = 0, differ = 0;
++    static std::uint8_t before_mem[16384], ref_mem[16384];
++    const RoundToZero rz;
++    const Vu0Regs before = g_vu1;
++    std::memcpy(before_mem, g_vu1_mem, sizeof before_mem);
++    g_reference_dry = true;
++    compiled(g_vu1, g_vu1_mem);
++    g_reference_dry = false;
++    const Vu0Regs ref = g_vu1;
++    std::memcpy(ref_mem, g_vu1_mem, sizeof ref_mem);
++    g_vu1 = before;
++    std::memcpy(g_vu1_mem, before_mem, sizeof g_vu1_mem);
++    native(g_vu1, g_vu1_mem);
++    ++calls;
++    int byte = -1;
++    for (int i = 0; i < 16384 && byte < 0; ++i)
++        if (ref_mem[i] != g_vu1_mem[i]) byte = i;
++    int vi = -1, vf = -1;
++    for (int i = 0; i < 16 && vi < 0; ++i)
++        if (ref.vi[i] != g_vu1.vi[i]) vi = i;
++    for (int i = 1; i < 32 && vf < 0; ++i)
++        if (std::memcmp(&ref.vf[i], &g_vu1.vf[i], 16) != 0) vf = i;
++    if (byte >= 0 || vi >= 0 || vf >= 0) {
++        if (++differ <= 30) {
++            std::uint32_t a = 0, b = 0;
++            if (byte >= 0) {
++                std::memcpy(&a, ref_mem + (byte & ~3), 4);
++                std::memcpy(&b, g_vu1_mem + (byte & ~3), 4);
++            }
++            std::fprintf(stderr, "[vu-native] entry %04X call %llu differs: mem qword %d.%d (%08X vs %08X) vi%d (%04X vs %04X) vf%d\n", pc & 16383u,
++                         static_cast<unsigned long long>(calls), byte < 0 ? -1 : byte / 16, byte < 0 ? -1 : (byte % 16) / 4, a, b, vi,
++                         vi < 0 ? 0 : ref.vi[vi], vi < 0 ? 0 : g_vu1.vi[vi], vf);
++        }
++    }
++    if (calls % 20000 == 0) std::fprintf(stderr, "[vu-native] %llu calls checked, %llu differ\n", static_cast<unsigned long long>(calls), static_cast<unsigned long long>(differ));
++}
++
+ void kick(int unit, std::uint32_t address) {
+     if (g_kick_log && unit == 1) g_kick_log->push_back(address);
+     Unit u = unit_of(unit);
+@@ -933,9 +1001,13 @@ void report_profile(double busy_ms, double idle_ms, double seconds) {
+                                    seconds, busy_ms, idle_ms, programs, g_kick_ms, g_unpack_ms);
+     for (std::size_t i = 0; i < v.size() && i < 12; ++i) {
+         std::uint64_t key = 0;
++        const char *kind = "";
+         for (const auto &[k, f] : g_programs)
+             if (f == v[i].first) key = k;
+-        line += std::format(" {:016X} {:.0f}ms/{}", key, v[i].second.ms, v[i].second.calls);
++        for (const auto &[k, fns] : natives())
++            for (ProgramFn f : fns)
++                if (f == v[i].first) key = k, kind = "N";
++        line += std::format(" {:016X}{} {:.0f}ms/{}", key, kind, v[i].second.ms, v[i].second.calls);
+     }
+     std::fprintf(stderr, "%s\n", line.c_str());
+     g_program_stats.clear();
+@@ -1088,6 +1160,12 @@ void run_entry(int unit, std::uint32_t pc) {
+                 if (escape >= 0) interpret(1, static_cast<std::uint32_t>(escape));
+                 return;
+             }
++            if (const ProgramFn native = native_for(pc, fn)) {
++                static const bool check_native = std::getenv("PS2_VU_NATIVE_CHECK") != nullptr;
++                if (check_native) run_native_checked(native, fn, pc);
++                else run_profiled(native);
++                return;
++            }
+             if (jit && jit != fn && ++sampled % 32 == 0) check_jit(fn, jit);
+             else run_profiled(fn);
+             return;
+-- 
+2.54.0 (Apple Git-157)
+

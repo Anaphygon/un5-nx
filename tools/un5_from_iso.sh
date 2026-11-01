@@ -62,4 +62,6 @@ python3 -I "$here/un5_vu1.py" "$G/disc/SLES_556.05" "$work/vu1"
 # longer upload left in VU memory is out of the executable's reach.
 if [ -d "$G/vu1" ]; then cp "$G"/vu1/*.bin "$work/vu1/" 2>/dev/null || true; fi
 (cd "$web" && build/tools/vurecomp --rz --snapshots "$work/vu1" generated/un5 | tail -1)
+# Hand-written stand-ins for the hottest VU1 programs, linked into the player.
+ln -sf "$here/../ports/un5/vu1_native.cpp" "$web/generated/un5/native_vu1.cpp"
 echo "Done: $web/generated/un5"
