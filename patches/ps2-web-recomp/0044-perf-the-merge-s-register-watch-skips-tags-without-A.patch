@@ -1,0 +1,99 @@
+From 525b9df064c3024792bd3b0d2a0151379f218364 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 1 Nov 2026 15:41:43 +0700
+Subject: [PATCH] perf: the merge's register watch skips tags without A+D
+
+Walking every qword of every packet to find A+D writes cost the thread
+that sends GIF data about as much as VIF unpacking (Mac sample, battle:
+123 samples in out() next to 92 for the stage's VU1 program). Tags with
+no A+D register (vertex data, images, REGLIST) are now skipped whole:
+25 samples. Mac regression unchanged (369 frames).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ runtime/src/gs/gif.cpp | 56 +++++++++++++++++++++++++++++++-----------
+ 1 file changed, 41 insertions(+), 15 deletions(-)
+
+diff --git a/runtime/src/gs/gif.cpp b/runtime/src/gs/gif.cpp
+index 7dbb4de..0436244 100644
+--- a/runtime/src/gs/gif.cpp
++++ b/runtime/src/gs/gif.cpp
+@@ -206,19 +206,16 @@ std::vector<std::uint64_t> g_alphas;
+ // The GS registers written through A+D on their way out, for the conditions.
+ std::uint64_t g_regs[kRegisters];
+ bool g_known[kRegisters];
+-Path g_watch[4];
+-
+-struct WatchSink {
+-    void tag(const Path &, const Reg128 &) {}
+-    void packed(std::uint32_t reg, const Reg128 &q) {
+-        const std::uint64_t address = q.d[1] & 0xFFu;
+-        if (reg != kAddressData || address >= kRegisters) return;
+-        g_regs[address] = q.d[0];
+-        g_known[address] = true;
+-    }
+-    void reglist(std::uint32_t, std::uint64_t) {}
+-    void image(const std::uint8_t *, std::uint32_t) {}
++
++// Where each path is in its GIF tag, read for its A+D writes only: the
++// tags without one (vertex data, images, REGLIST) are skipped whole.
++struct Watch {
++    std::uint64_t left = 0; // qwords of the tag's data still to come
++    std::uint64_t regs = 0;
++    std::uint32_t nreg = 0, reg = 0;
++    bool address_data = false;
+ };
++Watch g_watch[4];
+ 
+ bool enabled() {
+     static const bool on = [] {
+@@ -356,14 +353,43 @@ void flush() {
+ }
+ 
+ void watch(int path, const std::uint8_t *data, std::uint32_t qwc) {
+-    WatchSink sink;
+-    walk(g_watch[path], data, qwc, sink);
++    Watch &w = g_watch[path];
++    for (std::uint32_t i = 0; i < qwc;) {
++        const std::uint8_t *at = data + static_cast<std::size_t>(i) * 16;
++        if (!w.left) {
++            std::uint64_t lo;
++            std::memcpy(&lo, at, 8);
++            std::memcpy(&w.regs, at + 8, 8);
++            const std::uint64_t nloop = lo & 0x7FFFu, flg = (lo >> 58) & 3u;
++            w.nreg = static_cast<std::uint32_t>(lo >> 60) & 0xFu;
++            if (!w.nreg) w.nreg = 16;
++            w.reg = 0;
++            w.address_data = false;
++            if (flg == 0)
++                for (std::uint32_t r = 0; r < w.nreg; ++r) w.address_data = w.address_data || ((w.regs >> (r * 4)) & 0xFu) == kAddressData;
++            w.left = flg == 0 ? nloop * w.nreg : flg == 1 ? (nloop * w.nreg + 1) / 2 : nloop;
++            ++i;
++            continue;
++        }
++        const std::uint32_t run = static_cast<std::uint32_t>(std::min<std::uint64_t>(w.left, qwc - i));
++        if (w.address_data) {
++            for (std::uint32_t k = 0; k < run; ++k, at += 16) {
++                if (((w.regs >> (w.reg * 4)) & 0xFu) == kAddressData && at[8] < kRegisters) {
++                    std::memcpy(&g_regs[at[8]], at, 8);
++                    g_known[at[8]] = true;
++                }
++                if (++w.reg >= w.nreg) w.reg = 0;
++            }
++        }
++        w.left -= run;
++        i += run;
++    }
+ }
+ 
+ void forget() {
+     flush();
+     std::fill(std::begin(g_known), std::end(g_known), false);
+-    for (Path &p : g_watch) p = Path{};
++    for (Watch &w : g_watch) w = Watch{};
+ }
+ 
+ }
+-- 
+2.54.0 (Apple Git-157)
+

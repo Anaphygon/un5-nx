@@ -1,0 +1,160 @@
+From 4eb1eb321042598e313f1bfe4bb6b5c68dc0a103 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 1 Nov 2026 15:44:32 +0700
+Subject: [PATCH] perf: masked and offset VIF unpacks get a templated path
+
+Masked unpacks and STMOD 1/2 went through the per-lane loop that decodes
+the mask, the mode and the element width for every lane. In UN5's battle
+that loop carried 51M of 126M unpacked vectors (masked V2-16 in offset
+mode, V1-8, V3-32). They now run in a loop templated on width, components
+and sign like the unmasked one, with the mask decoded once per command;
+only filling (WL > CL) and V4-5 stay on the general loop.
+
+Mac sample, battle: unpacking fell from 1.79x to 0.62x the time of the
+stage's VU1 program (about 2.9x faster). Mac regression unchanged (369
+frames).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ runtime/src/vif.cpp | 104 ++++++++++++++++++++++++++++++++++++--------
+ 1 file changed, 85 insertions(+), 19 deletions(-)
+
+diff --git a/runtime/src/vif.cpp b/runtime/src/vif.cpp
+index b5a6f95..640611b 100644
+--- a/runtime/src/vif.cpp
++++ b/runtime/src/vif.cpp
+@@ -71,32 +71,75 @@ void run_vu(int unit, std::uint32_t address) {
+     vu::run(unit, address);
+ }
+ 
++// The n-th vector of an unpack's data, spread to four lanes as the VIF does.
++template <std::uint32_t Bits, std::uint32_t Components, bool Usn>
++void read_vector(const std::uint8_t *bytes, std::uint32_t n, std::uint32_t (&value)[4]) {
++    for (std::uint32_t j = 0; j < Components; ++j) {
++        const std::size_t at = static_cast<std::size_t>(n) * Components + j;
++        if constexpr (Bits == 32) {
++            std::memcpy(&value[j], bytes + at * 4, 4);
++        } else if constexpr (Bits == 16) {
++            std::uint16_t h;
++            std::memcpy(&h, bytes + at * 2, 2);
++            value[j] = Usn ? h : static_cast<std::uint32_t>(static_cast<std::int32_t>(static_cast<std::int16_t>(h)));
++        } else {
++            value[j] = Usn ? bytes[at] : static_cast<std::uint32_t>(static_cast<std::int32_t>(static_cast<std::int8_t>(bytes[at])));
++        }
++    }
++    if constexpr (Components == 1) {
++        value[1] = value[2] = value[3] = value[0];
++    } else if constexpr (Components == 2) {
++        value[2] = value[0];
++        value[3] = value[1];
++    } else if constexpr (Components == 3) {
++        value[3] = 0;
++    }
++}
++
+ template <std::uint32_t Bits, std::uint32_t Components, bool Usn>
+ void unpack_fast(std::uint8_t *mem, std::uint32_t mask, std::uint32_t addr, std::uint32_t wl, std::uint32_t skip, const std::uint8_t *bytes, std::uint32_t num) {
+     std::uint32_t cycle = 0;
+     for (std::uint32_t n = 0; n < num; ++n) {
+         std::uint32_t value[4];
+-        for (std::uint32_t j = 0; j < Components; ++j) {
+-            const std::size_t at = static_cast<std::size_t>(n) * Components + j;
+-            if constexpr (Bits == 32) {
+-                std::memcpy(&value[j], bytes + at * 4, 4);
+-            } else if constexpr (Bits == 16) {
+-                std::uint16_t h;
+-                std::memcpy(&h, bytes + at * 2, 2);
+-                value[j] = Usn ? h : static_cast<std::uint32_t>(static_cast<std::int32_t>(static_cast<std::int16_t>(h)));
+-            } else {
+-                value[j] = Usn ? bytes[at] : static_cast<std::uint32_t>(static_cast<std::int32_t>(static_cast<std::int8_t>(bytes[at])));
+-            }
++        read_vector<Bits, Components, Usn>(bytes, n, value);
++        std::memcpy(mem + (addr & mask) * 16, value, 16);
++        ++addr;
++        if (++cycle >= wl) {
++            addr += skip;
++            cycle = 0;
+         }
+-        if constexpr (Components == 1) {
+-            value[1] = value[2] = value[3] = value[0];
+-        } else if constexpr (Components == 2) {
+-            value[2] = value[0];
+-            value[3] = value[1];
+-        } else if constexpr (Components == 3) {
+-            value[3] = 0;
++    }
++}
++
++// Masked unpacks and the offset (STMOD 1) and difference (2) modes, as long
++// as there is no filling (write cycle longer than the cycle): the mask is
++// read once per command instead of once per lane.
++template <std::uint32_t Bits, std::uint32_t Components, bool Usn>
++void unpack_masked(Unit &u, bool masked, std::uint8_t *mem, std::uint32_t mask, std::uint32_t addr, std::uint32_t wl, std::uint32_t skip, const std::uint8_t *bytes, std::uint32_t num) {
++    enum : std::uint32_t { kData, kRow, kCol, kProtect };
++    std::uint32_t lane[4][4];
++    for (std::uint32_t r = 0; r < 4; ++r)
++        for (std::uint32_t j = 0; j < 4; ++j) lane[r][j] = masked ? (u.mask >> ((r * 4 + j) * 2)) & 3u : kData;
++    const std::uint32_t mode = u.mode;
++    std::uint32_t cycle = 0;
++    for (std::uint32_t n = 0; n < num; ++n) {
++        std::uint32_t value[4];
++        read_vector<Bits, Components, Usn>(bytes, n, value);
++        std::uint8_t *q = mem + (addr & mask) * 16;
++        const std::uint32_t r = std::min<std::uint32_t>(cycle, 3u);
++        for (std::uint32_t j = 0; j < 4; ++j) {
++            std::uint32_t out;
++            switch (lane[r][j]) {
++            case kData:
++                out = mode == 1 || mode == 2 ? value[j] + u.row[j] : value[j];
++                if (mode == 2) u.row[j] = out;
++                break;
++            case kRow: out = u.row[j]; break;
++            case kCol: out = u.col[r]; break;
++            default: continue;
++            }
++            std::memcpy(q + j * 4, &out, 4);
+         }
+-        std::memcpy(mem + (addr & mask) * 16, value, 16);
+         ++addr;
+         if (++cycle >= wl) {
+             addr += skip;
+@@ -105,6 +148,24 @@ void unpack_fast(std::uint8_t *mem, std::uint32_t mask, std::uint32_t addr, std:
+     }
+ }
+ 
++using MaskedUnpack = void (*)(Unit &, bool, std::uint8_t *, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, const std::uint8_t *, std::uint32_t);
++
++template <std::uint32_t Bits>
++constexpr MaskedUnpack masked_pair(std::uint32_t components, bool usn) {
++    switch (components) {
++    case 1: return usn ? unpack_masked<Bits, 1, true> : unpack_masked<Bits, 1, false>;
++    case 2: return usn ? unpack_masked<Bits, 2, true> : unpack_masked<Bits, 2, false>;
++    case 3: return usn ? unpack_masked<Bits, 3, true> : unpack_masked<Bits, 3, false>;
++    default: return usn ? unpack_masked<Bits, 4, true> : unpack_masked<Bits, 4, false>;
++    }
++}
++
++constexpr MaskedUnpack kMaskedUnpack[3][4][2] = {
++    {{masked_pair<32>(1, false), masked_pair<32>(1, true)}, {masked_pair<32>(2, false), masked_pair<32>(2, true)}, {masked_pair<32>(3, false), masked_pair<32>(3, true)}, {masked_pair<32>(4, false), masked_pair<32>(4, true)}},
++    {{masked_pair<16>(1, false), masked_pair<16>(1, true)}, {masked_pair<16>(2, false), masked_pair<16>(2, true)}, {masked_pair<16>(3, false), masked_pair<16>(3, true)}, {masked_pair<16>(4, false), masked_pair<16>(4, true)}},
++    {{masked_pair<8>(1, false), masked_pair<8>(1, true)}, {masked_pair<8>(2, false), masked_pair<8>(2, true)}, {masked_pair<8>(3, false), masked_pair<8>(3, true)}, {masked_pair<8>(4, false), masked_pair<8>(4, true)}},
++};
++
+ using FastUnpack = void (*)(std::uint8_t *, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, const std::uint8_t *, std::uint32_t);
+ 
+ template <std::uint32_t Bits>
+@@ -171,6 +232,11 @@ void unpack_body(int unit, std::uint32_t cmd, const std::uint32_t *data) {
+         u.num = 0;
+         return;
+     }
++    if (!(wl > cl) && vl != 3) {
++        kMaskedUnpack[vl][vn][usn ? 1 : 0](u, masked, mem, wrap - 1, addr, wl, cl - wl, reinterpret_cast<const std::uint8_t *>(data), num);
++        u.num = 0;
++        return;
++    }
+     for (std::uint32_t n = 0; n < num; ++n) {
+         const bool fill = wl > cl && cycle >= cl;
+         std::uint32_t value[4] = {0, 0, 0, 0};
+-- 
+2.54.0 (Apple Git-157)
+
