@@ -1,0 +1,397 @@
+From ef5d585a74a1bd112f38464f1f7be9ab946f9a5e Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 1 Nov 2026 15:31:10 +0700
+Subject: [PATCH] perf: merge shadow-volume count packets into one draw per
+ blend
+
+UN5 draws its shadows as stencil-style counts: each triangle (or quad) of a
+volume adds or subtracts a constant into a colour channel of an off-screen
+target, with ALPHA switched per triangle. Every switch ends a renderer's
+draw: in a battle replay ~250 of 624 draws a frame were these.
+
+The GIF layer now holds a run of such VU1 packets (untextured, blended,
+RGBAQ + ALPHA + XYZ2 loops, depth not written, no alpha or destination
+test) and sends it as one triangle list per blend, additions first, then
+restores PRIM, RGBAQ and ALPHA. Anything else reaching the GIF, and every
+GS event (vblank, present, download, state, reset), sends the run first.
+PS2_GIF_MERGE=0 turns it off.
+
+Battle replay: 624 -> 333 draws a frame. Mac regression unchanged:
+battle 0/62, movie 0/100, shop 0/47, adv 0/160 frames differ (threaded
+and one-thread battle).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ runtime/src/gs/gif.cpp | 235 +++++++++++++++++++++++++++++++++++++++--
+ runtime/src/gs/gif.hpp |   5 +
+ runtime/src/gs/gs.cpp  |   6 ++
+ runtime/src/system.cpp |   7 +-
+ 4 files changed, 246 insertions(+), 7 deletions(-)
+
+diff --git a/runtime/src/gs/gif.cpp b/runtime/src/gs/gif.cpp
+index e20c176..7dbb4de 100644
+--- a/runtime/src/gs/gif.cpp
++++ b/runtime/src/gs/gif.cpp
+@@ -9,6 +9,7 @@
+ #include <algorithm>
+ #include <cstdio>
+ #include <cstring>
++#include <cstdlib>
+ #include <vector>
+ 
+ namespace ps2::gif {
+@@ -163,14 +164,222 @@ struct Held {
+ 
+ bool hold_here() { return !gs::queue::vu_active() || gs::queue::role() == gs::queue::Role::Vu; }
+ 
++// To the renderer, or to the next thread on the way to it.
++void send(int path, const std::uint8_t *data, std::uint32_t qwc) {
++    if (!gs::queue::active()) render(path, data, qwc);
++    else gs::queue::post(gs::queue::kGif, static_cast<std::uint32_t>(path), qwc, data, qwc * 16);
++}
++
++// Shadow volumes drawn as counts. UN5 casts its shadows by adding a constant
++// to a colour channel of an off-screen target for the faces that look one
++// way and subtracting it for the others, one triangle (or quad) at a time,
++// with ALPHA switched between the two blends for each. A renderer has to end
++// its draw at every switch: PCSX2's GS made ~250 draws a battle frame of
++// them, 40% of all its draws. Adding and subtracting commute as long as
++// nothing else touches the target in between and depth is not written, so a
++// run of such VU1 packets is held here and sent as one triangle list per
++// blend, the additions first: with COLCLAMP clamping at 0, adding first never
++// loses a count that a subtraction would have clamped away. Anything else
++// that reaches the GIF sends the run first. PS2_GIF_MERGE=0 turns it off.
++namespace merge {
++
++constexpr std::uint64_t kAdd = 0x48; // ALPHA (Cs - 0) * As + Cd
++constexpr std::uint64_t kSub = 0x42; // ALPHA (0 - Cs) * As + Cd
++constexpr std::uint32_t kAddressData = 0xE, kXyz2 = 0x5;
++constexpr std::uint32_t kPrim = 0x00, kRgbaq = 0x01, kAlpha1 = 0x42, kDthe = 0x45, kTest1 = 0x47, kFrame1 = 0x4C,
++                        kZbuf1 = 0x4E, kRegisters = 0x64;
++constexpr std::uint32_t kMaxLoop = 0x7FFF;
++constexpr std::size_t kMaxTriangles = 1u << 16; // sent then, to bound what is held
++
++struct Group {
++    std::uint64_t prim = 0, alpha = 0;
++    std::vector<Reg128> triangles; // per triangle: RGBAQ as A+D, then three XYZ2
++};
++
++std::vector<Group> g_groups;
++std::size_t g_triangles = 0;
++std::uint64_t g_last_prim = 0, g_last_rgbaq = 0, g_last_alpha[2];
++bool g_alpha_written[2];
++std::vector<Reg128> g_loop, g_packet;
++std::vector<std::uint64_t> g_alphas;
++
++// The GS registers written through A+D on their way out, for the conditions.
++std::uint64_t g_regs[kRegisters];
++bool g_known[kRegisters];
++Path g_watch[4];
++
++struct WatchSink {
++    void tag(const Path &, const Reg128 &) {}
++    void packed(std::uint32_t reg, const Reg128 &q) {
++        const std::uint64_t address = q.d[1] & 0xFFu;
++        if (reg != kAddressData || address >= kRegisters) return;
++        g_regs[address] = q.d[0];
++        g_known[address] = true;
++    }
++    void reglist(std::uint32_t, std::uint64_t) {}
++    void image(const std::uint8_t *, std::uint32_t) {}
++};
++
++bool enabled() {
++    static const bool on = [] {
++        const char *e = std::getenv("PS2_GIF_MERGE");
++        return !e || std::atoi(e) != 0;
++    }();
++    return on;
++}
++
++// Whether triangles drawn in a context can go in any order: no depth write,
++// no test that reads what they wrote, no dithering on a 16-bit target.
++bool commutes(std::uint32_t context) {
++    const std::uint32_t zbuf = kZbuf1 + context, test = kTest1 + context, frame = kFrame1 + context;
++    if (!g_known[zbuf] || !g_known[test] || !g_known[frame]) return false;
++    if (!((g_regs[zbuf] >> 32) & 1u)) return false; // ZMSK clear: depth is written
++    const std::uint64_t t = g_regs[test];
++    const bool alpha_test = (t & 1u) && ((t >> 1) & 7u) != 1u; // ATE with ATST other than ALWAYS
++    const bool destination_test = (t >> 14) & 1u;              // DATE
++    if (alpha_test || destination_test) return false;
++    const std::uint32_t psm = static_cast<std::uint32_t>(g_regs[frame] >> 24) & 0x3Fu;
++    const bool sixteen_bit = psm == 0x02 || psm == 0x0A;
++    return !(sixteen_bit && (!g_known[kDthe] || (g_regs[kDthe] & 1u)));
++}
++
++bool adc(const Reg128 &xyz2) { return (xyz2.d[1] >> 47) & 1u; }
++
++void add_triangle(const Reg128 &rgbaq, const Reg128 &a, const Reg128 &b, const Reg128 &c) {
++    g_loop.push_back(rgbaq);
++    for (Reg128 v : {a, b, c}) {
++        v.d[1] &= ~(1ull << 47); // drawing kicks, whatever they were
++        g_loop.push_back(v);
++    }
++}
++
++// Takes a VU1 packet of counting triangles: one PACKED tag with PRIM, each
++// loop RGBAQ and ALPHA as A+D then the vertices as XYZ2, a triangle list of
++// three or a strip whose first two vertices only fill the queue (ADC).
++bool take(int path, const std::uint8_t *data, std::uint32_t qwc) {
++    if (path != 1 || qwc < 2 || !enabled()) return false;
++    Reg128 tag;
++    std::memcpy(&tag, data, 16);
++    const std::uint32_t nloop = static_cast<std::uint32_t>(tag.d[0]) & 0x7FFFu;
++    const bool eop = (tag.d[0] >> 15) & 1u, pre = (tag.d[0] >> 46) & 1u;
++    const std::uint64_t prim = (tag.d[0] >> 47) & 0x7FFu;
++    const std::uint32_t flg = static_cast<std::uint32_t>(tag.d[0] >> 58) & 3u;
++    const std::uint32_t nreg = static_cast<std::uint32_t>(tag.d[0] >> 60) & 0xFu;
++    const std::uint64_t regs = tag.d[1];
++    const std::uint32_t kind = static_cast<std::uint32_t>(prim) & 7u, verts = nreg - 2;
++    // Untextured, unfogged, blended, not antialiased: TME, FGE, ABE, AA1.
++    if (!eop || !pre || flg != 0 || !nloop || nreg < 5 || (prim & 0xF0u) != 0x40u) return false;
++    if (qwc != 1 + nloop * nreg || (regs & 0xFFu) != 0xEEu) return false;
++    for (std::uint32_t r = 2; r < nreg; ++r)
++        if (((regs >> (r * 4)) & 0xFu) != kXyz2) return false;
++    if (!(kind == 3 && verts == 3) && kind != 4) return false;
++    const std::uint32_t context = static_cast<std::uint32_t>(prim >> 9) & 1u;
++    if (!commutes(context)) return false;
++    g_loop.clear();
++    g_alphas.clear();
++    for (std::uint32_t loop = 0; loop < nloop; ++loop) {
++        const std::uint8_t *at = data + (1 + static_cast<std::size_t>(loop) * nreg) * 16;
++        Reg128 q[16];
++        std::memcpy(q, at, static_cast<std::size_t>(nreg) * 16);
++        const std::uint64_t blend = q[1].d[0] & 0xFFu;
++        if ((q[0].d[1] & 0xFFu) != kRgbaq || (q[1].d[1] & 0xFFu) != kAlpha1 + context || (blend != kAdd && blend != kSub))
++            return false;
++        if (kind == 3) {
++            if (adc(q[2]) || adc(q[3]) || adc(q[4])) return false;
++            add_triangle(q[0], q[2], q[3], q[4]);
++        } else {
++            if (!adc(q[2]) || !adc(q[3])) return false;
++            for (std::uint32_t v = 4; v < nreg; ++v) {
++                if (adc(q[v])) return false;
++                add_triangle(q[0], q[v - 2], q[v - 1], q[v]);
++            }
++        }
++        g_alphas.insert(g_alphas.end(), kind == 3 ? 1 : verts - 2, q[1].d[0]);
++    }
++    const std::uint64_t list = (prim & ~7ull) | 3u;
++    for (std::size_t t = 0; t < g_alphas.size(); ++t) {
++        const std::uint64_t alpha = g_alphas[t];
++        auto group = std::find_if(g_groups.begin(), g_groups.end(), [&](const Group &g) { return g.prim == list && g.alpha == alpha; });
++        if (group == g_groups.end()) group = g_groups.insert(g_groups.end(), Group{list, alpha, {}});
++        group->triangles.insert(group->triangles.end(), g_loop.begin() + t * 4, g_loop.begin() + t * 4 + 4);
++    }
++    g_triangles += g_alphas.size();
++    const std::uint8_t *last = data + (1 + static_cast<std::size_t>(nloop - 1) * nreg) * 16;
++    std::memcpy(&g_last_rgbaq, last, 8);
++    std::memcpy(&g_last_alpha[context], last + 16, 8);
++    g_alpha_written[context] = true;
++    g_last_prim = prim;
++    return true;
++}
++
++Reg128 gif_tag(std::uint32_t nloop, bool eop, bool pre, std::uint64_t prim, std::uint32_t nreg, std::uint64_t regs) {
++    Reg128 t{};
++    t.d[0] = nloop | (static_cast<std::uint64_t>(eop) << 15) | (static_cast<std::uint64_t>(pre) << 46) | (prim << 47) |
++             (static_cast<std::uint64_t>(nreg & 0xFu) << 60);
++    t.d[1] = regs;
++    return t;
++}
++
++Reg128 address_data(std::uint32_t address, std::uint64_t value) {
++    Reg128 q{};
++    q.d[0] = value;
++    q.d[1] = address;
++    return q;
++}
++
++// Sends what is held: each blend's triangles as one list, additions first,
++// then PRIM, RGBAQ and each context's ALPHA as the packets left them.
++void flush() {
++    if (g_groups.empty()) return;
++    std::stable_partition(g_groups.begin(), g_groups.end(), [](const Group &g) { return (g.alpha & 0xFFu) == kAdd; });
++    g_packet.clear();
++    for (const Group &g : g_groups) {
++        g_packet.push_back(gif_tag(1, false, false, 0, 1, kAddressData));
++        g_packet.push_back(address_data(kAlpha1 + ((g.prim >> 9) & 1u), g.alpha));
++        for (std::size_t done = 0; done < g.triangles.size();) {
++            const std::size_t n = std::min<std::size_t>(kMaxLoop, (g.triangles.size() - done) / 4);
++            g_packet.push_back(gif_tag(static_cast<std::uint32_t>(n), false, true, g.prim, 4, 0x555Eu));
++            g_packet.insert(g_packet.end(), g.triangles.begin() + done, g.triangles.begin() + done + n * 4);
++            done += n * 4;
++        }
++    }
++    const std::uint32_t restored = 2 + g_alpha_written[0] + g_alpha_written[1];
++    g_packet.push_back(gif_tag(restored, true, false, 0, 1, kAddressData));
++    g_packet.push_back(address_data(kPrim, g_last_prim));
++    g_packet.push_back(address_data(kRgbaq, g_last_rgbaq));
++    for (std::uint32_t context = 0; context < 2; ++context)
++        if (g_alpha_written[context]) g_packet.push_back(address_data(kAlpha1 + context, g_last_alpha[context]));
++    g_alpha_written[0] = g_alpha_written[1] = false;
++    g_groups.clear();
++    g_triangles = 0;
++    send(1, reinterpret_cast<const std::uint8_t *>(g_packet.data()), static_cast<std::uint32_t>(g_packet.size()));
++}
++
++void watch(int path, const std::uint8_t *data, std::uint32_t qwc) {
++    WatchSink sink;
++    walk(g_watch[path], data, qwc, sink);
++}
++
++void forget() {
++    flush();
++    std::fill(std::begin(g_known), std::end(g_known), false);
++    for (Path &p : g_watch) p = Path{};
++}
++
++}
++
+ void out(int path, const std::uint8_t *data, std::uint32_t qwc) {
+     if (!qwc) return;
+-    if (!gs::queue::active()) {
+-        render(path, data, qwc);
+-        return;
++    if (gs::queue::active() && gs::queue::role() != gs::queue::Role::Vu) scan(g_scan[path], data, qwc);
++    if (hold_here()) {
++        if (merge::take(path, data, qwc)) {
++            if (merge::g_triangles >= merge::kMaxTriangles) merge::flush();
++            return;
++        }
++        merge::flush();
++        merge::watch(path, data, qwc);
+     }
+-    if (gs::queue::role() != gs::queue::Role::Vu) scan(g_scan[path], data, qwc);
+-    gs::queue::post(gs::queue::kGif, static_cast<std::uint32_t>(path), qwc, data, qwc * 16);
++    send(path, data, qwc);
+ }
+ 
+ // How many of these qwords belong to the packet under way; mid_packet is left set when
+@@ -225,9 +434,20 @@ void drop_held() {
+     g_held.masked = masked;
+ }
+ 
++void flush_merged() {
++    if (hold_here()) merge::flush();
++}
++
++void forget_merged() {
++    if (hold_here()) merge::forget();
++}
++
+ void reset() {
+     g_stat = 0;
+-    if (hold_here()) drop_held();
++    if (hold_here()) {
++        merge::flush();
++        drop_held();
++    }
+     if (gs::queue::active()) {
+         for (Path &p : g_scan) p = Path{};
+         gs::queue::post(gs::queue::kGifReset, 0, 0, nullptr, 0);
+@@ -330,6 +550,9 @@ namespace ps2::gif {
+ 
+ void state(ps2::state::Stream &s) {
+     s.tag("gif");
++    // Whatever is held goes out first; after a load the registers the
++    // conditions read are unknown again.
++    forget_merged();
+     s.pod(g_paths);
+     s.pod(g_stat);
+     s.pod(g_tags);
+diff --git a/runtime/src/gs/gif.hpp b/runtime/src/gs/gif.hpp
+index 6ef5e1a..ecddf32 100644
+--- a/runtime/src/gs/gif.hpp
++++ b/runtime/src/gs/gif.hpp
+@@ -25,5 +25,10 @@ void set_path3_masked(bool masked);
+ void drop_held();
+ // VIF1 has run out of work (its DMA ended), so an unmasked PATH3 has the GIF to itself
+ void vif1_idle();
++// Sends the run of shadow-volume packets held back to merge them (see gif.cpp),
++// on the thread that holds it; anything that is not a GIF packet calls it first
++void flush_merged();
++// ... and forgets the GS registers it watched, around a state save or load
++void forget_merged();
+ 
+ }
+diff --git a/runtime/src/gs/gs.cpp b/runtime/src/gs/gs.cpp
+index 959eba2..41db117 100644
+--- a/runtime/src/gs/gs.cpp
++++ b/runtime/src/gs/gs.cpp
+@@ -480,6 +480,7 @@ void reset() {
+     }
+     g_csr = 0x551B4000ull;
+     g_imr = 0x7F00ull;
++    gif::flush_merged();
+     if (queue::active()) queue::post(queue::kReset, 0, 0, nullptr, 0);
+     else render_reset();
+ }
+@@ -702,6 +703,7 @@ void write_image(const std::uint8_t *data, std::uint32_t qwords) { feed_image(da
+ std::atomic<std::uint32_t> g_downloads{0};
+ 
+ void read_image(std::uint8_t *data, std::uint32_t qwords) {
++    gif::flush_merged();
+     if (!queue::active()) {
+         render_read_image(data, qwords);
+         return;
+@@ -824,6 +826,7 @@ void write_privileged(std::uint32_t address, std::uint64_t value) {
+         g_csr &= ~(value & 0x1Fu);
+         if (value & 0x200u) {
+             g_csr = 0x551B4000ull;
++            gif::flush_merged();
+             if (queue::active()) queue::post(queue::kSoftReset, 0, 0, nullptr, 0);
+             else soft_reset();
+         }
+@@ -862,6 +865,7 @@ void vblank(bool start) {
+     if (start) {
+         g_odd_field = !g_odd_field;
+         raise(8);
++        gif::flush_merged();
+         if (queue::active()) queue::post(queue::kVblank, 0, 0, nullptr, 0);
+ #ifdef PS2_GPU
+         else if (gpu_on()) gpu::flush();
+@@ -1019,6 +1023,7 @@ void flush_and_wait() {
+ void start_thread() { queue::render().start(32u << 20); }
+ 
+ void post_present() {
++    gif::flush_merged();
+     const DisplayRegs regs = display_regs();
+     queue::post(queue::kPresent, g_odd_field ? 1u : 0u, 0, &regs, sizeof regs);
+     ++g_posted_presents;
+@@ -1205,6 +1210,7 @@ void serve_state(const void *payload) {
+ 
+ void state(ps2::state::Stream &s) {
+     s.tag("gs");
++    gif::flush_merged();
+     if (!queue::active()) {
+         render_state(s);
+         return;
+diff --git a/runtime/src/system.cpp b/runtime/src/system.cpp
+index ea0ad9a..d221051 100644
+--- a/runtime/src/system.cpp
++++ b/runtime/src/system.cpp
+@@ -532,6 +532,7 @@ void run_vu_thread() {
+             case gs::queue::kGif: gif::transfer(static_cast<int>(h.arg0), payload, h.arg1); break;
+             case gs::queue::kPath3Idle: gif::vif1_idle(); break;
+             case gs::queue::kGifReset:
++                gif::flush_merged();
+                 gif::drop_held();
+                 gs::queue::render().post(gs::queue::kGifReset, h.arg0, h.arg1, payload, h.bytes);
+                 break;
+@@ -543,7 +544,11 @@ void run_vu_thread() {
+                 g_vu_fence.fetch_add(1);
+                 gs::queue::notify(g_vu_fence);
+                 break;
+-            default: gs::queue::render().post(static_cast<gs::queue::Type>(h.type), h.arg0, h.arg1, payload, h.bytes); break;
++            default:
++                if (h.type == gs::queue::kState) gif::forget_merged();
++                else gif::flush_merged();
++                gs::queue::render().post(static_cast<gs::queue::Type>(h.type), h.arg0, h.arg1, payload, h.bytes);
++                break;
+             }
+             in.pop(h);
+         }
+-- 
+2.54.0 (Apple Git-157)
+
