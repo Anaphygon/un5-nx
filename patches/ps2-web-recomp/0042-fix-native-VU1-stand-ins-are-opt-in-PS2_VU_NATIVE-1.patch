@@ -1,0 +1,63 @@
+From e48c6b666578476acf111c914924b0fd7c409f69 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 1 Nov 2026 08:02:03 +0700
+Subject: [PATCH] fix: native VU1 stand-ins are opt-in (PS2_VU_NATIVE=1)
+
+On the Switch, UN5's DC7A stand-in ran only 1.07x faster than the GCC
+build of the compiled program (13.9 against 14.9 us per call over 156k
+calls each, PS2_VU_NATIVE=alt), and PS2_VU_BENCH there found its VU
+memory not identical, while the clang build on the Mac is identical on
+every call. Until that is understood, natives run only when asked:
+PS2_VU_NATIVE=1 or alt, or PS2_VU_NATIVE_CHECK.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ runtime/include/ps2/vu_ops.hpp |  6 +++---
+ runtime/src/vu_micro.cpp       | 10 ++++++----
+ 2 files changed, 9 insertions(+), 7 deletions(-)
+
+diff --git a/runtime/include/ps2/vu_ops.hpp b/runtime/include/ps2/vu_ops.hpp
+index a234d5e..3154bc6 100644
+--- a/runtime/include/ps2/vu_ops.hpp
++++ b/runtime/include/ps2/vu_ops.hpp
+@@ -31,9 +31,9 @@ struct Program {
+ void register_programs(const Program *programs, std::uint32_t count, bool round_to_zero = false);
+ // A hand-written stand-in for the compiled program with this key, compared
+ // with it by PS2_VU_BENCH. Several may be registered; they are timed in the
+-// order they were registered. The first one runs in place of the compiled
+-// program (PS2_VU_NATIVE=0 keeps the compiled one; PS2_VU_NATIVE_CHECK=1
+-// runs both on every call and reports where they differ).
++// order they were registered. With PS2_VU_NATIVE=1 the first one runs in
++// place of the compiled program (alt: in turn with it); PS2_VU_NATIVE_CHECK=1
++// runs both on every call and reports where they differ.
+ void register_native(std::uint64_t key, ProgramFn function);
+ // Inside a native stand-in: the compiled program it replaces, for the cases
+ // the native code leaves to it.
+diff --git a/runtime/src/vu_micro.cpp b/runtime/src/vu_micro.cpp
+index 32addbe..a109546 100644
+--- a/runtime/src/vu_micro.cpp
++++ b/runtime/src/vu_micro.cpp
+@@ -920,14 +920,16 @@ ProgramFn native_fallback() { return g_native_fallback; }
+ // The native stand-in registered for the program at this entry, if natives
+ // are on; sets the compiled program it falls back to.
+ ProgramFn native_for(std::uint32_t pc, ProgramFn compiled) {
+-    // PS2_VU_NATIVE=alt takes the native and the compiled program in turn,
+-    // call by call, so PS2_VU_PROFILE times both on the same scenes.
++    // Off unless PS2_VU_NATIVE is set: 1 runs the natives, alt takes the
++    // native and the compiled program in turn, call by call, so
++    // PS2_VU_PROFILE times both on the same scenes.
+     static const int mode = [] {
+         const char *v = std::getenv("PS2_VU_NATIVE");
+-        return !v ? 1 : v[0] == '0' ? 0 : std::strcmp(v, "alt") == 0 ? 2 : 1;
++        return !v || !v[0] || v[0] == '0' ? 0 : std::strcmp(v, "alt") == 0 ? 2 : 1;
+     }();
+     static std::uint64_t turn = 0;
+-    if (mode == 0 || natives().empty() || (mode == 2 && ++turn % 2 == 0)) return nullptr;
++    static const bool check = std::getenv("PS2_VU_NATIVE_CHECK") != nullptr;
++    if ((mode == 0 && !check) || natives().empty() || (mode == 2 && ++turn % 2 == 0)) return nullptr;
+     const auto it = natives().find(g_entries[(pc & 16383u) >> 3].key);
+     if (it == natives().end() || it->second.empty()) return nullptr;
+     g_native_fallback = compiled;
+-- 
+2.54.0 (Apple Git-157)
+

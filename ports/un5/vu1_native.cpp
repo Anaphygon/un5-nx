@@ -10,7 +10,9 @@
 // Checked with PS2_VU_NATIVE_CHECK=1 on the Mac battle replay: every call is
 // run both ways and compared (DC7A: 169,584 calls, 0 differ). On the Mac the
 // gain is small (1.02-1.08x per call): clang's translation is already close
-// to the arithmetic. The Switch build (GCC) is timed with PS2_VU_NATIVE=alt.
+// to the arithmetic. On the Switch (GCC) it is 1.07x (13.9 vs 14.9 us per call)
+// and PS2_VU_BENCH found its VU memory not identical there, so natives are
+// opt-in (PS2_VU_NATIVE=1); GCC contracting float ops into FMAs is suspected.
 #include "ps2/vu_ops.hpp"
 
 #include "ps2/fpu.hpp"
