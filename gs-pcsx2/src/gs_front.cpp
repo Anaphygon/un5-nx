@@ -19,6 +19,7 @@
 #include "fmt/format.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <vector>
 #include <array>
@@ -53,6 +54,7 @@ u32 un5_hoc_nearest_hz(u32 module, u32 mhz);
 bool un5_hoc_override(const u32 hz[3]);
 bool un5_hoc_status(int out[5]);
 bool un5_hoc_real_mhz(unsigned out[3]);
+namespace EmuFolders { extern std::string Logs; } // pcsx2_glue.cpp
 // From ps2-web-recomp's host/switch_threads.cpp: the core for threads
 // created from now on (-1: libnx's default).
 extern "C" void ps2_switch_new_thread_core(int core);
@@ -61,6 +63,12 @@ extern "C" bool ps2_switch_move_placed_thread(int core);
 int s_glthread_core = 1;
 // The device in use is deko3d (UN5GS_RENDERER=dk), not OpenGL.
 bool s_deko3d = false;
+// Whether UN5's stage batches come here untransformed: OpenGL only, with
+// resources/shaders/opengl/tfx_un5_vgs.glsl, without draw buffering, unless
+// UN5GS_NATIVE=0.
+bool s_native_batches = false;
+// Whether the stand-in sends them now (UN5GS_SHOTS_AB turns it off for a while).
+std::atomic<bool> s_native_send{true};
 #endif
 
 extern bool g_un5_honour_scanmsk; // pcsx2 GSState.cpp (patch 0006)
@@ -338,6 +346,14 @@ void log_speed()
 		g_perfmon.GetCounter(GSPerfMon::Draw), g_perfmon.GetCounter(GSPerfMon::DrawCalls), g_perfmon.GetCounter(GSPerfMon::TextureUploads),
 		g_perfmon.GetCounter(GSPerfMon::TextureCopies), g_perfmon.GetCounter(GSPerfMon::Readbacks), g_perfmon.GetCounter(GSPerfMon::Barriers));
 	log_draw_split(s_fields, Common::Timer::ConvertValueToSeconds(s_gs_ticks) * 1000.0);
+	if (s_native_batches)
+	{
+		GSState::UN5Stats& st = g_gs_renderer->m_un5_stats;
+		Console.WriteLn("[stage] per frame: %.0f native batches (%.0f with nothing to draw yet, %.0f restarting a strip), %.0f draws, %.0f triangles",
+			st.batches / static_cast<double>(s_fields), st.empty / static_cast<double>(s_fields), st.rechained / static_cast<double>(s_fields),
+			st.draws / static_cast<double>(s_fields), st.triangles / static_cast<double>(s_fields));
+		st = {};
+	}
 	// UN5GS_UPSCALE_CYCLE="2,1": the internal resolution steps through the list
 	// every 10 s (as PCSX2 changes it from its settings), to compare in one run.
 	static const char* s_upscale_cycle = std::getenv("UN5GS_UPSCALE_CYCLE");
@@ -414,6 +430,9 @@ void log_to_stderr(LOGLEVEL level, ConsoleColors, std::string_view message)
 
 #ifdef __SWITCH__
 extern "C" void util_queue_kill_all_threads(void); // our Mesa (patches/switch-mesa/0003)
+// Defined with the stage program's stand-in (ports/un5/vu1_native.cpp), which
+// sends its batches untransformed while this says yes.
+extern "C" bool (*un5_native_batches_hook)();
 #endif
 
 namespace un5gs {
@@ -472,6 +491,11 @@ bool open()
 	g_gs_renderer->SetRegsMem(s_privileged);
 	g_gs_renderer->ResetPCRTC();
 	g_gs_renderer->UpdateRenderFixes();
+	const char* native = std::getenv("UN5GS_NATIVE");
+	s_native_batches = !s_deko3d && !GSConfig.UserHacks_DrawBuffering && !(native && std::strcmp(native, "0") == 0) &&
+					   static_cast<GSDeviceOGL*>(g_gs_device.get())->UN5ShaderLoaded();
+	un5_native_batches_hook = [] { return s_native_batches && s_native_send.load(std::memory_order_relaxed); };
+	Console.WriteLn("un5gs: stage batches %s", s_native_batches ? "transformed on the GPU" : "transformed by VU1");
 	return true;
 }
 
@@ -503,10 +527,28 @@ void close()
 #endif
 }
 
+// A batch of UN5's stage program sent untransformed (ports/un5/vu1_native.cpp):
+// a PACKED tag of one NOP register, then the "UN5N" header.
+static bool is_native_batch(const u8* mem, std::uint32_t qwords)
+{
+	if (qwords < 12)
+		return false;
+	u32 tag[4], info[4];
+	std::memcpy(tag, mem, sizeof(tag));
+	std::memcpy(info, mem + 16, sizeof(info));
+	return tag[1] == 0x10000000u && tag[2] == 0xFu && tag[3] == 0 && (tag[0] & 0xFFFF7FFFu) + 1 == qwords && info[0] == 0x4E354E55u && info[1] == 1 &&
+		   info[2] + 11 == qwords;
+}
+
 void transfer(int path, const void* data, std::uint32_t qwords)
 {
 	GsTime timed;
 	const u8* mem = static_cast<const u8*>(data);
+	if (path == 1 && s_native_batches && is_native_batch(mem, qwords))
+	{
+		g_gs_renderer->UN5NativeBatch(mem);
+		return;
+	}
 	switch (path)
 	{
 		case 1: g_gs_renderer->Transfer<0>(mem, qwords); break;
@@ -523,6 +565,64 @@ std::uint8_t* privileged_registers()
 void write_csr(std::uint32_t csr)
 {
 	g_gs_renderer->WriteCSR(csr);
+}
+
+// UN5GS_SHOTS=n,n,...: the presented picture of those vsyncs (counted from
+// open) as half-size PPM files next to the log, shot_<n>.ppm, for checking a
+// bench run. Each one stalls that frame (a readback and ~3 MB to the card).
+// With UN5GS_SHOTS_AB=1 the stage batches go through VU1 for the 20 vsyncs
+// before each n, and a second shot at n + 20 has them back on the GPU: the
+// same scene both ways, for comparing.
+static void take_shots()
+{
+	static const char* list = std::getenv("UN5GS_SHOTS");
+	static const bool ab = std::getenv("UN5GS_SHOTS_AB") && std::getenv("UN5GS_SHOTS_AB")[0] == '1';
+	static u32 count = 0;
+	++count;
+	if (!list)
+		return;
+	for (const char* p = list; *p;)
+	{
+		char* end;
+		const unsigned long n = std::strtoul(p, &end, 10);
+		if (end == p)
+			break;
+		if (ab && count == n - 20)
+			s_native_send = false;
+		if (ab && count == n)
+			s_native_send = true;
+		if (n == count || (ab && n + 20 == count))
+		{
+			u32 w = 0, h = 0;
+			std::vector<u32> pixels;
+			if (!g_gs_renderer->SaveSnapshotToMemory(0, 0, false, false, &w, &h, &pixels) || !w || !h)
+				return;
+			// Half size and one write: the SD card is slow with small ones.
+			const u32 hw = w / 2, hh = h / 2;
+			const std::string header = fmt::format("P6\n{} {}\n255\n", hw, hh);
+			std::vector<u8> file(header.begin(), header.end());
+			file.reserve(header.size() + hw * hh * 3);
+			for (u32 y = 0; y < hh; y++)
+			{
+				for (u32 x = 0; x < hw; x++)
+				{
+					const u32 c = pixels[(y * 2) * w + x * 2];
+					file.push_back(c & 0xFF);
+					file.push_back((c >> 8) & 0xFF);
+					file.push_back((c >> 16) & 0xFF);
+				}
+			}
+			const std::string path = fmt::format("{}/shot_{}.ppm", ::EmuFolders::Logs, count);
+			if (std::FILE* f = std::fopen(path.c_str(), "wb"))
+			{
+				std::fwrite(file.data(), 1, file.size(), f);
+				std::fclose(f);
+				Console.WriteLn("un5gs: shot of vsync %u (%ux%u) in %s", count, hw, hh, path.c_str());
+			}
+			return;
+		}
+		p = *end ? end + 1 : end;
+	}
 }
 
 void vsync(std::uint32_t field, bool registers_written)
@@ -551,6 +651,7 @@ void vsync(std::uint32_t field, bool registers_written)
 #endif
 	r.VSync(field, registers_written, r.IsIdleFrame());
 	}
+	take_shots();
 #ifdef __SWITCH__
 	un5_menu_poll();
 #endif

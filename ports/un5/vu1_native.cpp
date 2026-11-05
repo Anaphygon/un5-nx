@@ -272,17 +272,15 @@ constexpr std::uint32_t kInside = 208u;           // x, y and w within the guard
 }
 
 // Set by un5-nx's PCSX2 front end when it opens and can draw these packets
-// (gs-pcsx2/src/gs_front.cpp); read from the first DC7A batch on.
+// (gs-pcsx2/src/gs_front.cpp); asked for every batch, so that it can turn
+// them off for a while (UN5GS_SHOTS_AB).
 extern "C" {
 bool (*un5_native_batches_hook)() = nullptr;
 }
 
 namespace {
 
-bool gpu_batches() {
-    static const bool on = un5_native_batches_hook && un5_native_batches_hook();
-    return on;
-}
+bool gpu_batches() { return un5_native_batches_hook && un5_native_batches_hook(); }
 
 bool reference_batches() {
     static const bool on = [] {
@@ -332,7 +330,7 @@ bool pack_batch(const Vu0Regs &r, std::uint8_t *mem, std::uint32_t top, std::uin
         store(mem, at + 11 + k, packed);
     }
     const std::uint32_t data = 10 + count;
-    store(mem, at, v4u{data | 0x8000u, 0u, 0x10000000u, 0xFu}); // NLOOP, EOP; FLG PACKED, NREG 1; REGS NOP
+    store(mem, at, v4u{data | 0x8000u, 0x10000000u, 0xFu, 0u}); // NLOOP, EOP | FLG PACKED, NREG 1 | REGS: NOP
     store(mem, at + 1, v4u{kBatchMagic, kBatchVersion, count, uv_z});
     store(mem, at + 2, tag);
     const int consts[8] = {1, 2, 3, 4, 13, 14, 15, 16};
@@ -352,24 +350,28 @@ void finish_state(Vu0Regs &r, std::uint8_t *mem, std::uint32_t top, std::uint32_
 
     // The last four vertices decide VI7..VI12 and the clipper marks of the
     // last two; VI10 (2 after an inside vertex, one less after each outside
-    // one) needs the outside run before them. VI6 is only the marks of these
-    // four: the clipper batches it would flag are not told apart here.
-    constexpr std::uint32_t kTail = 4;
+    // one) needs the outside run before them. All of it comes from the last
+    // kWindow vertices, each transformed once: an outside run longer than
+    // that only leaves VI10 more negative than the program would, which no
+    // later decision tells apart (only its sign is tested). VI6 holds the
+    // marks of the last four only.
+    constexpr std::uint32_t kTail = 4, kWindow = 8;
     const std::uint32_t from = count - kTail;
-    auto inside_at = [&](std::uint32_t k) { return see(n1, n2, n3, n4, n13, n14, n16, load(mem, first + 4 * k)).inside; };
-    Seen seen[kTail];
-    for (std::uint32_t j = 0; j < kTail; ++j) seen[j] = see(n1, n2, n3, n4, n13, n14, n16, load(mem, first + 4 * (from + j)));
+    const std::uint32_t start = count > kWindow ? count - kWindow : 0;
+    Seen window[kWindow];
+    for (std::uint32_t k = start; k < count; ++k) window[k - start] = see(n1, n2, n3, n4, n13, n14, n16, load(mem, first + 4 * k));
+    const Seen *seen = &window[from - start];
     std::uint16_t i10 = r.vi[10];
-    for (std::uint32_t k = from; k-- > 0;) {
-        if (inside_at(k) == kInside) {
-            i10 = static_cast<std::uint16_t>(2u - (from - 1u - k));
-            break;
-        }
-        if (k == 0) i10 = static_cast<std::uint16_t>(r.vi[10] - from);
+    {
+        std::uint32_t k = from;
+        while (k > start && window[k - 1 - start].inside != kInside) --k;
+        if (k > start) i10 = static_cast<std::uint16_t>(2u - (from - k));
+        else if (start == 0) i10 = static_cast<std::uint16_t>(r.vi[10] - from);
+        else i10 = static_cast<std::uint16_t>(2u - (from - start) - 1u);
     }
     std::uint16_t i7 = r.vi[7], i8 = r.vi[8];
     for (std::uint32_t k = from >= 2 ? from - 2 : 0; k < from; ++k) {
-        const std::uint16_t in = inside_at(k);
+        const std::uint16_t in = window[k - start].inside;
         i8 = static_cast<std::uint16_t>(i7 & in);
         i7 = in;
     }
