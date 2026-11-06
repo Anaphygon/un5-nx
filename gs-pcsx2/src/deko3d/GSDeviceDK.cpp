@@ -43,6 +43,7 @@ namespace
 	// Same bindings as the OpenGL device's GLSL.
 	constexpr u32 g_vs_pc_index = 4;
 	constexpr u32 g_vs_ib_index = 3;
+	constexpr u32 g_vs_un5_sb_index = 6; // un5-nx: VS_UN5's batch constants (tfx_un5_vgs.glsl)
 	constexpr u32 g_vs_vb_index = 2;
 	constexpr u32 g_vs_cb_index = 1;
 	constexpr u32 g_ps_cb_index = 0;
@@ -224,6 +225,10 @@ bool GSDeviceDK::Create(GSVSyncMode vsync_mode, bool allow_present_throttle)
 	}
 	m_tfx_vgs = std::move(*vgs);
 	m_tfx_fs = std::move(*fs);
+	// un5-nx: UN5's stage batches; without it they are not sent here
+	// (gs_front.cpp asks UN5ShaderLoaded()).
+	if (std::optional<std::string> un5 = ReadShaderSource("shaders/opengl/tfx_un5_vgs.glsl"))
+		m_tfx_un5_vgs = std::move(*un5);
 	PreloadPack();
 	if (!CreateFixedPrograms())
 		return false;
@@ -514,7 +519,7 @@ std::string GSDeviceDK::GetVSSource(VSSelector sel) const
 		+ fmt::format("#define VS_POINT_SIZE {}\n", static_cast<u32>(sel.point_size))
 		+ fmt::format("#define VS_EXPAND {}\n", static_cast<int>(sel.expand));
 	std::string src = GenGlslHeader("vs_main", DkStage_Vertex, macro);
-	src += m_tfx_vgs;
+	src += sel.un5 ? m_tfx_un5_vgs : m_tfx_vgs;
 	return src;
 }
 
@@ -2026,6 +2031,17 @@ void GSDeviceDK::RenderHW(GSHWDrawConfig& config)
 		std::memcpy(alloc.cpu, &m_ps_cb_cache, sizeof(m_ps_cb_cache));
 		m_ps_cb = DkBufExtents{alloc.gpu, sizeof(m_ps_cb_cache)};
 		m_ubos_dirty = true;
+	}
+	if (config.vs.un5)
+	{
+		// un5-nx: the batches' constants, 8 vec4 each, for VS_UN5. deko3d has
+		// all clip distances on, so the program's near plane needs nothing more.
+		const u32 size = config.un5_nconsts * 16;
+		const dk::Context::Allocation alloc = m_ctx.Stream(size, DK_UNIFORM_BUF_ALIGNMENT);
+		if (!alloc.cpu)
+			return;
+		std::memcpy(alloc.cpu, config.un5_consts, size);
+		dkCmdBufBindStorageBuffer(m_ctx.Cmd(), DkStage_Vertex, g_vs_un5_sb_index, alloc.gpu, size);
 	}
 
 	// Program. A shader missing from the pack skips the draw.

@@ -63,9 +63,9 @@ extern "C" bool ps2_switch_move_placed_thread(int core);
 int s_glthread_core = 1;
 // The device in use is deko3d (UN5GS_RENDERER=dk), not OpenGL.
 bool s_deko3d = false;
-// Whether UN5's stage batches come here untransformed: OpenGL only, with
-// resources/shaders/opengl/tfx_un5_vgs.glsl, without draw buffering, unless
-// UN5GS_NATIVE=0.
+// Whether UN5's stage batches come here untransformed: with
+// resources/shaders/opengl/tfx_un5_vgs.glsl (both devices compile it), without
+// draw buffering; deko3d unless UN5GS_NATIVE=0, OpenGL with UN5GS_NATIVE=1.
 bool s_native_batches = false;
 // Whether the stand-in sends them now (UN5GS_SHOTS_AB turns it off for a while).
 std::atomic<bool> s_native_send{true};
@@ -377,6 +377,15 @@ void log_speed()
 		}
 		Console.WriteLn("[gs] upscale now %dx", next);
 	}
+	// UN5GS_NATIVE_CYCLE=1: the stage batches alternate between the GPU and
+	// VU1 every 10 s, to compare them in one run.
+	static const bool s_native_cycle = std::getenv("UN5GS_NATIVE_CYCLE") != nullptr;
+	static u32 s_native_windows = 0;
+	if (s_native_batches && s_native_cycle && ++s_native_windows % 2 == 0)
+	{
+		s_native_send = !s_native_send.load(std::memory_order_relaxed);
+		Console.WriteLn("[stage] batches now %s", s_native_send.load(std::memory_order_relaxed) ? "on the GPU" : "on VU1");
+	}
 	// UN5DK_BARRIER_CYCLE=1: deko3d's hazard barrier alternates between
 	// fragments and full every 30 s, to compare them in one run.
 	static const bool s_barrier_cycle = std::getenv("UN5DK_BARRIER_CYCLE") != nullptr;
@@ -492,8 +501,12 @@ bool open()
 	g_gs_renderer->ResetPCRTC();
 	g_gs_renderer->UpdateRenderFixes();
 	const char* native = std::getenv("UN5GS_NATIVE");
-	s_native_batches = !s_deko3d && !GSConfig.UserHacks_DrawBuffering && !(native && std::strcmp(native, "0") == 0) &&
-					   static_cast<GSDeviceOGL*>(g_gs_device.get())->UN5ShaderLoaded();
+	const bool shader = s_deko3d ? static_cast<GSDeviceDK*>(g_gs_device.get())->UN5ShaderLoaded() :
+								   static_cast<GSDeviceOGL*>(g_gs_device.get())->UN5ShaderLoaded();
+	// On by default with deko3d; with OpenGL only for UN5GS_NATIVE=1: from one
+	// Switch run on, every OpenGL frame showed zoomed in, cause unknown.
+	const bool wanted = s_deko3d ? !(native && std::strcmp(native, "0") == 0) : (native && std::strcmp(native, "1") == 0);
+	s_native_batches = shader && wanted && !GSConfig.UserHacks_DrawBuffering;
 	un5_native_batches_hook = [] { return s_native_batches && s_native_send.load(std::memory_order_relaxed); };
 	Console.WriteLn("un5gs: stage batches %s", s_native_batches ? "transformed on the GPU" : "transformed by VU1");
 	return true;

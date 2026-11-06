@@ -55,6 +55,9 @@ public:
 	bool UpdateWindow() override;
 	void ResizeWindow(u32 new_window_width, u32 new_window_height, float new_window_scale) override;
 	bool SupportsExclusiveFullscreen() const override;
+	// un5-nx: whether UN5's stage batches can be drawn here (tfx_un5_vgs.glsl
+	// read from the resources).
+	bool UN5ShaderLoaded() const { return !m_tfx_un5_vgs.empty(); }
 	void DestroySurface() override;
 	std::string GetDriverInfo() const override;
 	void SetVSyncMode(GSVSyncMode mode, bool allow_present_throttle) override;
@@ -228,6 +231,7 @@ private:
 	std::unordered_map<u64, DkShader> m_shaders;
 	std::unordered_map<u64, bool> m_missing_shaders;
 	std::string m_tfx_vgs, m_tfx_fs;
+	std::string m_tfx_un5_vgs; // un5-nx: the vertex shader of UN5's stage batches (tfx_un5_vgs.glsl)
 	std::unordered_map<u8, const DkShader*> m_vs_cache;
 	struct PSKeyHash
 	{

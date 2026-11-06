@@ -539,7 +539,7 @@
  		config.colclip_update_area = config.colclip_update_area.runion(config.drawarea);
 --- /dev/null
 +++ b/bin/resources/shaders/opengl/tfx_un5_vgs.glsl
-@@ -0,0 +1,94 @@
+@@ -0,0 +1,100 @@
 +// SPDX-License-Identifier: GPL-3.0+
 +// un5-nx: the vertex shader for UN5's stage batches (GSState::UN5NativeBatch),
 +// in place of tfx_vgs.glsl's vs_main, whose programs it leaves untouched. Its
@@ -561,7 +561,7 @@
 +	float LineAA1Width;
 +};
 +
-+// 8 vec4 per batch: the matrix columns, the guard band (unused here), fog
++// 8 vec4 per batch: the matrix columns, the guard band (low, high), fog
 +// (min, max, base, per w) and (near, alpha scale, uv z, 0).
 +layout(std430, binding = 6) readonly buffer cb_un5
 +{
@@ -598,14 +598,20 @@
 +	vec4 fog = un5_consts[slot + 6u];
 +	vec4 misc = un5_consts[slot + 7u];
 +
++	// The GPU clips at the program's near plane, where it ran its clipper.
++	// The clipper only takes triangles that reach past the guard band
++	// (VF13..VF14 on x / w, y / w and w); one inside it is drawn whole, even
++	// behind the near plane, so a vertex inside the guard band never clips.
++	vec3 seen = vec3(clip.xy / clip.w, clip.w);
++	bool inside = clip.w > 0.0f && all(greaterThan(seen, un5_consts[slot + 4u].xyw)) && all(lessThan(seen, un5_consts[slot + 5u].xyw));
++	gl_ClipDistance[0] = inside ? max(clip.w - misc.x, 0.0f) : clip.w - misc.x;
++
 +	// The GS position is 16 xyz / w, truncated as the program's FTOI4 does:
 +	// the other passes over this geometry come from the program's own
 +	// output, and pass their z tests only on the same depth. Z goes a little
 +	// further (GS z grows towards the eye) to stay below theirs where float
-+	// rounding differs from the VU's, and stays inside the depth range. The
-+	// GPU clips at the program's near plane, where it ran its clipper; behind
-+	// the eye the position stays homogeneous for that.
-+	gl_ClipDistance[0] = clip.w - misc.x;
++	// rounding differs from the VU's, and stays inside the depth range.
++	// Behind the eye the position stays homogeneous, for the clipping.
 +	vec3 gs;
 +	if (clip.w > 0.0f)
 +	{

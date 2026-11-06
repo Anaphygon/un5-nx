@@ -544,9 +544,21 @@ void dc7a_batch(Vu0Regs &r, std::uint8_t *mem) {
     vu::kick(1, top + 201u);
 }
 
+// Batches go to the GS untransformed while it takes them; otherwise to the
+// translated program, as without natives (its 1.07x stand-in, dc7a, is not
+// bit-identical under GCC; UN5_STAGE_CPU=1 runs it).
+bool cpu_stand_in() {
+    static const bool on = [] {
+        const char *e = std::getenv("UN5_STAGE_CPU");
+        return e && e[0] == '1';
+    }();
+    return on;
+}
+
 void dc7a_entry(Vu0Regs &r, std::uint8_t *mem) {
     if (gpu_batches() || reference_batches()) dc7a_batch(r, mem);
-    else dc7a(r, mem);
+    else if (cpu_stand_in()) dc7a(r, mem);
+    else vu::native_fallback()(r, mem);
 }
 
 struct Register {
