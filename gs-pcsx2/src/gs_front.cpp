@@ -236,6 +236,20 @@ void log_draw_split(u32 fields, double gs_ms)
 		gs_ms * per, g_un5_draw_ms * per, g_un5_render_ms * per,
 		Common::Timer::ConvertValueToMilliseconds(s_vsync_ticks) * per, g_un5_swap_ms * per,
 		g_un5_presents ? 100.0 * static_cast<double>(g_un5_gpu_behind) / static_cast<double>(g_un5_presents) : 0.0);
+	// Where a draw's time goes (pcsx2 GSState.h, Un5Span). Each stage holds
+	// the ones after it: GIF transfers flush draws, a flush traces the
+	// vertices and calls Draw(), Draw() looks up the texture and the targets
+	// and calls DrawPrims(), which ends in RenderHW.
+	const double* t = g_un5_gs_ms;
+	Console.WriteLn("[gs-time] ms per frame: GIF transfers %.1f without their flushes (%.0f vertex kicks, CLUT loads %.1f); "
+					"native batches %.1f without their flushes; flushes %.1f (from transfers %.1f, batches %.1f, others %.1f; "
+					"vertex trace %.1f, outside Draw() %.1f); in Draw(): texture lookup %.1f, target lookups %.1f, DrawPrims %.1f "
+					"(outside RenderHW %.1f), the rest %.1f",
+		(t[5] - t[7]) * per, static_cast<double>(g_un5_kicks) * per, t[6] * per, (t[8] - t[9]) * per, t[4] * per, t[7] * per,
+		t[9] * per, t[11] * per, t[3] * per, (t[4] - g_un5_draw_ms) * per, t[0] * per, t[1] * per, t[2] * per,
+		(t[2] - g_un5_render_ms) * per, (g_un5_draw_ms - t[0] - t[1] - t[2]) * per);
+	g_un5_kicks = 0;
+	std::fill(std::begin(g_un5_gs_ms), std::end(g_un5_gs_ms), 0.0);
 	s_vsync_ticks = 0;
 	g_un5_swap_ms = 0.0;
 	g_un5_gpu_behind = g_un5_presents = 0;

@@ -1,0 +1,280 @@
+From b173e5d081b60f8aac55a440e3374a7d17b108a9 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 7 Nov 2026 21:55:04 +0700
+Subject: [PATCH] perf: UN5's body pass B held and drawn after the pass A
+ chunks
+
+UN5 draws each character mesh chunk twice: pass A with its own texture,
+then pass B, the same strip with a shared toon texture subtracted. Each
+switch ends a renderer draw, so a fighter cost two draws per chunk. Pass B
+packets are now held in the GIF layer while the run keeps that exact shape
+and sent after the last pass A under one copy of their state. Chunks with a
+see-through vertex alpha keep their order. PS2_BODY_MERGE=0 turns it off,
+PS2_BODY_MERGE_CYCLE=n alternates every n frames.
+
+Mac battle replay: 816 -> 416 GS state runs per frame; 6 of 62 frames
+differ by at most 101 pixels (5 beyond a 2% fuzz). Movie, shop and
+adventure regressions identical.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ runtime/src/gs/gif.cpp | 214 ++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 209 insertions(+), 5 deletions(-)
+
+diff --git a/runtime/src/gs/gif.cpp b/runtime/src/gs/gif.cpp
+index 0436244..8a1ac2c 100644
+--- a/runtime/src/gs/gif.cpp
++++ b/runtime/src/gs/gif.cpp
+@@ -5,6 +5,7 @@
+ 
+ #include "ps2/external_gs.hpp"
+ #include "ps2/state.hpp"
++#include "ps2/system.hpp"
+ 
+ #include <algorithm>
+ #include <cstdio>
+@@ -394,9 +395,8 @@ void forget() {
+ 
+ }
+ 
+-void out(int path, const std::uint8_t *data, std::uint32_t qwc) {
+-    if (!qwc) return;
+-    if (gs::queue::active() && gs::queue::role() != gs::queue::Role::Vu) scan(g_scan[path], data, qwc);
++// Past the shadow merge, to the renderer.
++void pass(int path, const std::uint8_t *data, std::uint32_t qwc) {
+     if (hold_here()) {
+         if (merge::take(path, data, qwc)) {
+             if (merge::g_triangles >= merge::kMaxTriangles) merge::flush();
+@@ -408,6 +408,205 @@ void out(int path, const std::uint8_t *data, std::uint32_t qwc) {
+     send(path, data, qwc);
+ }
+ 
++// Characters drawn in two passes per mesh. UN5's body program draws each
++// mesh chunk twice: pass A with the chunk's own texture and palette, blended
++// over the frame, then pass B, the same strip again with a shared toon
++// texture subtracted from it (ALPHA (0 - Cs) * As + Cd), both with depth test
++// GEQUAL and depth writes. Each switch ends a draw in a renderer, so a
++// fighter costs two draws per chunk: about 260 pass B draws a battle frame,
++// all with the same state. Pass B is held here and sent once the chunks stop
++// coming, after the last pass A, under one copy of its state, so the B
++// passes become one draw and the A passes of chunks sharing a texture join
++// up too. Only a run of exactly this shape is held: pass A state packets that
++// write no register pass B's state does not write again (so B sees the same
++// state), vertex packets without A+D, and the same pass B state each time;
++// anything else sends the run first, and so does a pass A with a vertex
++// alpha under 0x80 (a fighter turned see-through). Depth makes the order mostly
++// irrelevant, as only the nearest chunk passes GEQUAL at a pixel; where a
++// chunk's pass A fails the alpha test (AFAIL FB_ONLY, no depth written) an
++// earlier chunk's pass B now lands on its colour. PS2_BODY_MERGE=0 turns it
++// off.
++namespace body {
++
++constexpr std::uint32_t kAddressData = 0xE, kPrim = 0x00, kRgbaq = 0x01, kTexflush = 0x3F, kAlpha1 = 0x42, kTest1 = 0x47,
++                        kRegisters = 0x80;
++constexpr std::size_t kMaxHeld = 1024;
++
++enum class Next { State, Vertices };
++
++struct Packet {
++    std::size_t at = 0, qwc = 0;
++};
++
++std::vector<std::uint8_t> g_b_state;   // the pass B state packet
++std::vector<std::uint8_t> g_held;      // pass B vertex packets, back to back
++std::vector<Packet> g_packets;
++std::uint64_t g_b_prim = 0;
++bool g_b_writes[kRegisters];
++bool g_in_b = false;                   // the last packet seen was pass B's state
++bool g_in_run = false;
++std::vector<std::uint8_t> g_out;
++std::vector<std::uint8_t> g_a_state;   // pass A state waiting for its vertices
++
++// PS2_BODY_MERGE_CYCLE=n (frames): on for n frames, off for the next n, to
++// price it within one run; each switch is logged.
++bool enabled() {
++    static const bool on = [] {
++        const char *e = std::getenv("PS2_BODY_MERGE");
++        return !e || std::atoi(e) != 0;
++    }();
++    static const std::uint64_t cycle = [] {
++        const char *e = std::getenv("PS2_BODY_MERGE_CYCLE");
++        return e ? std::strtoull(e, nullptr, 10) : 0ull;
++    }();
++    if (!on || !cycle) return on;
++    const bool now = ((ps2::frame_count() / cycle) & 1u) == 0;
++    static bool was = !now;
++    if (now != was) std::fprintf(stderr, "[body] pass B merge %s at frame %llu\n", now ? "on" : "off", static_cast<unsigned long long>(ps2::frame_count()));
++    was = now;
++    return now;
++}
++
++// One PACKED tag of A+D writes and nothing else: their addresses, or false.
++bool address_data_only(const std::uint8_t *data, std::uint32_t qwc, bool (&writes)[kRegisters], std::uint64_t (&value)[kRegisters]) {
++    std::uint64_t lo, regs;
++    std::memcpy(&lo, data, 8);
++    std::memcpy(&regs, data + 8, 8);
++    const std::uint32_t nloop = lo & 0x7FFFu, flg = (lo >> 58) & 3u, nreg = (lo >> 60) & 0xFu;
++    if (flg != 0 || nreg != 1 || (regs & 0xFu) != kAddressData || !nloop || qwc != 1 + nloop || ((lo >> 46) & 1u)) return false;
++    std::fill(std::begin(writes), std::end(writes), false);
++    for (std::uint32_t i = 1; i <= nloop; ++i) {
++        std::uint64_t v, a;
++        std::memcpy(&v, data + i * 16, 8);
++        std::memcpy(&a, data + i * 16 + 8, 8);
++        if ((a & 0xFFu) >= kRegisters) return false;
++        writes[a & 0xFFu] = true;
++        value[a & 0xFFu] = v;
++    }
++    return true;
++}
++
++// One PACKED tag of vertex data without A+D (a PRIM in the tag is fine);
++// opaque says each vertex carries its RGBAQ with alpha 0x80 or more.
++bool vertices_only(const std::uint8_t *data, std::uint32_t qwc, bool &opaque) {
++    std::uint64_t lo, regs;
++    std::memcpy(&lo, data, 8);
++    std::memcpy(&regs, data + 8, 8);
++    const std::uint32_t nloop = lo & 0x7FFFu, flg = (lo >> 58) & 3u;
++    std::uint32_t nreg = (lo >> 60) & 0xFu;
++    if (!nreg) nreg = 16;
++    if (flg != 0 || !nloop || qwc != 1 + nloop * nreg) return false;
++    bool kicks = false;
++    std::uint32_t colour = 16;
++    for (std::uint32_t r = 0; r < nreg; ++r) {
++        const std::uint32_t reg = (regs >> (r * 4)) & 0xFu;
++        if (reg == kAddressData) return false;
++        kicks = kicks || reg == 0x4 || reg == 0x5 || reg == 0xC || reg == 0xD;
++        if (reg == 0x1) colour = r;
++    }
++    opaque = colour < nreg;
++    for (std::uint32_t loop = 0; opaque && loop < nloop; ++loop) {
++        std::uint32_t alpha;
++        std::memcpy(&alpha, data + (1 + static_cast<std::size_t>(loop) * nreg + colour) * 16 + 12, 4);
++        opaque = (alpha & 0xFFu) >= 0x80u;
++    }
++    return kicks;
++}
++
++// Pass B's state: a subtracting blend, a depth test, no alpha test, a PRIM.
++bool is_b_state(const bool (&writes)[kRegisters], const std::uint64_t (&value)[kRegisters]) {
++    if (!writes[kPrim] || writes[kAlpha1 + 1] || writes[kTest1 + 1] || !writes[kAlpha1] || !writes[kTest1]) return false;
++    const std::uint64_t test = value[kTest1];
++    return (value[kAlpha1] & 0xFFu) == 0x42u && !(test & 1u) && ((test >> 16) & 1u) && !((value[kPrim] >> 9) & 1u);
++}
++
++void flush() {
++    if (g_in_run && !g_packets.empty()) {
++        g_out.assign(g_b_state.begin(), g_b_state.end());
++        for (const Packet &p : g_packets) {
++            // A PRIM write ends the strip before each packet, as pass B's state did.
++            Reg128 q[2]{};
++            q[0].d[0] = 1 | (1ull << 15) | (1ull << 60);
++            q[0].d[1] = kAddressData;
++            q[1].d[0] = g_b_prim;
++            q[1].d[1] = kPrim;
++            const auto *b = reinterpret_cast<const std::uint8_t *>(q);
++            g_out.insert(g_out.end(), b, b + sizeof q);
++            g_out.insert(g_out.end(), g_held.begin() + p.at * 16, g_held.begin() + (p.at + p.qwc) * 16);
++        }
++        pass(1, g_out.data(), static_cast<std::uint32_t>(g_out.size() / 16));
++    } else if (g_in_run && g_in_b) {
++        pass(1, g_b_state.data(), static_cast<std::uint32_t>(g_b_state.size() / 16));
++    }
++    if (!g_a_state.empty()) pass(1, g_a_state.data(), static_cast<std::uint32_t>(g_a_state.size() / 16));
++    g_a_state.clear();
++    g_held.clear();
++    g_packets.clear();
++    g_in_run = g_in_b = false;
++}
++
++// Takes the packet if it belongs to a run (holding pass B, sending the rest
++// on); false means the caller sends it after flush().
++bool take(int path, const std::uint8_t *data, std::uint32_t qwc) {
++    if (path != 1 || qwc < 2 || !enabled()) return false;
++    static bool writes[kRegisters];
++    static std::uint64_t value[kRegisters];
++    if (address_data_only(data, qwc, writes, value)) {
++        if (is_b_state(writes, value)) {
++            const bool same = g_in_run && g_b_state.size() == qwc * 16u && std::memcmp(g_b_state.data(), data, qwc * 16u) == 0;
++            if (!same || !g_a_state.empty()) {
++                flush();
++                g_b_state.assign(data, data + qwc * 16u);
++                std::copy(std::begin(writes), std::end(writes), std::begin(g_b_writes));
++                g_b_prim = value[kPrim];
++                g_in_run = true;
++            }
++            g_in_b = true;
++            return true;
++        }
++        if (!g_in_run || !g_a_state.empty()) return false;
++        // Pass A must set all it needs but TEXFLUSH and RGBAQ (its vertices
++        // carry their own colour), and nothing pass B leaves alone.
++        for (std::uint32_t a = 0; a < kRegisters; ++a)
++            if ((writes[a] && !g_b_writes[a]) || (g_b_writes[a] && !writes[a] && a != kTexflush && a != kRgbaq)) return false;
++        // Held until its vertices show whether the chunk can go ahead of
++        // the B passes held so far.
++        g_in_b = false;
++        g_a_state.assign(data, data + qwc * 16u);
++        return true;
++    }
++    bool opaque = false;
++    if (!g_in_run || !vertices_only(data, qwc, opaque)) return false;
++    if (!g_in_b) {
++        // A see-through chunk (a fighter fading out) needs the B passes
++        // held so far drawn before it: flush() sends them, then its state.
++        if (!opaque || g_a_state.empty()) return false;
++        pass(path, g_a_state.data(), static_cast<std::uint32_t>(g_a_state.size() / 16));
++        g_a_state.clear();
++        pass(path, data, qwc);
++        return true;
++    }
++    g_packets.push_back(Packet{g_held.size() / 16, qwc});
++    g_held.insert(g_held.end(), data, data + qwc * 16u);
++    if (g_packets.size() >= kMaxHeld) {
++        flush();
++        return true;
++    }
++    return true;
++}
++
++}
++
++void out(int path, const std::uint8_t *data, std::uint32_t qwc) {
++    if (!qwc) return;
++    if (gs::queue::active() && gs::queue::role() != gs::queue::Role::Vu) scan(g_scan[path], data, qwc);
++    if (hold_here()) {
++        if (body::take(path, data, qwc)) return;
++        body::flush();
++    }
++    pass(path, data, qwc);
++}
++
+ // How many of these qwords belong to the packet under way; mid_packet is left set when
+ // the packet goes on past them.
+ std::uint32_t packet_length(const std::uint8_t *data, std::uint32_t qwc) {
+@@ -461,16 +660,21 @@ void drop_held() {
+ }
+ 
+ void flush_merged() {
+-    if (hold_here()) merge::flush();
++    if (!hold_here()) return;
++    body::flush();
++    merge::flush();
+ }
+ 
+ void forget_merged() {
+-    if (hold_here()) merge::forget();
++    if (!hold_here()) return;
++    body::flush();
++    merge::forget();
+ }
+ 
+ void reset() {
+     g_stat = 0;
+     if (hold_here()) {
++        body::flush();
+         merge::flush();
+         drop_held();
+     }
+-- 
+2.54.0 (Apple Git-157)
+

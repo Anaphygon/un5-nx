@@ -1,0 +1,206 @@
+From b02c420a8116e35eacb2999f6745532bf53589d8 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 7 Nov 2026 21:53:54 +0700
+Subject: [PATCH] un5-nx: where a draw's time goes on the GS thread
+
+Span timers for the port's speed log ([gs-time]): GIF transfers and the
+native batches without the flushes they cause, flushes with their vertex
+trace, and inside Draw() the texture lookup, the target lookups and
+DrawPrims; also CLUT loads and the vertex kicks per frame.
+---
+ pcsx2/GS/GSState.cpp                   | 22 +++++++++++++-
+ pcsx2/GS/GSState.h                     | 15 ++++++++++
+ pcsx2/GS/Renderers/HW/GSRendererHW.cpp | 41 ++++++++++++++++++--------
+ 3 files changed, 64 insertions(+), 14 deletions(-)
+
+diff --git a/pcsx2/GS/GSState.cpp b/pcsx2/GS/GSState.cpp
+index 75c2c66..cd88925 100644
+--- a/pcsx2/GS/GSState.cpp
++++ b/pcsx2/GS/GSState.cpp
+@@ -19,6 +19,7 @@
+ #include <iomanip>
+ #include <bit>
+ #include <cstring>
++#include "common/ScopedGuard.h"
+ 
+ u64 GSState::s_n = 0;
+ u64 GSState::s_last_transfer_draw_n = 0;
+@@ -1752,6 +1753,7 @@ void GSState::ApplyTEX0(GIFRegTEX0& TEX0)
+ 			InvalidateLocalMem(BITBLTBUF, r, true);
+ 		}
+ 
++		Un5Span un5_timed{g_un5_gs_ms[6]};
+ 		m_mem.m_clut.Write(m_env.CTXT[i].TEX0, m_env.TEXCLUT);
+ 	}
+ 
+@@ -2340,6 +2342,9 @@ void GSState::GIFRegHandlerHWREG(const GIFReg* RESTRICT r)
+ u64 g_un5_flush_reason[16];
+ u64 g_un5_split[4]; // same state, texture only, render target, other state
+ u64 g_un5_indices;
++double g_un5_gs_ms[12];
++u64 g_un5_kicks;
++int g_un5_gs_in;
+ 
+ namespace
+ {
+@@ -2378,6 +2383,11 @@ void GSState::Flush(GSFlushReason reason)
+ 
+ void GSState::FlushDraw(GSFlushReason reason)
+ {
++	Un5Span un5_timed{g_un5_gs_ms[4]};
++	Un5Span un5_nested{g_un5_gs_ms[g_un5_gs_in == 1 ? 7 : g_un5_gs_in == 2 ? 9 : 11]};
++	const int un5_in = g_un5_gs_in;
++	g_un5_gs_in = 0;
++	ScopedGuard un5_restore([un5_in]() { g_un5_gs_in = un5_in; });
+ 	FlushWrite();
+ 
+ 	if (m_index->tail > 0)
+@@ -2641,7 +2651,10 @@ void GSState::FlushPrim()
+ 		m_env.CTXT[PRIM->CTXT].UpdateScissor();
+ 		if (m_un5.pending)
+ 			UN5WriteProxy();
+-		m_vt.Update(vtx_buff.buff, idx_buff.buff, vtx_buff.tail, idx_buff.tail, GSUtil::GetPrimClass(PRIM->PRIM));
++		{
++			Un5Span un5_timed{g_un5_gs_ms[3]};
++			m_vt.Update(vtx_buff.buff, idx_buff.buff, vtx_buff.tail, idx_buff.tail, GSUtil::GetPrimClass(PRIM->PRIM));
++		}
+ 
+ 		// Texel coordinate rounding
+ 		// Helps Manhunt (lights shining through objects).
+@@ -2775,6 +2788,9 @@ static constexpr u32 UN5_MAX_CONSTS = 1024; // the VS_UN5 uniform block
+ 
+ void GSState::UN5NativeBatch(const u8* packet)
+ {
++	Un5Span un5_timed{g_un5_gs_ms[8]};
++	g_un5_gs_in = 2;
++	ScopedGuard un5_restore([]() { g_un5_gs_in = 0; });
+ 	u32 info[4];
+ 	memcpy(info, packet + 16, sizeof(info));
+ 	const u32 count = info[2];
+@@ -3670,6 +3686,9 @@ template void GSState::Transfer<3>(const u8* mem, u32 size);
+ template <int index>
+ void GSState::Transfer(const u8* mem, u32 size)
+ {
++	Un5Span un5_timed{g_un5_gs_ms[5]};
++	g_un5_gs_in = 1;
++	ScopedGuard un5_restore([]() { g_un5_gs_in = 0; });
+ 	const u8* start = mem;
+ 
+ 	GIFPath& path = m_path[index];
+@@ -6160,6 +6179,7 @@ __forceinline void GSState::VertexKick(u32 skip)
+ 	GSIndexBuff& idx_buff = *m_index;
+ 	static_assert(n > 0);
+ 	pxAssert(vtx_buff.tail < m_max_vertex_count + 3);
++	g_un5_kicks++;
+ 
+ 	if constexpr (prim == GS_INVALID)
+ 	{
+diff --git a/pcsx2/GS/GSState.h b/pcsx2/GS/GSState.h
+index 1d3f691..b7111ca 100644
+--- a/pcsx2/GS/GSState.h
++++ b/pcsx2/GS/GSState.h
+@@ -13,6 +13,21 @@
+ #include "GS/Renderers/Common/GSDevice.h"
+ #include "GS/GSVector.h"
+ #include "GSAlignedClass.h"
++#include "common/Timer.h"
++
++// un5-nx: milliseconds the GS thread spends in each stage of a draw, for the
++// port's speed log (gs_front.cpp names the slots).
++extern double g_un5_gs_ms[12];
++extern u64 g_un5_kicks;
++// Set while a GIF transfer (1) or a native batch (2) runs, so the flushes
++// they cause can be told apart (slots 7 and 9).
++extern int g_un5_gs_in;
++struct Un5Span
++{
++	double& sum;
++	Common::Timer timer;
++	~Un5Span() { sum += timer.GetTimeMilliseconds(); }
++};
+ 
+ class GSDumpBase;
+ 
+diff --git a/pcsx2/GS/Renderers/HW/GSRendererHW.cpp b/pcsx2/GS/Renderers/HW/GSRendererHW.cpp
+index 1227f84..4263c8c 100644
+--- a/pcsx2/GS/Renderers/HW/GSRendererHW.cpp
++++ b/pcsx2/GS/Renderers/HW/GSRendererHW.cpp
+@@ -3598,9 +3598,12 @@ void GSRendererHW::Draw()
+ 		}
+ 		else
+ 		{
+-			src = tex_psm.depth ? g_texture_cache->LookupDepthSource(true, TEX0, m_cached_ctx.TEXA, MIP_CLAMP, tmm.coverage, possible_shuffle, m_vt.IsLinear(), m_cached_ctx.FRAME, req_color, req_alpha)
+-			                    : g_texture_cache->LookupSource(true, TEX0, m_cached_ctx.TEXA, MIP_CLAMP, tmm.coverage, (GSConfig.HWMipmap || GSConfig.TriFilter == TriFiltering::Forced) ? &hash_lod_range : nullptr,
+-			                         possible_shuffle, m_vt.IsLinear(), m_cached_ctx.FRAME, req_color, req_alpha);
++			{
++				Un5Span un5_timed{g_un5_gs_ms[0]};
++				src = tex_psm.depth ? g_texture_cache->LookupDepthSource(true, TEX0, m_cached_ctx.TEXA, MIP_CLAMP, tmm.coverage, possible_shuffle, m_vt.IsLinear(), m_cached_ctx.FRAME, req_color, req_alpha)
++				                    : g_texture_cache->LookupSource(true, TEX0, m_cached_ctx.TEXA, MIP_CLAMP, tmm.coverage, (GSConfig.HWMipmap || GSConfig.TriFilter == TriFiltering::Forced) ? &hash_lod_range : nullptr,
++				                         possible_shuffle, m_vt.IsLinear(), m_cached_ctx.FRAME, req_color, req_alpha);
++			}
+ 
+ 			if (!src) [[unlikely]]
+ 			{
+@@ -3769,9 +3772,12 @@ void GSRendererHW::Draw()
+ 		ZBUF_TEX0.TBW = m_cached_ctx.FRAME.FBW;
+ 		ZBUF_TEX0.PSM = m_cached_ctx.ZBUF.PSM;
+ 
+-		ds = g_texture_cache->LookupDrawTarget(ZBUF_TEX0, t_size, target_scale, GSTextureCache::DepthStencil,
+-			m_cached_ctx.DepthWrite(), 0, force_preload, preserve_depth, preserve_depth, unclamped_draw_rect, IsPossibleChannelShuffle(), is_possible_mem_clear && ZBUF_TEX0.TBP0 != m_cached_ctx.FRAME.Block(), !no_rt,
+-			src, nullptr, -1);
++		{
++			Un5Span un5_timed{g_un5_gs_ms[1]};
++			ds = g_texture_cache->LookupDrawTarget(ZBUF_TEX0, t_size, target_scale, GSTextureCache::DepthStencil,
++				m_cached_ctx.DepthWrite(), 0, force_preload, preserve_depth, preserve_depth, unclamped_draw_rect, IsPossibleChannelShuffle(), is_possible_mem_clear && ZBUF_TEX0.TBP0 != m_cached_ctx.FRAME.Block(), !no_rt,
++				src, nullptr, -1);
++		}
+ 
+ 		ZBUF_TEX0.TBW = m_channel_shuffle ? src->m_from_target_TEX0.TBW : m_cached_ctx.FRAME.FBW;
+ 
+@@ -4031,9 +4037,12 @@ void GSRendererHW::Draw()
+ 		// Of course if this size is different (in width) or this is a shuffle happening, this will be bypassed.
+ 		const bool preserve_downscale_draw = (GSConfig.UserHacks_NativeScaling != GSNativeScaling::Off && ((std::abs(scale_draw) == 1 && !scaled_copy) || (scale_draw == 0 && src && src->m_from_target && src->m_from_target->m_downscaled))) || is_possible_mem_clear == ClearType::ClearWithDraw;
+ 
+-		rt = g_texture_cache->LookupDrawTarget(FRAME_TEX0, t_size, ((src && src->m_scale != 1) && (GSConfig.UserHacks_NativeScaling == GSNativeScaling::Normal || GSConfig.UserHacks_NativeScaling == GSNativeScaling::NormalUpscaled) && !possible_shuffle) ? GetTextureScaleFactor() : target_scale, GSTextureCache::RenderTarget, true,
+-			fm, force_preload, preserve_rt_rgb, preserve_rt_alpha, lookup_rect, possible_shuffle, is_possible_mem_clear && FRAME_TEX0.TBP0 != m_cached_ctx.ZBUF.Block(),
+-			GSConfig.UserHacks_NativeScaling != GSNativeScaling::Off && preserve_downscale_draw && is_possible_mem_clear != ClearType::NormalClear, src, ds, (no_ds || !ds) ? -1 : (m_cached_ctx.ZBUF.Block() - ds->m_TEX0.TBP0));
++		{
++			Un5Span un5_timed{g_un5_gs_ms[1]};
++			rt = g_texture_cache->LookupDrawTarget(FRAME_TEX0, t_size, ((src && src->m_scale != 1) && (GSConfig.UserHacks_NativeScaling == GSNativeScaling::Normal || GSConfig.UserHacks_NativeScaling == GSNativeScaling::NormalUpscaled) && !possible_shuffle) ? GetTextureScaleFactor() : target_scale, GSTextureCache::RenderTarget, true,
++				fm, force_preload, preserve_rt_rgb, preserve_rt_alpha, lookup_rect, possible_shuffle, is_possible_mem_clear && FRAME_TEX0.TBP0 != m_cached_ctx.ZBUF.Block(),
++				GSConfig.UserHacks_NativeScaling != GSNativeScaling::Off && preserve_downscale_draw && is_possible_mem_clear != ClearType::NormalClear, src, ds, (no_ds || !ds) ? -1 : (m_cached_ctx.ZBUF.Block() - ds->m_TEX0.TBP0));
++		}
+ 
+ 		// Draw skipped because it was a clear and there was no target.
+ 		if (!rt)
+@@ -4414,9 +4423,12 @@ void GSRendererHW::Draw()
+ 		ZBUF_TEX0.TBW = m_cached_ctx.FRAME.FBW;
+ 		ZBUF_TEX0.PSM = m_cached_ctx.ZBUF.PSM;
+ 
+-		ds = g_texture_cache->LookupDrawTarget(ZBUF_TEX0, t_size, target_scale, GSTextureCache::DepthStencil,
+-			m_cached_ctx.DepthWrite(), 0, force_preload, preserve_depth, preserve_depth, unclamped_draw_rect, IsPossibleChannelShuffle(), is_possible_mem_clear && ZBUF_TEX0.TBP0 != m_cached_ctx.FRAME.Block(), false,
+-			src, nullptr, -1);
++		{
++			Un5Span un5_timed{g_un5_gs_ms[1]};
++			ds = g_texture_cache->LookupDrawTarget(ZBUF_TEX0, t_size, target_scale, GSTextureCache::DepthStencil,
++				m_cached_ctx.DepthWrite(), 0, force_preload, preserve_depth, preserve_depth, unclamped_draw_rect, IsPossibleChannelShuffle(), is_possible_mem_clear && ZBUF_TEX0.TBP0 != m_cached_ctx.FRAME.Block(), false,
++				src, nullptr, -1);
++		}
+ 
+ 		ZBUF_TEX0.TBW = m_channel_shuffle ? src->m_from_target_TEX0.TBW : m_cached_ctx.FRAME.FBW;
+ 
+@@ -5303,7 +5315,10 @@ void GSRendererHW::Draw()
+ 	const GSVector4i real_rect = m_r;
+ 
+ 	if (!skip_draw)
+-		DrawPrims(rt, ds, src, tmm);
++		{
++			Un5Span un5_timed{g_un5_gs_ms[2]};
++			DrawPrims(rt, ds, src, tmm);
++		}
+ 
+ 
+ 	// Temporary source *must* be invalidated before normal, because otherwise it'll be double freed.
+-- 
+2.54.0 (Apple Git-157)
+
