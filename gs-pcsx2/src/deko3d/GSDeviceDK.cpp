@@ -15,6 +15,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
 #include <dirent.h>
 #include <sys/stat.h>
 
@@ -37,8 +38,14 @@ extern u64 g_un5_gpu_behind, g_un5_presents;
 
 namespace
 {
+#ifdef UN5_HOST
+	// The Mac shader harvest: the pack it already has and where new sources go.
+	const char* const kPackDir = std::getenv("UN5DK_PACK") ? std::getenv("UN5DK_PACK") : "shaders-dk";
+	const char* const kMissingDir = std::getenv("UN5DK_MISSING") ? std::getenv("UN5DK_MISSING") : "shaders-dk-missing";
+#else
 	constexpr const char* kPackDir = "sdmc:/switch/un5-nx/shaders-dk";
 	constexpr const char* kMissingDir = "sdmc:/switch/un5-nx/shaders-dk-missing";
+#endif
 
 	// Same bindings as the OpenGL device's GLSL.
 	constexpr u32 g_vs_pc_index = 4;

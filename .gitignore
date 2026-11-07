@@ -1,5 +1,6 @@
 disc/
 build/
+build-*/
 out/
 generated/
 third_party/

@@ -9,10 +9,12 @@
 #include "GS/GSPerfMon.h"
 #include "GS/GSState.h"
 #include "GS/Renderers/HW/GSRendererHW.h"
+#ifndef UN5_HOST
 #include "GS/Renderers/OpenGL/GSDeviceOGL.h"
+#endif
 #include "un5_settings.h"
 #include "bench.h"
-#ifdef __SWITCH__
+#if defined(__SWITCH__) || defined(UN5_HOST)
 #include "deko3d/GSDeviceDK.h"
 #endif
 #include "common/Console.h"
@@ -62,6 +64,8 @@ extern "C" void ps2_switch_new_thread_core(int core);
 // ... and moves the last thread placed that way (glthread's worker).
 extern "C" bool ps2_switch_move_placed_thread(int core);
 int s_glthread_core = 1;
+#endif
+#if defined(__SWITCH__) || defined(UN5_HOST)
 // The device in use is deko3d (UN5GS_RENDERER=dk), not OpenGL.
 bool s_deko3d = false;
 // Whether UN5's stage batches come here untransformed: with
@@ -465,6 +469,8 @@ void log_to_stderr(LOGLEVEL level, ConsoleColors, std::string_view message)
 
 #ifdef __SWITCH__
 extern "C" void util_queue_kill_all_threads(void); // our Mesa (patches/switch-mesa/0003)
+#endif
+#if defined(__SWITCH__) || defined(UN5_HOST)
 // Defined with the stage program's stand-in (ports/un5/vu1_native.cpp), which
 // sends its batches untransformed while this says yes.
 extern "C" bool (*un5_native_batches_hook)();
@@ -492,6 +498,11 @@ bool open()
 	apply_environment();
 	EmuConfig.CurrentAspectRatio = AspectRatioType::R4_3;
 	EmuConfig.CurrentCustomAspectRatio = 0.0f;
+#if defined(UN5_HOST)
+	// The Mac shader harvest has only the deko3d device, with nothing behind it.
+	s_deko3d = true;
+	g_gs_device = std::make_unique<GSDeviceDK>();
+#else
 #ifdef __SWITCH__
 	// UN5GS_RENDERER=dk draws with deko3d (src/deko3d/) instead of OpenGL.
 	const char* renderer = std::getenv("UN5GS_RENDERER");
@@ -501,6 +512,7 @@ bool open()
 	else
 #endif
 		g_gs_device = std::make_unique<GSDeviceOGL>();
+#endif
 	const char* vsync = std::getenv("UN5GS_VSYNC");
 #ifdef __SWITCH__
 	// glthread's worker starts with the context, on core 1 with the emulation
@@ -527,8 +539,12 @@ bool open()
 	g_gs_renderer->ResetPCRTC();
 	g_gs_renderer->UpdateRenderFixes();
 	const char* native = std::getenv("UN5GS_NATIVE");
+#ifdef UN5_HOST
+	const bool shader = static_cast<GSDeviceDK*>(g_gs_device.get())->UN5ShaderLoaded();
+#else
 	const bool shader = s_deko3d ? static_cast<GSDeviceDK*>(g_gs_device.get())->UN5ShaderLoaded() :
 								   static_cast<GSDeviceOGL*>(g_gs_device.get())->UN5ShaderLoaded();
+#endif
 	// On by default with deko3d; with OpenGL only for UN5GS_NATIVE=1: from one
 	// Switch run on, every OpenGL frame showed zoomed in, cause unknown.
 	const bool wanted = s_deko3d ? !(native && std::strcmp(native, "0") == 0) : (native && std::strcmp(native, "1") == 0);

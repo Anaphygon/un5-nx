@@ -5,6 +5,8 @@
 #include "ps2/external_gs.hpp"
 #include "ps2/system.hpp"
 
+#include <cstdlib>
+
 #ifdef __SWITCH__
 bool un5_launcher(const char* nro_dir);
 #endif
@@ -35,7 +37,13 @@ void vsync(std::uint32_t field)
 
 const ps2::ExternalGs kPcsx2Gs{open, transfer, privileged, un5gs::write_csr, vsync, un5gs::read_fifo, un5gs::close};
 
+#ifndef __SWITCH__
+// The Mac runner links it for the shader harvest only: PS2_EXTERNAL_GS=1 asks
+// for it, so its regression runs keep the runtime's own GS.
+[[maybe_unused]] const bool kRegistered = std::getenv("PS2_EXTERNAL_GS") && (ps2::set_external_gs(&kPcsx2Gs), true);
+#else
 [[maybe_unused]] const bool kRegistered = (ps2::set_external_gs(&kPcsx2Gs), true);
+#endif
 
 #ifdef __SWITCH__
 // The settings screen before the game (gs-pcsx2/src/launcher.cpp).

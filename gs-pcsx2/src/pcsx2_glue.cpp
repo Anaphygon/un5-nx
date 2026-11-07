@@ -24,7 +24,9 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
+#ifndef UN5_HOST
 #include <malloc.h>
+#endif
 
 // ---- settings ----------------------------------------------------------
 
@@ -120,9 +122,17 @@ bool Pcsx2Config::GSOptions::ShouldDump(u64, int) const
 }
 
 namespace EmuFolders {
+#ifdef UN5_HOST
+// The Mac shader harvest: PCSX2's resources from UN5GS_RESOURCES (the
+// checkout's bin/resources, which is what the Switch's SD card holds).
+std::string Cache = "cache";
+std::string Logs = ".";
+std::string Resources = std::getenv("UN5GS_RESOURCES") ? std::getenv("UN5GS_RESOURCES") : "resources";
+#else
 std::string Cache = "sdmc:/switch/un5-nx/cache";
 std::string Logs = "sdmc:/switch/un5-nx";
 std::string Resources = "sdmc:/switch/un5-nx/resources";
+#endif
 }
 
 bool FMVstarted = false;
@@ -415,11 +425,13 @@ std::string_view Path::GetFileName(const std::string_view path)
 	std::abort();
 }
 
+#ifndef UN5_HOST // a desktop has its own
 extern "C" int posix_memalign(void** out, size_t alignment, size_t size)
 {
 	*out = memalign(alignment, size);
 	return *out ? 0 : ENOMEM;
 }
+#endif
 
 const char* Pcsx2Config::GSOptions::DEFAULT_CAPTURE_CONTAINER = "mp4";
 

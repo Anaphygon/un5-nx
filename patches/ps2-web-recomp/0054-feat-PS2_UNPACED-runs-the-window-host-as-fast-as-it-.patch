@@ -1,0 +1,47 @@
+From 2d9c963b4a989f98b6a035ea2ba2df0427fdc45c Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 8 Nov 2026 03:54:01 +0700
+Subject: [PATCH] feat: PS2_UNPACED runs the window host as fast as it goes,
+ without sound
+
+For runs that only want to get through the game (a port's shader harvest,
+with its external GS and PS2_ONE_THREAD): no pacing to the PAL or NTSC
+field rate and no audio device, whose queue would otherwise grow without
+bound at several times real speed.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ host/window.cpp | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/host/window.cpp b/host/window.cpp
+index 1692ea3..13e4167 100644
+--- a/host/window.cpp
++++ b/host/window.cpp
+@@ -261,7 +261,15 @@ constexpr Uint32 kAudioBytesPerMs = 48 * 4;
+ double g_frame_longest_ms = 0;
+ std::uint32_t g_frames_over_40 = 0;
+ 
++// PS2_UNPACED=1: no pacing and no sound, for runs that only want to get through
++// the game quickly (a port's shader harvest).
++bool unpaced() {
++    static const bool on = std::getenv("PS2_UNPACED") != nullptr;
++    return on;
++}
++
+ void pace() {
++    if (unpaced()) return;
+     const std::uint64_t frequency = SDL_GetPerformanceFrequency();
+     {
+         static std::uint64_t previous = 0;
+@@ -502,6 +510,7 @@ bool open_window(bool fullscreen) {
+ }
+ 
+ static void open_audio_and_pads() {
++    if (unpaced()) return;
+     SDL_AudioSpec want{}, have{};
+     want.freq = 48000;
+     want.format = AUDIO_S16SYS;
+-- 
+2.54.0 (Apple Git-157)
+
