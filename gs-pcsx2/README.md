@@ -16,4 +16,6 @@ PCSX2's rules (its AGENTS.md) forbid AI agents from opening pull requests,
 issues or comments there and new contributors from sending LLM-written code:
 nothing from here is to be sent upstream by an agent.
 
-Status: runs on a Switch (HOS 23.0.0): UN5 intro, battles and Master Mode, below full speed.
+Status: runs on a Switch (HOS 23.0.0) through OpenGL (Mesa nouveau) or deko3d
+(`src/deko3d/`, a launcher setting): UN5 intro, battles and Master Mode; with
+deko3d, battles at the PAL cap of 50 frames per second (2026-11-08).

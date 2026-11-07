@@ -15,11 +15,15 @@ and are kept in [`archive/ps2recomp`](archive/ps2recomp).
 > computer and stays there.
 
 **Status: experimental, phase 4 of 8.** On the **Switch** (title override,
-PCSX2's hardware GS on the GPU through deko3d) it plays intro movies, menus,
-battles, the shop and Master Mode; battles run at the PAL cap of 50 frames per
-second most of the time, movies at 13-20. On **macOS** (Apple silicon) it plays
-the same at 50. See [`docs/PHASE3.md`](docs/PHASE3.md) and
-[`docs/PHASE4.md`](docs/PHASE4.md). Windows is not started.
+PCSX2's hardware GS on the GPU through OpenGL or deko3d) it plays intro movies,
+menus, battles, the shop and Master Mode. With deko3d, battles hold the PAL cap
+of 50 frames per second, heavy stages and jutsu included (an 11-minute session
+on 2026-11-08 stayed at 49.5-50 in nearly every 5-second window); an effect
+seen for the first time hitches once while its shader is compiled on the
+console, which then keeps it. Movies run at 13-20. On **macOS** (Apple silicon) it plays the
+same at 50. See [`docs/PHASE3.md`](docs/PHASE3.md),
+[`docs/PHASE4.md`](docs/PHASE4.md) and [Speed on the Switch](#speed-on-the-switch).
+Windows is not started.
 
 ## Read the plan
 
@@ -64,6 +68,39 @@ docker run --rm -v "/path/to/your.iso:/in/game.iso:ro" -v "$PWD/out:/out" un5-nx
 then copy `out/switch/un5-nx` to `sdmc:/switch/un5-nx` with your ISO as
 `disc.iso`. See [`docker/README.md`](docker/README.md).
 
+## Speed on the Switch
+
+The Switch's three cores run the game code (EE thread), the VU1 programs (VU
+thread) and PCSX2's GS (render thread). Each of them was the limit in turn:
+
+- **GS:** about 730 draws a frame at first. Shadow-volume count packets go out
+  as one draw per blend, and a character's toon pass (pass B) is held and drawn
+  after its texture passes, with see-through fighters kept in order: about 240
+  draws a frame, GS about 10 ms.
+- **VU1:** VIF unpacks got templated paths; UN5's stage program can also run
+  as a vertex shader (`UN5GS_NATIVE=1`), but it stays off: the floor by the
+  camera flickers with it on the Switch and it gained no speed there.
+- **EE:** the thread then held the frame rate at 40-46 while the others waited.
+  A sampling profiler on the console (`PS2_SAMPLE`) showed the IOP interpreter
+  (CRI ADX and Sony's `modhsyn` sound modules) at about 13% of it and VU0
+  programs in the exact soft-float loop at about 9%. Both are translated now:
+  VU0 programs with `vurecomp --vu0`, the IOP code a run recorded with
+  `ioprecomp` (`PS2_IOP_RECORD`). With them the thread is about a fifth idle.
+  The EE's own floating point (COP1, COP2 macro instructions) must stay
+  bit-exact: in native single precision UN5 plays out differently.
+
+The launcher has a **Benchmark** row: three minutes of a Practice fight (no
+timer, no KO; Practice always uses the grass-field stage) from
+`practice.state` with scripted combos and jutsu, using the settings on the
+left. It quits by itself; the next time the launcher opens, the row shows the
+average, the slowest 5 seconds and how much of the time was at full speed
+(`bench-result.txt`, with the details and a sampler report in `ps2run.log`).
+On 2026-11-08 at 1.5x: 49.4 fps on average, 47.5 at the slowest, full speed
+83% of the time. `practice.state` holds game memory, so it is not in this
+repository: save one with the Mac runner (`--save-state <frame>:<file>`) at
+the first frame of a Practice fight and copy it next to the NRO; the row says
+when it is missing.
+
 ## Building (macOS, Apple silicon)
 
 Requirements: Xcode command line tools, CMake, Ninja, Python 3, and your own
@@ -94,11 +131,12 @@ Builds use half the CPU cores by default (`JOBS=` to change it).
 |---|---|
 | `tools/setup_ps2webrecomp.sh` | Clones ps2-web-recomp at the pinned commit, applies `patches/ps2-web-recomp` with `git am`, ports your disc |
 | `tools/un5_play.sh` | Plays the game; when it halts on untranslated code, captures the overlays, seeds entries and rebuilds |
-| `tools/un5_from_iso.sh` | Translates the game from the disc alone: executable, the overlays in `PRG/`, every VU1 program |
+| `tools/un5_from_iso.sh` | Translates the game from the disc alone: executable, the overlays in `PRG/`, every VU1 program; also the VU0 programs (`games/un5/vu0`) and IOP code (`games/un5/iop`) a run recorded, when there are records (without them those stay interpreted, slower) |
 | `tools/un5_entries.py` | Lists every function start of the executable and the overlays by their layout |
 | `tools/un5_vu1.py` | Rebuilds the VU1 programs from the MPG upload blocks in the executable, for `vurecomp --snapshots` |
 | `tools/un5_seed.py` | Finds overlay functions reached through pointers: vtables, constructor tables, `lui`/`addiu` |
-| `tools/code_sync.sh`, `tools/vu_sync.sh` | Safety net: translate code or VU1 programs a Switch reached without a translation, and reinstall |
+| `tools/code_sync.sh`, `tools/vu_sync.sh` | Safety net: translate code or VU1/VU0 programs a Switch reached without a translation, and reinstall |
+| `tools/dk_sync.sh` | Adds the shaders the deko3d renderer could not build on the console to its pack |
 | `tools/elfinfo.py` | Segments, sections and symbol families of a PS2 ELF |
 | `tools/xref.py` | R5900-aware address cross-references and disassembly (rabbitizer) |
 | `tools/ghidra_export.sh` | Ghidra headless analysis of the executable (and the PS2Recomp function export) |
@@ -121,6 +159,22 @@ In `patches/ps2-web-recomp/`, to be sent upstream (details in
   and finds its files when an emulator passes no arguments.
 - `scripts/glsl.sh` translates the GS compute shaders to GLSL 4.30 for an
   OpenGL backend.
+
+Performance work for UN5 on the Switch (patches `0043`-`0052`, details in the
+commit messages):
+
+- Shadow-volume count packets merged into one draw per blend; the merge's
+  register watch skips tags without A+D.
+- Masked and offset VIF unpacks get templated paths (about 2.9x faster).
+- UN5's character pass B is held and drawn after the run's pass A chunks.
+- The stall line says how long each thread waited on the others; the Switch
+  sampler can be started by a call; a port's launcher can start a run of its
+  own (`PS2_ARGS_FILE`).
+- VU0 micro programs leave the exact soft-float loop for the decoding
+  interpreter, and `vurecomp --vu0` translates them like VU1's.
+- `PS2_IOP_RECORD` records the IOP code a run executes; `ioprecomp` turns it
+  into C++ blocks the IOP interpreter runs instead, one cycle per instruction
+  as before, checked against RAM before they run.
 
 ## Fixes to PS2Recomp (phases 1 and 2)
 
@@ -214,9 +268,14 @@ This project stands on other people's work:
 - **[rabbitizer](https://github.com/Decompollaborate/rabbitizer)** by
   **Decompollaborate**: the R5900-aware disassembler behind `tools/xref.py`.
 - **[Ghidra](https://github.com/NationalSecurityAgency/ghidra)** by the NSA.
-- **[PCSX2](https://github.com/PCSX2/pcsx2)**: the reference for how the PS2
-  behaves, and the source of the reference interpreters in the runtime forks
-  above.
+- **[PCSX2](https://github.com/PCSX2/pcsx2)** (GPL-3.0): its hardware GS
+  renderer draws the game on the Switch (`gs-pcsx2/`, with local patches only;
+  nothing is sent upstream by an agent), and it is the reference for how the
+  PS2 behaves.
+- **[deko3d](https://github.com/devkitPro/deko3d)** and
+  **[uam](https://github.com/devkitPro/uam)** by **fincs** (devkitPro): the
+  Switch GPU API the GS draws through, and the shader compiler behind its
+  shader pack and the shaders compiled on the console.
 
 *Naruto Shippuden: Ultimate Ninja 5* is © Masashi Kishimoto / Shueisha,
 TV Tokyo, Pierrot, and Namco Bandai Games; developed by CyberConnect2. This
