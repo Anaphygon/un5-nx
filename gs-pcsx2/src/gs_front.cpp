@@ -61,9 +61,6 @@ namespace EmuFolders { extern std::string Logs; } // pcsx2_glue.cpp
 extern "C" void ps2_switch_new_thread_core(int core);
 // ... and moves the last thread placed that way (glthread's worker).
 extern "C" bool ps2_switch_move_placed_thread(int core);
-// ps2-web-recomp gif.cpp: the body pass B merge forced on (1), off (0), or as
-// the environment says (-1).
-extern "C" void ps2_body_merge_override(int on);
 int s_glthread_core = 1;
 // The device in use is deko3d (UN5GS_RENDERER=dk), not OpenGL.
 bool s_deko3d = false;
@@ -418,14 +415,11 @@ void log_speed()
 		g_un5_dk_full_barrier = !g_un5_dk_full_barrier;
 		Console.WriteLn("[dk] hazard barrier now %s", g_un5_dk_full_barrier ? "full" : "fragments");
 	}
-	// The launcher's Benchmark: the next window's variant.
+	// The launcher's Benchmark.
 	if (un5_bench_on())
 	{
 		const double gs_ms = s_fields ? Common::Timer::ConvertValueToMilliseconds(s_gs_ticks) / s_fields : 0.0;
-		const Un5BenchChoice next = un5_bench_window({s_fields / seconds, gs_ms, s_last_vu_busy, s_last_draws});
-		if (s_native_batches)
-			s_native_send = next.gpu_stage;
-		ps2_body_merge_override(next.body_merge ? 1 : 0);
+		un5_bench_window({s_fields / seconds, gs_ms, s_last_vu_busy, s_last_draws});
 	}
 	s_shader_compiles = 0;
 	g_un5_program_ms = 0.0;

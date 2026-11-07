@@ -124,23 +124,33 @@ namespace
 		return text;
 	}
 
-	// The Benchmark's run: the battle replay (battle.state, made on the Mac,
-	// and its button presses) with UN5GS_BENCH switching the optional paths
-	// every 5 s, as args.txt would give it. Written next to the NRO each
-	// time, so it always matches the build.
+	// The Benchmark's run: a Practice fight (practice.state, made on the Mac
+	// at its first frame, Naruto and Sakura against the same), three minutes
+	// of combos, jutsu and steps, as args.txt would give it. Written next to
+	// the NRO each time, so it always matches the build.
+	constexpr const char* kBenchState = "practice.state";
+	constexpr int kBenchFirst = 9660, kBenchEnd = 18600; // frames: 50 a second
+
 	bool write_bench_args(const std::string& path)
 	{
 		std::FILE* f = std::fopen(path.c_str(), "w");
 		if (!f)
 			return false;
-		std::fprintf(f, "# written by the launcher's Benchmark\nUN5GS_BENCH=1\nUN5GS_NATIVE=1\nPS2_VU_NATIVE=1\nPS2_VU_PROFILE=1\n"
+		std::fprintf(f, "# written by the launcher's Benchmark\nUN5GS_BENCH=1\nPS2_VU_PROFILE=1\n"
 						// The sampler waits for the benchmark's go (bench.cpp).
 						"PS2_SAMPLE=100000\n"
-						"--window\n--fullscreen\n--disc\n$DIR/disc.iso\n--memcard\n$DIR/bench.ps2\n--load-state\n$DIR/battle.state\n"
-						"--press\n6900:cross:4\n");
-		for (int t = 7500; t <= 8940; t += 60)
-			std::fprintf(f, "--press\n%d:triangle:4\n--press\n%d:circle:4\n", t, t + 12);
-		std::fprintf(f, "--frames\n14500\n");
+						"--window\n--fullscreen\n--disc\n$DIR/disc.iso\n--memcard\n$DIR/bench.ps2\n--load-state\n$DIR/%s\n",
+			kBenchState);
+		// Every 2.4 s: a four-hit combo, a jutsu (chakra, then attack), a step
+		// towards the other side.
+		for (int t = kBenchFirst; t < kBenchEnd; t += 120)
+		{
+			for (int hit = 0; hit < 4; ++hit)
+				std::fprintf(f, "--press\n%d:circle:4\n", t + hit * 12);
+			std::fprintf(f, "--press\n%d:triangle:4\n--press\n%d:circle:4\n--press\n%d:%s:16\n", t + 60, t + 72, t + 96,
+				(t / 120) % 2 ? "left" : "right");
+		}
+		std::fprintf(f, "--frames\n%d\n", kBenchEnd);
 		std::fclose(f);
 		return true;
 	}
@@ -167,10 +177,10 @@ namespace
 		if (selected == kBench)
 		{
 			screen.heading = "Benchmark";
-			screen.value = exists(g_dir + "battle.state") ? "Run it" : "battle.state is missing";
+			screen.value = exists(g_dir + kBenchState) ? "Run it" : std::string(kBenchState) + " is missing";
 			const std::string last = bench_summary();
-			// The settings on the left apply, with deko3d; the run quits by itself.
-			screen.note = "A three-minute battle replay; it quits at the end.\n" +
+			// The settings on the left apply; the run quits by itself.
+			screen.note = "Three minutes of Practice; it quits at the end.\n" +
 						  (last.empty() ? std::string("No run yet.") : last);
 		}
 		else if (selected == kStart)
@@ -315,7 +325,7 @@ bool un5_launcher(const char* dir)
 		if (selected == kStart && (down & HidNpadButton_A))
 			start = true;
 		else if (selected == kBench)
-			start = bench = (down & HidNpadButton_A) && exists(g_dir + "battle.state");
+			start = bench = (down & HidNpadButton_A) && exists(g_dir + kBenchState);
 		else if (dx || (down & HidNpadButton_A))
 			un5_row_step(s, selected, dx ? dx : 1), dirty = true;
 		if (start)
@@ -340,9 +350,9 @@ bool un5_launcher(const char* dir)
 	setenv("UN5GS_FILTER", std::to_string(s.filter).c_str(), 1);
 	setenv("PS2_AUDIO_STRETCH", s.audio_stretch ? "1" : "0", 1);
 	setenv("UN5_SHOW_FPS", s.show_fps ? "1" : "0", 1);
-	setenv("UN5GS_RENDERER", s.deko3d || bench ? "dk" : "gl", 1);
-	// UN5's stage on the GPU stays off in play until the Benchmark shows the
-	// floor by the camera right on the Switch (it flickered there once).
+	setenv("UN5GS_RENDERER", s.deko3d ? "dk" : "gl", 1);
+	// UN5's stage on the GPU stays off: the floor by the camera flickers with
+	// it on the Switch, depth clamp or not, and it gained no speed there.
 	setenv("UN5GS_NATIVE", "0", 0);
 	// The runner reads PS2_ARGS_FILE in place of args.txt.
 	if (bench && write_bench_args(g_dir + "bench-args.txt"))
