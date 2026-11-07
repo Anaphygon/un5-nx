@@ -1,0 +1,84 @@
+From 043684e313614723ac3d60cb98fbda9353af1093 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 7 Nov 2026 22:34:38 +0700
+Subject: [PATCH] feat: a port's launcher can start a run of its own
+
+After the port's launcher, PS2_ARGS_FILE names a file in args.txt's format
+to read in its place (UN5's Benchmark). PS2_NEXT_LOAD, from args.txt, names
+an NRO for the homebrew loader to start when this one exits. The body
+merge can be switched at run time through ps2_body_merge_override().
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ host/main.cpp          | 9 +++++++++
+ runtime/src/gs/gif.cpp | 9 +++++++++
+ 2 files changed, 18 insertions(+)
+
+diff --git a/host/main.cpp b/host/main.cpp
+index 7ebc95f..45577a0 100644
+--- a/host/main.cpp
++++ b/host/main.cpp
+@@ -1,5 +1,7 @@
+ #ifdef __SWITCH__
+ #include "switch_sampler.hpp"
++
++#include <switch.h>
+ #endif
+ #include "ps2/system.hpp"
+ 
+@@ -57,6 +59,9 @@ int main(int argc, char **argv) {
+         std::FILE *f = std::fopen((dir + "args.txt").c_str(), "r");
+         if (!f) {
+             if (const ps2::PortLauncher launcher = ps2::port_launcher(); launcher && !launcher(dir.c_str())) return 0;
++            // A port's launcher can ask for a run of its own (a benchmark)
++            // through PS2_ARGS_FILE, in args.txt's format.
++            if (const char *args_file = std::getenv("PS2_ARGS_FILE")) f = std::fopen(args_file, "r");
+         }
+         if (f) {
+             defaults.resize(2);
+@@ -75,6 +80,10 @@ int main(int argc, char **argv) {
+             }
+             std::fclose(f);
+         }
++        // PS2_NEXT_LOAD (set in args.txt) names an NRO for the homebrew loader
++        // to start when this one exits, however it exits: a bench run started
++        // from a remote tool hands the console back to that tool.
++        if (const char *next = std::getenv("PS2_NEXT_LOAD"); next && envHasNextLoad()) envSetNextLoad(next, next);
+         for (std::string &a : defaults) switch_argv.push_back(a.data());
+         argc = static_cast<int>(switch_argv.size());
+         argv = switch_argv.data();
+diff --git a/runtime/src/gs/gif.cpp b/runtime/src/gs/gif.cpp
+index 8a1ac2c..5a30fdb 100644
+--- a/runtime/src/gs/gif.cpp
++++ b/runtime/src/gs/gif.cpp
+@@ -8,6 +8,7 @@
+ #include "ps2/system.hpp"
+ 
+ #include <algorithm>
++#include <atomic>
+ #include <cstdio>
+ #include <cstring>
+ #include <cstdlib>
+@@ -450,7 +451,10 @@ std::vector<std::uint8_t> g_a_state;   // pass A state waiting for its vertices
+ 
+ // PS2_BODY_MERGE_CYCLE=n (frames): on for n frames, off for the next n, to
+ // price it within one run; each switch is logged.
++std::atomic<int> g_override{-1};
++
+ bool enabled() {
++    if (const int forced = g_override.load(std::memory_order_relaxed); forced >= 0) return forced != 0;
+     static const bool on = [] {
+         const char *e = std::getenv("PS2_BODY_MERGE");
+         return !e || std::atoi(e) != 0;
+@@ -790,3 +794,8 @@ void state(ps2::state::Stream &s) {
+ }
+ 
+ }
++
++// A port's benchmark switches the body merge on (1) or off (0) as it runs;
++// -1 goes back to PS2_BODY_MERGE. A run held when it goes off is sent with
++// the next packet.
++extern "C" void ps2_body_merge_override(int on) { ps2::gif::body::g_override.store(on, std::memory_order_relaxed); }
+-- 
+2.54.0 (Apple Git-157)
+

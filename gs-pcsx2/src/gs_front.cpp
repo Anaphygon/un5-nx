@@ -11,6 +11,7 @@
 #include "GS/Renderers/HW/GSRendererHW.h"
 #include "GS/Renderers/OpenGL/GSDeviceOGL.h"
 #include "un5_settings.h"
+#include "bench.h"
 #ifdef __SWITCH__
 #include "deko3d/GSDeviceDK.h"
 #endif
@@ -60,6 +61,9 @@ namespace EmuFolders { extern std::string Logs; } // pcsx2_glue.cpp
 extern "C" void ps2_switch_new_thread_core(int core);
 // ... and moves the last thread placed that way (glthread's worker).
 extern "C" bool ps2_switch_move_placed_thread(int core);
+// ps2-web-recomp gif.cpp: the body pass B merge forced on (1), off (0), or as
+// the environment says (-1).
+extern "C" void ps2_body_merge_override(int on);
 int s_glthread_core = 1;
 // The device in use is deko3d (UN5GS_RENDERER=dk), not OpenGL.
 bool s_deko3d = false;
@@ -214,6 +218,9 @@ void clock_cycle_window() {}
 // the same state as the one before it (so could have been merged), only a
 // new texture, a new render target, or other state; why PCSX2 flushed; and
 // the GS thread's time split between Draw() setup and GL submission.
+// The last window's draws per frame and VU thread share, for the benchmark.
+double s_last_draws = 0, s_last_vu_busy = 0;
+
 void log_draw_split(u32 fields, double gs_ms)
 {
 	static const char* const kReasons[16] = {"unknown", "reset", "state change", "clut change", "gs transfer",
@@ -221,6 +228,7 @@ void log_draw_split(u32 fields, double gs_ms)
 		"autoflush", "vsync", "reopen", "vertex count"};
 	const u64 draws = g_un5_split[0] + g_un5_split[1] + g_un5_split[2] + g_un5_split[3];
 	const double per = fields ? 1.0 / fields : 0.0;
+	s_last_draws = static_cast<double>(draws) * per;
 	const auto pct = [draws](u64 n) { return draws ? 100.0 * static_cast<double>(n) / static_cast<double>(draws) : 0.0; };
 	std::string reasons;
 	for (int i = 0; i < 16; i++)
@@ -309,6 +317,7 @@ void log_draw_split(u32 fields, double gs_ms)
 	const double vu_busy = window_ms > 0 ? std::clamp(100.0 * (1.0 - (vu_idle - s_vu_idle) / window_ms), 0.0, 100.0) : 0.0;
 	s_vu_idle = vu_idle;
 	s_vu_since = Common::Timer::GetCurrentValue();
+	s_last_vu_busy = vu_busy;
 	Console.WriteLn("[vu1] VU thread busy %.0f%%; %.1f interpreted program runs per frame", vu_busy,
 		static_cast<double>(interpreted - s_interpreted) * per);
 	s_interpreted = interpreted;
@@ -408,6 +417,15 @@ void log_speed()
 	{
 		g_un5_dk_full_barrier = !g_un5_dk_full_barrier;
 		Console.WriteLn("[dk] hazard barrier now %s", g_un5_dk_full_barrier ? "full" : "fragments");
+	}
+	// The launcher's Benchmark: the next window's variant.
+	if (un5_bench_on())
+	{
+		const double gs_ms = s_fields ? Common::Timer::ConvertValueToMilliseconds(s_gs_ticks) / s_fields : 0.0;
+		const Un5BenchChoice next = un5_bench_window({s_fields / seconds, gs_ms, s_last_vu_busy, s_last_draws});
+		if (s_native_batches)
+			s_native_send = next.gpu_stage;
+		ps2_body_merge_override(next.body_merge ? 1 : 0);
 	}
 	s_shader_compiles = 0;
 	g_un5_program_ms = 0.0;

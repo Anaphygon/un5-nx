@@ -106,15 +106,33 @@ namespace
 		return t;
 	}
 
+	// Word-wrapped text; a newline starts a new line.
 	void wrapped(Un5Painter& p, int x, int y, int px, uint32_t c, const std::string& text, int max_w, int line_h)
 	{
 		std::string line;
 		size_t at = 0;
 		while (at <= text.size())
 		{
-			size_t end = text.find(' ', at);
+			size_t end = text.find_first_of(" \n", at);
 			if (end == std::string::npos)
 				end = text.size();
+			if (end < text.size() && text[end] == '\n')
+			{
+				const std::string word = text.substr(at, end - at);
+				const std::string tried = line.empty() ? word : line + " " + word;
+				if (!line.empty() && p.width(px, tried.c_str()) > max_w)
+				{
+					p.text(x, y, px, c, line.c_str());
+					y += line_h;
+					p.text(x, y, px, c, word.c_str());
+				}
+				else
+					p.text(x, y, px, c, tried.c_str());
+				y += line_h;
+				line.clear();
+				at = end + 1;
+				continue;
+			}
 			const std::string word = text.substr(at, end - at);
 			const std::string tried = line.empty() ? word : line + " " + word;
 			if (!line.empty() && p.width(px, tried.c_str()) > max_w)

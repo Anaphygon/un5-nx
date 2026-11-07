@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0+
 // The launcher: a settings screen before the game starts, from the homebrew
-// menu (it is skipped when args.txt is there, for benchmark runs). The
+// menu (it is skipped when args.txt is there, for remote bench runs; its
+// Benchmark row starts the built-in one). The
 // choices are kept in launcher.ini next to the NRO and take effect through the
 // environment the runner and the GS read, and through Horizon OC's clock
 // override for the performance presets.
@@ -99,7 +100,48 @@ namespace
 			std::fprintf(stderr, "[settings] clocks %s: %u/%u/%u MHz\n", p.name, hz[0] / 1000000, hz[1] / 1000000, hz[2] / 1000000);
 	}
 
-	constexpr int kStart = kSettingRows; // the launcher's last row
+	constexpr int kStart = kSettingRows; // the launcher's last two rows
+	constexpr int kBench = kStart + 1;
+	constexpr int kRows = kBench + 1;
+
+	bool exists(const std::string& path)
+	{
+		struct stat st;
+		return stat(path.c_str(), &st) == 0;
+	}
+
+	// The last benchmark's summary (bench-result.txt up to its blank line).
+	std::string bench_summary()
+	{
+		std::string text;
+		if (std::FILE* f = std::fopen((g_dir + "bench-result.txt").c_str(), "r"))
+		{
+			char line[160];
+			while (std::fgets(line, sizeof line, f) && line[0] != '\n')
+				text += line;
+			std::fclose(f);
+		}
+		return text;
+	}
+
+	// The Benchmark's run: the battle replay (battle.state, made on the Mac,
+	// and its button presses) with UN5GS_BENCH switching the optional paths
+	// every 5 s, as args.txt would give it. Written next to the NRO each
+	// time, so it always matches the build.
+	bool write_bench_args(const std::string& path)
+	{
+		std::FILE* f = std::fopen(path.c_str(), "w");
+		if (!f)
+			return false;
+		std::fprintf(f, "# written by the launcher's Benchmark\nUN5GS_BENCH=1\nUN5GS_NATIVE=1\nPS2_VU_NATIVE=1\nPS2_VU_PROFILE=1\n"
+						"--window\n--fullscreen\n--disc\n$DIR/disc.iso\n--memcard\n$DIR/bench.ps2\n--load-state\n$DIR/battle.state\n"
+						"--press\n6900:cross:4\n");
+		for (int t = 7500; t <= 8940; t += 60)
+			std::fprintf(f, "--press\n%d:triangle:4\n--press\n%d:circle:4\n", t, t + 12);
+		std::fprintf(f, "--frames\n12000\n");
+		std::fclose(f);
+		return true;
+	}
 
 	class FramebufferPainter : public Un5Painter
 	{
@@ -119,7 +161,17 @@ namespace
 			screen.items.push_back({t.label, t.value});
 		}
 		screen.items.push_back({"Start game", ""});
-		if (selected == kStart)
+		screen.items.push_back({"Benchmark", ""});
+		if (selected == kBench)
+		{
+			screen.heading = "Benchmark";
+			screen.value = exists(g_dir + "battle.state") ? "Run it" : "battle.state is missing";
+			const std::string last = bench_summary();
+			// The settings on the left apply, with deko3d; the run quits by itself.
+			screen.note = "A two-minute battle replay; it quits at the end.\n" +
+						  (last.empty() ? std::string("No run yet.") : last);
+		}
+		else if (selected == kStart)
 		{
 			screen.heading = "Ready";
 			screen.value = "Start game";
@@ -246,7 +298,7 @@ bool un5_launcher(const char* dir)
 	padConfigureInput(8, HidNpadStyleSet_NpadStandard);
 	padInitializeAny(&pad);
 	int selected = kStart;
-	bool start = false, dirty = true;
+	bool start = false, bench = false, dirty = true;
 	while (appletMainLoop())
 	{
 		padUpdate(&pad);
@@ -254,12 +306,14 @@ bool un5_launcher(const char* dir)
 		if (down & HidNpadButton_Plus)
 			break;
 		if (down & HidNpadButton_AnyUp)
-			selected = (selected + kStart) % (kStart + 1), dirty = true;
+			selected = (selected + kRows - 1) % kRows, dirty = true;
 		if (down & HidNpadButton_AnyDown)
-			selected = (selected + 1) % (kStart + 1), dirty = true;
+			selected = (selected + 1) % kRows, dirty = true;
 		const int dx = (down & HidNpadButton_AnyRight) ? 1 : (down & HidNpadButton_AnyLeft) ? -1 : 0;
 		if (selected == kStart && (down & HidNpadButton_A))
 			start = true;
+		else if (selected == kBench)
+			start = bench = (down & HidNpadButton_A) && exists(g_dir + "battle.state");
 		else if (dx || (down & HidNpadButton_A))
 			un5_row_step(s, selected, dx ? dx : 1), dirty = true;
 		if (start)
@@ -284,7 +338,16 @@ bool un5_launcher(const char* dir)
 	setenv("UN5GS_FILTER", std::to_string(s.filter).c_str(), 1);
 	setenv("PS2_AUDIO_STRETCH", s.audio_stretch ? "1" : "0", 1);
 	setenv("UN5_SHOW_FPS", s.show_fps ? "1" : "0", 1);
-	setenv("UN5GS_RENDERER", s.deko3d ? "dk" : "gl", 1);
+	setenv("UN5GS_RENDERER", s.deko3d || bench ? "dk" : "gl", 1);
+	// UN5's stage on the GPU stays off in play until the Benchmark shows the
+	// floor by the camera right on the Switch (it flickered there once).
+	setenv("UN5GS_NATIVE", "0", 0);
+	// The runner reads PS2_ARGS_FILE in place of args.txt.
+	if (bench && write_bench_args(g_dir + "bench-args.txt"))
+	{
+		setenv("PS2_ARGS_FILE", (g_dir + "bench-args.txt").c_str(), 1);
+		setenv("UN5_BENCH_RESULT", (g_dir + "bench-result.txt").c_str(), 1);
+	}
 	setenv("UN5GS_FIX", std::to_string(s.upscale_fix).c_str(), 1);
 	// VU1 programs with no translation run in the interpreter, about ten times
 	// slower (a battle with new characters fell to 42 fps with the VU thread at
