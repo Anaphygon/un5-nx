@@ -1,0 +1,307 @@
+From 7194761468c3588d1619b877a5add0d9ae2e9649 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 8 Nov 2026 00:59:43 +0700
+Subject: [PATCH] perf: VU0 micro programs translated like VU1's
+
+vurecomp --vu0 translates recorded VU0 programs: a 4 KB code mask, the
+VU0 interpreter for what is left (vu::interpret(0, ...)), its 256-qword
+data memory (qword0), and a table of its own registered with
+register_programs0 from register_generated_vu0(). They are translated
+without --rz: they run on the EE thread, in round-to-nearest, as the VU0
+interpreter does since the previous commit.
+
+The runtime looks VU0 programs up by key at each VCALLMS entry, as it does
+VU1's (same reachable/program_key, an entry cache of its own invalidated
+by code_changed(0)); with PS2_VU_RECORD=<dir> one with no translation goes
+to <dir>/vu0/.
+
+UN5 uses two VU0 programs (eight entries with the jump targets). On the
+Mac the battle replay's share of VU0 work falls from 9.1% to 0.8% of CPU
+samples; the regression suite's frames are unchanged.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ host/main.cpp                  |  2 ++
+ host/web.cpp                   |  2 ++
+ recomp/vurecomp.cpp            | 34 +++++++++++++-----
+ runtime/include/ps2/vu_ops.hpp |  4 +++
+ runtime/src/vu_micro.cpp       | 63 +++++++++++++++++++++++++++++++---
+ 5 files changed, 92 insertions(+), 13 deletions(-)
+
+diff --git a/host/main.cpp b/host/main.cpp
+index 1eaa911..e13ca4b 100644
+--- a/host/main.cpp
++++ b/host/main.cpp
+@@ -20,6 +20,7 @@
+ 
+ void register_generated_code();
+ void register_generated_vu();
++void register_generated_vu0();
+ void register_generated_iop();
+ 
+ namespace {
+@@ -146,6 +147,7 @@ int main(int argc, char **argv) {
+ #endif
+     register_generated_code();
+     register_generated_vu();
++    register_generated_vu0();
+     register_generated_iop();
+     const auto emulate = [&]() -> int {
+         std::uint32_t entry = 0;
+diff --git a/host/web.cpp b/host/web.cpp
+index c065d5a..48ba28c 100644
+--- a/host/web.cpp
++++ b/host/web.cpp
+@@ -19,6 +19,7 @@
+ 
+ void register_generated_code();
+ void register_generated_vu();
++void register_generated_vu0();
+ void register_generated_iop();
+ 
+ EM_JS_DEPS(ps2web, "$stringToNewUTF8,$UTF8ToString");
+@@ -415,6 +416,7 @@ int main(int argc, char **argv) {
+     ps2::set_audio_sink(push_audio);
+     register_generated_code();
+     register_generated_vu();
++    register_generated_vu0();
+     register_generated_iop();
+ 
+     ps2::init_graphics();
+diff --git a/recomp/vurecomp.cpp b/recomp/vurecomp.cpp
+index a2b10b8..5e2b56e 100644
+--- a/recomp/vurecomp.cpp
++++ b/recomp/vurecomp.cpp
+@@ -17,7 +17,9 @@ namespace fs = std::filesystem;
+ 
+ namespace {
+ 
+-constexpr std::uint32_t kMask = 16383u;
++// The unit translated: VU1 (16 KB of code) or, with --vu0, VU0 (4 KB).
++int g_unit = 1;
++std::uint32_t kMask = 16383u;
+ constexpr int kAcc = 32;
+ 
+ struct Program {
+@@ -617,7 +619,7 @@ std::string generate(const Program &p, std::string &name, bool sticky_live) {
+     std::set<int> shadowed;
+     for (std::uint32_t pc : pcs)
+         for (int reg : upper(word(p.code, pc + 4), true).shadow_reads) shadowed.insert(reg);
+-    name = std::format("vu1_{:016X}", p.key);
++    name = std::format("vu{}_{:016X}", g_unit, p.key);
+     std::string o = std::format("void {}(Vu0Regs &r, std::uint8_t *mem) {{\n    FlagPipe fl;\n    fl.start(r);\n    bool pend = false, pendj = false, ending = false;\n    std::uint32_t jpc = 0;\n    (void)pend;\n    (void)pendj;\n    (void)ending;\n    (void)jpc;\n",
+                                 name);
+     if (!delay.empty()) o += "    std::uint16_t bk = 0, next_bk = 0;\n    unsigned bi = 0;\n    (void)bk;\n    (void)next_bk;\n    (void)bi;\n";
+@@ -695,6 +697,11 @@ std::string generate(const Program &p, std::string &name, bool sticky_live) {
+         replace_all(o, "vu::interpret(", "fl.commit(r); vu::interpret(");
+         replace_all(o, "r.tpc = ", "fl.commit(r); r.tpc = ");
+     }
++    if (g_unit == 0) {
++        // VU0: its interpreter for what is left, its 4 KB of data memory.
++        replace_all(o, "vu::interpret(1, ", "vu::interpret(0, ");
++        replace_all(o, "qword(mem, ", "qword0(mem, ");
++    }
+     return local_regs(o);
+ }
+ 
+@@ -709,11 +716,15 @@ int main(int argc, char **argv) {
+     bool snapshots = false;
+     for (; argc > 1 && argv[1][0] == '-'; --argc, ++argv) {
+         if (std::string(argv[1]) == "--rz") g_rz = true;
++        else if (std::string(argv[1]) == "--vu0") {
++            g_unit = 0;
++            kMask = 4095u;
++        }
+         else if (std::string(argv[1]) == "--snapshots") snapshots = true;
+         else break;
+     }
+     if (argc < 3) {
+-        std::fprintf(stderr, "usage: vurecomp [--rz] [--snapshots] <recorded programs dir> <out dir>\n");
++        std::fprintf(stderr, "usage: vurecomp [--rz] [--vu0] [--snapshots] <recorded programs dir> <out dir>\n");
+         return 1;
+     }
+     const fs::path in_dir = argv[1], out_dir = argv[2];
+@@ -776,8 +787,9 @@ int main(int argc, char **argv) {
+     }
+     std::sort(programs.begin(), programs.end(), [](const Program &a, const Program &b) { return a.key < b.key; });
+     fs::create_directories(out_dir);
++    const std::string prefix = std::format("vu{}_", g_unit);
+     for (const auto &e : fs::directory_iterator(out_dir))
+-        if (e.path().filename().string().rfind("vu1_", 0) == 0) fs::remove(e.path());
++        if (e.path().filename().string().rfind(prefix, 0) == 0) fs::remove(e.path());
+     // UN5: four programs clear the sticky bits with FSSET and later test sticky
+     // sign (FSAND 0x80); none reads one it did not clear.
+     std::vector<bool> sticky_reader(programs.size());
+@@ -801,15 +813,19 @@ int main(int argc, char **argv) {
+             names.push_back(name);
+         }
+         text += "}\n";
+-        std::ofstream(out_dir / std::format("vu1_{:03}.cpp", first / per_file)) << text;
++        std::ofstream(out_dir / std::format("{}{:03}.cpp", prefix, first / per_file)) << text;
+     }
+     std::string table = "#include \"ps2/vu_ops.hpp\"\n\nnamespace gen {\n";
+     for (const auto &n : names) table += std::format("void {}(ps2::Vu0Regs &r, std::uint8_t *mem);\n", n);
+-    table += "\nconst ps2::vu::Program kVuPrograms[] = {\n";
++    const std::string array = g_unit ? "kVuPrograms" : "kVu0Programs";
++    table += std::format("\nconst ps2::vu::Program {}[] = {{\n", array);
+     for (std::size_t i = 0; i < programs.size(); ++i) table += std::format("    {{0x{:016X}ull, {}}},\n", programs[i].key, names[i]);
+     if (programs.empty()) table += "    {0, nullptr},\n";
+-    table += std::format("}};\n\n}}\n\nvoid register_generated_vu() {{ ps2::vu::register_programs(gen::kVuPrograms, {}u, {}); }}\n", programs.size(), g_rz ? "true" : "false");
+-    std::ofstream(out_dir / "vu1_table.cpp") << table;
+-    std::printf("%zu VU1 programs, %zu of them jump targets\n", programs.size(), programs.size() - recorded);
++    if (g_unit)
++        table += std::format("}};\n\n}}\n\nvoid register_generated_vu() {{ ps2::vu::register_programs(gen::kVuPrograms, {}u, {}); }}\n", programs.size(), g_rz ? "true" : "false");
++    else
++        table += std::format("}};\n\n}}\n\nvoid register_generated_vu0() {{ ps2::vu::register_programs0(gen::kVu0Programs, {}u); }}\n", programs.size());
++    std::ofstream(out_dir / (prefix + "table.cpp")) << table;
++    std::printf("%zu VU%d programs, %zu of them jump targets\n", programs.size(), g_unit, programs.size() - recorded);
+     return 0;
+ }
+diff --git a/runtime/include/ps2/vu_ops.hpp b/runtime/include/ps2/vu_ops.hpp
+index 3154bc6..f714397 100644
+--- a/runtime/include/ps2/vu_ops.hpp
++++ b/runtime/include/ps2/vu_ops.hpp
+@@ -29,6 +29,9 @@ struct Program {
+ // round_to_zero: the programs were translated with vurecomp --rz and must
+ // run with the host in round-toward-zero, flush-to-zero mode.
+ void register_programs(const Program *programs, std::uint32_t count, bool round_to_zero = false);
++// VU0 programs, translated with vurecomp --vu0 (in round-to-nearest: they
++// run on the EE thread, whose rounding the game's own code needs).
++void register_programs0(const Program *programs, std::uint32_t count);
+ // A hand-written stand-in for the compiled program with this key, compared
+ // with it by PS2_VU_BENCH. Several may be registered; they are timed in the
+ // order they were registered. With PS2_VU_NATIVE=1 the first one runs in
+@@ -611,6 +614,7 @@ struct FlagPipe {
+ };
+ 
+ PS2_VU_INLINE std::uint8_t *qword(std::uint8_t *mem, std::uint32_t index) { return mem + (index & 1023u) * 16u; }
++PS2_VU_INLINE std::uint8_t *qword0(std::uint8_t *mem, std::uint32_t index) { return mem + (index & 255u) * 16u; }
+ PS2_VU_INLINE void set_vi(Vu0Regs &r, unsigned i, std::uint32_t v) {
+     if (i) r.vi[i] = static_cast<std::uint16_t>(v);
+ }
+diff --git a/runtime/src/vu_micro.cpp b/runtime/src/vu_micro.cpp
+index 860f0ae..d4b2efa 100644
+--- a/runtime/src/vu_micro.cpp
++++ b/runtime/src/vu_micro.cpp
+@@ -867,16 +867,16 @@ struct EntryCache {
+     std::uint32_t next = 0;
+ };
+ 
+-bool candidate_matches(const Candidate &c) {
++bool candidate_matches(const Candidate &c, const std::uint8_t *unit_code = g_vu1_code) {
+     const std::uint8_t *code = c.code.data();
+     for (std::size_t i = 0; i < c.runs.size(); i += 2) {
+-        if (std::memcmp(g_vu1_code + c.runs[i], code, c.runs[i + 1]) != 0) return false;
++        if (std::memcmp(unit_code + c.runs[i], code, c.runs[i + 1]) != 0) return false;
+         code += c.runs[i + 1];
+     }
+     return true;
+ }
+ 
+-Candidate make_candidate(std::vector<std::uint32_t> pcs) {
++Candidate make_candidate(std::vector<std::uint32_t> pcs, const std::uint8_t *unit_code = g_vu1_code) {
+     std::sort(pcs.begin(), pcs.end());
+     Candidate c;
+     for (std::uint32_t pc : pcs) {
+@@ -885,7 +885,7 @@ Candidate make_candidate(std::vector<std::uint32_t> pcs) {
+             c.runs.push_back(pc);
+             c.runs.push_back(8);
+         }
+-        c.code.insert(c.code.end(), g_vu1_code + pc, g_vu1_code + pc + 8);
++        c.code.insert(c.code.end(), unit_code + pc, unit_code + pc + 8);
+     }
+     return c;
+ }
+@@ -907,6 +907,16 @@ void code_changed(int unit) {
+     ++g_generation[unit & 1];
+ }
+ 
++// VU0 programs translated by vurecomp --vu0, by key, and the one found last
++// at each entry (as for VU1).
++std::unordered_map<std::uint64_t, ProgramFn> g_programs0;
++EntryCache g_entries0[512];
++
++void register_programs0(const Program *programs, std::uint32_t count) {
++    for (std::uint32_t i = 0; i < count; ++i)
++        if (programs[i].function) g_programs0[programs[i].key] = programs[i].function;
++}
++
+ void register_programs(const Program *programs, std::uint32_t count, bool round_to_zero) {
+     g_round_to_zero = round_to_zero;
+     for (std::uint32_t i = 0; i < count; ++i)
+@@ -1020,6 +1030,7 @@ std::uint32_t top() { return g_top; }
+ std::uint32_t itop() { return g_itop; }
+ 
+ ProgramFn lookup(std::uint32_t address);
++ProgramFn lookup0(std::uint32_t address);
+ 
+ std::atomic<std::uint64_t> g_interpreted_calls{0};
+ 
+@@ -1173,6 +1184,12 @@ void run_entry(int unit, std::uint32_t pc) {
+             return;
+         }
+     }
++    if (unit == 0 && !interpret_only) {
++        if (const ProgramFn fn = lookup0(pc)) {
++            fn(g_cpu.vu0, g_vu0_mem);
++            return;
++        }
++    }
+     if (unit == 1) g_interpreted_calls.fetch_add(1, std::memory_order_relaxed);
+     if (count && unit == 1) {
+         ++misses[pc];
+@@ -1234,6 +1251,43 @@ ProgramFn lookup(std::uint32_t address) {
+     return e.function;
+ }
+ 
++// The translated VU0 program starting at this address, if there is one; with
++// PS2_VU_RECORD=<dir>, the code of one that is not goes to <dir>/vu0.
++ProgramFn lookup0(std::uint32_t address) {
++    EntryCache &e = g_entries0[(address & 4095u) >> 3];
++    if (e.generation == g_generation[0]) return e.function;
++    e.generation = g_generation[0];
++    for (const Candidate &c : e.candidates)
++        if (candidate_matches(c, g_vu0_code)) {
++            e.function = c.function;
++            e.key = c.key;
++            return e.function;
++        }
++    const std::vector<std::uint32_t> pcs = reachable(g_vu0_code, 4095u, address);
++    const std::uint64_t key = program_key(g_vu0_code, pcs, address & 4095u);
++    e.key = key;
++    const auto it = g_programs0.find(key);
++    e.function = it == g_programs0.end() ? nullptr : it->second;
++    Candidate c = make_candidate(pcs, g_vu0_code);
++    c.key = key;
++    c.function = e.function;
++    if (e.candidates.size() < 8) e.candidates.push_back(std::move(c));
++    else e.candidates[e.next++ % 8] = std::move(c);
++    static const char *record = std::getenv("PS2_VU_RECORD");
++    if (!e.function && record) {
++        char name[64];
++        std::snprintf(name, sizeof name, "%016llX_%04X.bin", static_cast<unsigned long long>(key), address & 4095u);
++        static std::unordered_set<std::string> recorded;
++        if (!recorded.insert(name).second) return e.function;
++        const std::filesystem::path dir = std::filesystem::path(record) / "vu0";
++        if (!std::filesystem::exists(dir / name)) {
++            std::filesystem::create_directories(dir);
++            std::ofstream(dir / name, std::ios::binary).write(reinterpret_cast<const char *>(g_vu0_code), 4096);
++        }
++    }
++    return e.function;
++}
++
+ void run_fast(int n, std::uint32_t address) {
+     Unit u = unit_of(n);
+     Vu0Regs &r = *u.regs;
+@@ -1377,6 +1431,7 @@ void vcallms(Cpu &, std::uint32_t address) { vu::run(0, address); }
+ }
+ 
+ __attribute__((weak)) void register_generated_vu() {}
++__attribute__((weak)) void register_generated_vu0() {}
+ 
+ namespace ps2::vu {
+ 
+-- 
+2.54.0 (Apple Git-157)
+

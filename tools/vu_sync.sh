@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-3.0+
-# Translates the VU1 programs the Switch found with no translation. The game
+# Translates the VU1 (and VU0) programs the Switch found with no translation. The game
 # keeps each one in sdmc:/switch/un5-nx/vu1-new/ (the launcher turns
 # PS2_VU_RECORD on); left to the interpreter they are about ten times slower.
 # This pulls them (switch-devtools running, over USB or Wi-Fi), adds them to
@@ -42,6 +42,16 @@ for name in $(grep -oE '[0-9A-F]{16}_[0-9A-F]{4}\.bin' "$work/list" | sort -u); 
 		new=$((new + 1))
 	fi
 done
+# VU0 programs land in a folder of their own.
+if grep -qE ' vu0$' "$work/list" && dt ls "$remote/vu0" >"$work/list0" 2>/dev/null; then
+	mkdir -p "$web/games/un5/vu0"
+	for name in $(grep -oE '[0-9A-F]{16}_[0-9A-F]{4}\.bin' "$work/list0" | sort -u); do
+		if [ ! -f "$web/games/un5/vu0/$name" ]; then
+			dt get "$remote/vu0/$name" "$web/games/un5/vu0/$name" >/dev/null
+			new=$((new + 1))
+		fi
+	done
+fi
 if [ "$new" -eq 0 ]; then
 	echo "Nothing new: every VU1 program played so far is translated."
 	exit 0

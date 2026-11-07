@@ -62,6 +62,13 @@ python3 -I "$here/un5_vu1.py" "$G/disc/SLES_556.05" "$work/vu1"
 # longer upload left in VU memory is out of the executable's reach.
 if [ -d "$G/vu1" ]; then cp "$G"/vu1/*.bin "$work/vu1/" 2>/dev/null || true; fi
 (cd "$web" && build/tools/vurecomp --rz --snapshots "$work/vu1" generated/un5 | tail -1)
+# VU0 programs (VCALLMS from the game's code) that a run recorded
+# (PS2_VU_RECORD=<dir> puts them in <dir>/vu0; UN5 has two): translated for
+# the EE thread, the rest stay interpreted.
+if compgen -G "$G/vu0/*.bin" >/dev/null; then
+	echo "Translating the recorded VU0 programs..."
+	(cd "$web" && build/tools/vurecomp --vu0 "$G/vu0" generated/un5 | tail -1)
+fi
 # The IOP's sound modules (CRI ADX, modhsyn, libsd) take an eighth of the EE
 # thread in the interpreter. Code a run recorded (PS2_IOP_RECORD=<dir>, one
 # folder per run in $G/iop) becomes blocks the interpreter runs natively;
