@@ -13,6 +13,7 @@
 #include <string>
 #include <sys/stat.h>
 
+#include "harvest.h"
 #include "launcher_gfx.h"
 #include "menu_art.h"
 #include "un5_settings.h"
@@ -100,9 +101,10 @@ namespace
 			std::fprintf(stderr, "[settings] clocks %s: %u/%u/%u MHz\n", p.name, hz[0] / 1000000, hz[1] / 1000000, hz[2] / 1000000);
 	}
 
-	constexpr int kStart = kSettingRows; // the launcher's last two rows
+	constexpr int kStart = kSettingRows; // the launcher's last three rows
 	constexpr int kBench = kStart + 1;
-	constexpr int kRows = kBench + 1;
+	constexpr int kHarvest = kBench + 1;
+	constexpr int kRows = kHarvest + 1;
 
 	bool exists(const std::string& path)
 	{
@@ -174,6 +176,7 @@ namespace
 		}
 		screen.items.push_back({"Start game", ""});
 		screen.items.push_back({"Benchmark", ""});
+		screen.items.push_back({"Shader harvest", ""});
 		if (selected == kBench)
 		{
 			screen.heading = "Benchmark";
@@ -182,6 +185,16 @@ namespace
 			// The settings on the left apply; the run quits by itself.
 			screen.note = "Three minutes of Practice; it quits at the end.\n" +
 						  (last.empty() ? std::string("No run yet.") : last);
+		}
+		else if (selected == kHarvest)
+		{
+			const bool ready = exists(g_dir + kHarvestState) && exists(g_dir + kHarvestCard);
+			screen.heading = "Shader harvest";
+			screen.value = ready ? "Run it" : "Files missing";
+			// The settings on the left apply: the shaders depend on them.
+			screen.note = std::string("Every character's jutsu and ultimate in Practice, about 90 minutes, so their effects "
+									  "never stop the game later; it quits at the end.") +
+						  (ready ? "" : std::string("\nNeeds ") + kHarvestState + " and " + kHarvestCard + ".");
 		}
 		else if (selected == kStart)
 		{
@@ -310,7 +323,7 @@ bool un5_launcher(const char* dir)
 	padConfigureInput(8, HidNpadStyleSet_NpadStandard);
 	padInitializeAny(&pad);
 	int selected = kStart;
-	bool start = false, bench = false, dirty = true;
+	bool start = false, bench = false, harvest = false, dirty = true;
 	while (appletMainLoop())
 	{
 		padUpdate(&pad);
@@ -326,6 +339,8 @@ bool un5_launcher(const char* dir)
 			start = true;
 		else if (selected == kBench)
 			start = bench = (down & HidNpadButton_A) && exists(g_dir + kBenchState);
+		else if (selected == kHarvest)
+			start = harvest = (down & HidNpadButton_A) && exists(g_dir + kHarvestState) && exists(g_dir + kHarvestCard);
 		else if (dx || (down & HidNpadButton_A))
 			un5_row_step(s, selected, dx ? dx : 1), dirty = true;
 		if (start)
@@ -355,6 +370,8 @@ bool un5_launcher(const char* dir)
 	// it on the Switch, depth clamp or not, and it gained no speed there.
 	setenv("UN5GS_NATIVE", "0", 0);
 	// The runner reads PS2_ARGS_FILE in place of args.txt.
+	if (harvest && write_harvest_args(g_dir + "harvest-args.txt"))
+		setenv("PS2_ARGS_FILE", (g_dir + "harvest-args.txt").c_str(), 1);
 	if (bench && write_bench_args(g_dir + "bench-args.txt"))
 	{
 		setenv("PS2_ARGS_FILE", (g_dir + "bench-args.txt").c_str(), 1);

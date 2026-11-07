@@ -18,7 +18,7 @@ namespace
 	std::string g_out;
 	int g_frame;
 	// Each step is one frame's buttons; a picture is saved after each.
-	const std::vector<u64> kScript = {0, HidNpadButton_AnyDown, HidNpadButton_AnyUp, HidNpadButton_AnyUp, HidNpadButton_AnyUp, HidNpadButton_AnyUp,
+	const std::vector<u64> kScript = {0, HidNpadButton_AnyDown, HidNpadButton_AnyDown, HidNpadButton_AnyUp, HidNpadButton_AnyUp, HidNpadButton_AnyUp, HidNpadButton_AnyUp,
 		HidNpadButton_AnyRight, HidNpadButton_AnyUp, HidNpadButton_AnyUp, HidNpadButton_AnyUp, HidNpadButton_AnyUp,
 		HidNpadButton_AnyUp, HidNpadButton_Plus};
 	size_t g_step;
