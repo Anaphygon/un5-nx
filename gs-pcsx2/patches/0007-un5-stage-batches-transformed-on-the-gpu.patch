@@ -1,54 +1,114 @@
---- a/pcsx2/GS/GSState.h
-+++ b/pcsx2/GS/GSState.h
-@@ -161,6 +161,32 @@
- 	GSIndexBuff* m_index;
- 
- 	GSVertexBuff m_draw_vertex = {};
+diff --git a/bin/resources/shaders/opengl/tfx_un5_vgs.glsl b/bin/resources/shaders/opengl/tfx_un5_vgs.glsl
+new file mode 100644
+index 0000000..c8066bb
+--- /dev/null
++++ b/bin/resources/shaders/opengl/tfx_un5_vgs.glsl
+@@ -0,0 +1,100 @@
++// SPDX-License-Identifier: GPL-3.0+
++// un5-nx: the vertex shader for UN5's stage batches (GSState::UN5NativeBatch),
++// in place of tfx_vgs.glsl's vs_main, whose programs it leaves untouched. Its
++// outputs and uniform block are tfx_vgs.glsl's.
 +
-+	// un5-nx: the pending draw is made of UN5NativeBatch batches. m_vertex
-+	// and m_index then hold a proxy, one triangle spanning the batches'
-+	// screen box, uv range and colours, for the CPU side of the renderer;
-+	// the GPU draws m_un5_vertex with m_un5_index, transformed in the vertex
-+	// shader with the batches' constants (8 vec4 each, see UN5NativeBatch).
-+	struct UN5Native
++//#version 420 // Keep it for text editor detection
++
++layout(std140, binding = 1) uniform cb20
++{
++	vec2  VertexScale;
++	vec2  VertexOffset;
++
++	vec2  TextureScale;
++	vec2  TextureOffset;
++
++	vec2  PointSize;
++
++	uint  MaxDepth;
++	float LineAA1Width;
++};
++
++// 8 vec4 per batch: the matrix columns, the guard band (low, high), fog
++// (min, max, base, per w) and (near, alpha scale, uv z, 0).
++layout(std430, binding = 6) readonly buffer cb_un5
++{
++	vec4 un5_consts[];
++};
++
++out SHADER
++{
++	vec4 t_float;
++	vec4 t_int;
++	#if VS_IIP != 0
++		vec4 c;
++	#else
++		flat vec4 c;
++	#endif
++	float inv_cov;
++	flat uint interior;
++} VSout;
++
++const float exp_min32 = exp2(-32.0f);
++
++// A vertex: x, y, z / 4096 in ST and Q, int16 u, v in XY, its RGBA, and its
++// batch in Z.
++layout(location = 0) in vec2  i_st;
++layout(location = 2) in uvec4 i_c;
++layout(location = 3) in float i_q;
++layout(location = 4) in uvec2 i_p;
++layout(location = 5) in uint  i_z;
++
++void vs_main()
++{
++	uint slot = i_z * 8u;
++	vec4 clip = un5_consts[slot] * i_st.x + un5_consts[slot + 1u] * i_st.y + un5_consts[slot + 2u] * i_q + un5_consts[slot + 3u];
++	vec4 fog = un5_consts[slot + 6u];
++	vec4 misc = un5_consts[slot + 7u];
++
++	// The GPU clips at the program's near plane, where it ran its clipper.
++	// The clipper only takes triangles that reach past the guard band
++	// (VF13..VF14 on x / w, y / w and w); one inside it is drawn whole, even
++	// behind the near plane, so a vertex inside the guard band never clips.
++	vec3 seen = vec3(clip.xy / clip.w, clip.w);
++	bool inside = clip.w > 0.0f && all(greaterThan(seen, un5_consts[slot + 4u].xyw)) && all(lessThan(seen, un5_consts[slot + 5u].xyw));
++	gl_ClipDistance[0] = inside ? max(clip.w - misc.x, 0.0f) : clip.w - misc.x;
++
++	// The GS position is 16 xyz / w, truncated as the program's FTOI4 does:
++	// the other passes over this geometry come from the program's own
++	// output, and pass their z tests only on the same depth. Z goes a little
++	// further (GS z grows towards the eye) to stay below theirs where float
++	// rounding differs from the VU's, and stays inside the depth range.
++	// Behind the eye the position stays homogeneous, for the clipping.
++	vec3 gs;
++	if (clip.w > 0.0f)
 +	{
-+		bool pending = false;
-+		std::vector<GSVertex> vertex;
-+		std::vector<u16> index;
-+		std::vector<GSVector4> consts;
-+		GSVector4 box_min, box_max;     // proxy x, y (12.4), z
-+		GSVector4 uv_min, uv_max;       // texture coordinates (ST with Q = 1)
-+		int colour_min[4], colour_max[4];
-+		float fog_min, fog_max;
-+		// The GS's vertex queue ends with the previous batch's last two
-+		// vertices: the strip goes on across batches.
-+		bool chain = false;
-+		GSVertex last[2];
-+		GSVector4 last_consts[8];
-+		GSVector4 last_box_min, last_box_max;
-+		u32 last_at = 0;                 // index of last[0] in vertex while it is still there
-+	} m_un5;
-+	void UN5WriteProxy();
-+	void UN5EndDraw();
- 
- 	struct
- 	{
-@@ -521,6 +547,12 @@
- 	void ReadFIFO(u8* mem, int size);
- 	void ReadLocalMemoryUnsync(u8* mem, int qwc, GIFRegBITBLTBUF BITBLTBUF, GIFRegTRXPOS TRXPOS, GIFRegTRXREG TRXREG);
- 	template<int index> void Transfer(const u8* mem, u32 size);
-+	// un5-nx: a batch of UN5's stage program, untransformed (see UN5NativeBatch).
-+	void UN5NativeBatch(const u8* packet);
-+	struct UN5Stats
++		gs = trunc(16.0f * clip.xyz / clip.w);
++		gs.z = clamp(gs.z - 8.0f - gs.z * exp2(-20.0f), 0.0f, 4294967040.0f);
++		gs *= clip.w;
++	}
++	else
 +	{
-+		u64 batches = 0, triangles = 0, draws = 0, rechained = 0, empty = 0;
-+	} m_un5_stats;
- 	int Freeze(freezeData* fd, bool sizeonly);
- 	int Defrost(const freezeData* fd);
- 
++		gs = 16.0f * clip.xyz;
++	}
++	gl_Position.xy = (gs.xy - 0.05f * clip.w) * VertexScale - VertexOffset * clip.w;
++	#if HAS_CLIP_CONTROL
++		gl_Position.z = gs.z * exp_min32;
++	#else
++		gl_Position.z = 2.0f * gs.z * exp_min32 - clip.w;
++	#endif
++	gl_Position.w = clip.w;
++
++	// ST / Q is uv / uv z; interpolated with w, so Q stays 1.
++	ivec2 uv = (ivec2(i_p) << 16) >> 16;
++	vec2 st = vec2(uv) / (4096.0f * misc.z) - TextureOffset;
++	VSout.t_float = vec4(st, floor(clamp(fog.z + clip.w * fog.w, fog.x, fog.y)) / 255.0f, 1.0f);
++	VSout.t_int = vec4(0.0f, 0.0f, st / TextureScale);
++	VSout.c = vec4(vec3(i_c.rgb), floor(float(i_c.a) * misc.y));
++	VSout.inv_cov = 0.0f;
++	VSout.interior = 1u;
++}
+diff --git a/pcsx2/GS/GSState.cpp b/pcsx2/GS/GSState.cpp
+index 052c58f..75c2c66 100644
 --- a/pcsx2/GS/GSState.cpp
 +++ b/pcsx2/GS/GSState.cpp
-@@ -372,6 +372,8 @@
+@@ -372,6 +372,8 @@ void GSState::ResetDrawBufferIdx()
  
  void GSState::ResetDrawBuffers()
  {
@@ -57,7 +117,7 @@
  	m_used_buffers_idx = 1;
  	m_max_vertex_count = 0;
  
-@@ -1563,6 +1565,8 @@
+@@ -1563,6 +1565,8 @@ void GSState::GIFRegHandlerNull(const GIFReg* RESTRICT r)
  
  __forceinline void GSState::ApplyPRIM(u32 prim)
  {
@@ -66,7 +126,7 @@
  	if (m_env.PRMODECONT.AC == 1)
  	{
  		m_env.PRIM.U32[0] = prim;
-@@ -2635,6 +2639,8 @@
+@@ -2635,6 +2639,8 @@ void GSState::FlushPrim()
  #endif
  		// Update scissor, it may have been modified by a previous draw
  		m_env.CTXT[PRIM->CTXT].UpdateScissor();
@@ -75,7 +135,7 @@
  		m_vt.Update(vtx_buff.buff, idx_buff.buff, vtx_buff.tail, idx_buff.tail, GSUtil::GetPrimClass(PRIM->PRIM));
  
  		// Texel coordinate rounding
-@@ -2705,6 +2711,9 @@
+@@ -2705,6 +2711,9 @@ void GSState::FlushPrim()
  		if (!skip_draw)
  			Draw();
  
@@ -85,7 +145,7 @@
  		g_perfmon.Put(GSPerfMon::Draw, 1);
  		g_perfmon.Put(GSPerfMon::Prim, idx_buff.tail / GSUtil::GetVertexCount(PRIM->PRIM));
  
-@@ -2749,6 +2758,263 @@
+@@ -2749,6 +2758,263 @@ void GSState::FlushPrim()
  		}
  	}
  }
@@ -349,27 +409,77 @@
  GSVector4i GSState::GetTEX0Rect(const GSDrawingContext& prev_ctx)
  {
  	GSVector4i ret = GSVector4i::zero();
-@@ -5898,8 +6164,17 @@
- 	if constexpr (prim == GS_INVALID)
- 	{
- 		vtx_buff.tail = vtx_buff.head;
-+		return;
-+	}
-+
+@@ -5901,6 +6167,15 @@ __forceinline void GSState::VertexKick(u32 skip)
+ 		return;
+ 	}
+ 
 +	// un5-nx: m_vertex holds the native batches' proxy; draw them first.
 +	if (m_un5.pending) [[unlikely]]
 +	{
 +		Flush(GSFlushReason::CONTEXTCHANGE);
 +		VertexKick<prim, auto_flush>(skip);
- 		return;
- 	}
++		return;
++	}
 +	m_un5.chain = false;
- 
++
  	if (GSConfig.UserHacks_DrawBuffering)
  		if (CheckOverlapVerts(n))
+ 			Flush(CONTEXTCHANGE);
+diff --git a/pcsx2/GS/GSState.h b/pcsx2/GS/GSState.h
+index 3e0b354..1d3f691 100644
+--- a/pcsx2/GS/GSState.h
++++ b/pcsx2/GS/GSState.h
+@@ -162,6 +162,32 @@ protected:
+ 
+ 	GSVertexBuff m_draw_vertex = {};
+ 
++	// un5-nx: the pending draw is made of UN5NativeBatch batches. m_vertex
++	// and m_index then hold a proxy, one triangle spanning the batches'
++	// screen box, uv range and colours, for the CPU side of the renderer;
++	// the GPU draws m_un5_vertex with m_un5_index, transformed in the vertex
++	// shader with the batches' constants (8 vec4 each, see UN5NativeBatch).
++	struct UN5Native
++	{
++		bool pending = false;
++		std::vector<GSVertex> vertex;
++		std::vector<u16> index;
++		std::vector<GSVector4> consts;
++		GSVector4 box_min, box_max;     // proxy x, y (12.4), z
++		GSVector4 uv_min, uv_max;       // texture coordinates (ST with Q = 1)
++		int colour_min[4], colour_max[4];
++		float fog_min, fog_max;
++		// The GS's vertex queue ends with the previous batch's last two
++		// vertices: the strip goes on across batches.
++		bool chain = false;
++		GSVertex last[2];
++		GSVector4 last_consts[8];
++		GSVector4 last_box_min, last_box_max;
++		u32 last_at = 0;                 // index of last[0] in vertex while it is still there
++	} m_un5;
++	void UN5WriteProxy();
++	void UN5EndDraw();
++
+ 	struct
+ 	{
+ 		u16* buff;
+@@ -521,6 +547,12 @@ public:
+ 	void ReadFIFO(u8* mem, int size);
+ 	void ReadLocalMemoryUnsync(u8* mem, int qwc, GIFRegBITBLTBUF BITBLTBUF, GIFRegTRXPOS TRXPOS, GIFRegTRXREG TRXREG);
+ 	template<int index> void Transfer(const u8* mem, u32 size);
++	// un5-nx: a batch of UN5's stage program, untransformed (see UN5NativeBatch).
++	void UN5NativeBatch(const u8* packet);
++	struct UN5Stats
++	{
++		u64 batches = 0, triangles = 0, draws = 0, rechained = 0, empty = 0;
++	} m_un5_stats;
+ 	int Freeze(freezeData* fd, bool sizeonly);
+ 	int Defrost(const freezeData* fd);
+ 
+diff --git a/pcsx2/GS/Renderers/Common/GSDevice.h b/pcsx2/GS/Renderers/Common/GSDevice.h
+index 421f8ea..a39e526 100644
 --- a/pcsx2/GS/Renderers/Common/GSDevice.h
 +++ b/pcsx2/GS/Renderers/Common/GSDevice.h
-@@ -704,7 +704,7 @@
+@@ -704,7 +704,7 @@ struct alignas(16) GSHWDrawConfig
  				u8 iip : 1;
  				u8 point_size : 1;		///< Set when points need to be expanded without VS expanding.
  				VSExpand expand : 3;
@@ -378,7 +488,7 @@
  			};
  			u8 key;
  		};
-@@ -1264,6 +1264,8 @@
+@@ -1264,6 +1264,8 @@ struct alignas(16) GSHWDrawConfig
  	const u16* indices;    ///< Indices to draw
  	u32 nverts;            ///< Number of vertices
  	u32 nindices;          ///< Number of indices
@@ -387,9 +497,11 @@
  	u32 indices_per_prim;  ///< Number of indices that make up one primitive
  	const std::vector<size_t>* drawlist;          ///< For reducing barriers on sprites
  	const std::vector<GSVector4i>* drawlist_bbox; ///< For RT copy when barriers not available.
+diff --git a/pcsx2/GS/Renderers/HW/GSRendererHW.cpp b/pcsx2/GS/Renderers/HW/GSRendererHW.cpp
+index ef25cfd..1227f84 100644
 --- a/pcsx2/GS/Renderers/HW/GSRendererHW.cpp
 +++ b/pcsx2/GS/Renderers/HW/GSRendererHW.cpp
-@@ -5768,6 +5768,23 @@
+@@ -5768,6 +5768,23 @@ void GSRendererHW::SetupIA(float target_scale, float sx, float sy, bool req_vert
  	}
  	m_conf.nverts = m_vertex->next;
  	m_conf.nindices = m_index->tail;
@@ -413,7 +525,7 @@
  }
  
  void GSRendererHW::EmulateZbuffer(const GSTextureCache::Target* ds)
-@@ -9889,6 +9906,10 @@
+@@ -9889,6 +9906,10 @@ GSRendererHW::CLUTDrawTestResult GSRendererHW::PossibleCLUTDrawAggressive()
  
  bool GSRendererHW::CanUseSwPrimRender(bool no_rt, bool no_ds, bool draw_sprite_tex)
  {
@@ -424,7 +536,7 @@
  	// Master enable.
  	const int bw = GSConfig.UserHacks_CPUSpriteRenderBW;
  	const int level = GSConfig.UserHacks_CPUSpriteRenderLevel;
-@@ -10952,6 +10973,10 @@
+@@ -10952,6 +10973,10 @@ int GSRendererHW::IsScalingDraw(GSTextureCache::Source* src, bool no_gaps)
  
  ClearType GSRendererHW::IsConstantDirectWriteMemClear()
  {
@@ -435,9 +547,102 @@
  	const bool direct_draw = (m_vt.m_primclass == GS_SPRITE_CLASS) || (m_vt.m_primclass == GS_TRIANGLE_CLASS && (m_index->tail % 6) == 0 && TrianglesAreQuads());
  	// Constant Direct Write without texture/test/blending (aka a GS mem clear)
  	if (direct_draw && !PRIM->TME // Direct write
+diff --git a/pcsx2/GS/Renderers/OpenGL/GSDeviceOGL.cpp b/pcsx2/GS/Renderers/OpenGL/GSDeviceOGL.cpp
+index 6294fa1..6400cdf 100644
+--- a/pcsx2/GS/Renderers/OpenGL/GSDeviceOGL.cpp
++++ b/pcsx2/GS/Renderers/OpenGL/GSDeviceOGL.cpp
+@@ -28,6 +28,7 @@ static constexpr u32 g_vs_ib_index        = 3;
+ static constexpr u32 g_vs_vb_index        = 2;
+ static constexpr u32 g_vs_cb_index        = 1;
+ static constexpr u32 g_ps_cb_index        = 0;
++static constexpr u32 g_vs_un5_sb_index    = 6; // un5-nx: VS_UN5's batch constants (a storage buffer)
+ 
+ static constexpr u32 VERTEX_BUFFER_SIZE = 32 * 1024 * 1024;
+ static constexpr u32 INDEX_BUFFER_SIZE = 16 * 1024 * 1024;
+@@ -417,7 +418,12 @@ bool GSDeviceOGL::Create(GSVSyncMode vsync_mode, bool allow_present_throttle)
+ 		m_vertex_uniform_stream_buffer = GLStreamBuffer::Create(GL_UNIFORM_BUFFER, VERTEX_UNIFORM_BUFFER_SIZE);
+ 		m_fragment_uniform_stream_buffer = GLStreamBuffer::Create(GL_UNIFORM_BUFFER, FRAGMENT_UNIFORM_BUFFER_SIZE);
+ 		m_vertex_push_constants_stream_buffer = GLStreamBuffer::Create(GL_UNIFORM_BUFFER, VERTEX_PUSH_CONSTANT_BUFFER_SIZE);
++		// un5-nx: its own buffer, so that its writes never land where another
++		// buffer's cached binding still points.
++		m_un5_stream_buffer = GLStreamBuffer::Create(GL_SHADER_STORAGE_BUFFER, 4 * 1024 * 1024);
+ 		glGetIntegerv(GL_UNIFORM_BUFFER_OFFSET_ALIGNMENT, &m_uniform_buffer_alignment);
++	if (GLAD_GL_VERSION_4_3 || GLAD_GL_ARB_shader_storage_buffer_object)
++		glGetIntegerv(GL_SHADER_STORAGE_BUFFER_OFFSET_ALIGNMENT, &m_un5_storage_alignment);
+ 		if (!m_vertex_stream_buffer || !m_index_stream_buffer || !m_expand_index_stream_buffer ||
+ 			!m_vertex_uniform_stream_buffer || !m_fragment_uniform_stream_buffer || !m_vertex_push_constants_stream_buffer)
+ 		{
+@@ -778,6 +784,10 @@ bool GSDeviceOGL::CreateTextureFX()
+ 	}
+ 
+ 	m_shader_tfx_vgs = std::move(*vertex_shader);
++	// un5-nx: UN5's stage batches (see tfx_un5_vgs.glsl); without it they are
++	// not sent here (gs_front.cpp asks UN5ShaderLoaded()).
++	if (std::optional<std::string> un5 = ReadShaderSource("shaders/opengl/tfx_un5_vgs.glsl"))
++		m_shader_un5_vgs = std::move(*un5);
+ 	m_shader_tfx_fs = std::move(*fragment_shader);
+ 
+ 	// warning 1 sampler by image unit. So you cannot reuse m_ps_ss...
+@@ -1164,6 +1174,7 @@ void GSDeviceOGL::DestroyResources()
+ 
+ 	m_fragment_uniform_stream_buffer.reset();
+ 	m_vertex_uniform_stream_buffer.reset();
++	m_un5_stream_buffer.reset();
+ 	m_vertex_push_constants_stream_buffer.reset();
+ 
+ 	glBindVertexArray(0);
+@@ -1862,7 +1873,7 @@ std::string GSDeviceOGL::GetVSSource(VSSelector sel)
+ 		+ fmt::format("#define VS_EXPAND {}\n", static_cast<int>(sel.expand));
+ 
+ 	std::string src = GenGlslHeader("vs_main", GL_VERTEX_SHADER, macro);
+-	src += m_shader_tfx_vgs;
++	src += sel.un5 ? m_shader_un5_vgs : m_shader_tfx_vgs;
+ 	return src;
+ }
+ 
+@@ -3226,8 +3237,22 @@ void GSDeviceOGL::RenderHW(GSHWDrawConfig& config)
+ 
+ 	if (m_vs_cb_cache.Update(config.cb_vs))
+ 		VSSetUniformBuffer(m_vs_cb_cache);
+-	if (m_ps_cb_cache.Update(config.cb_ps))
+-		PSSetUniformBuffer(m_ps_cb_cache);
++	if (config.vs.un5)
++	{
++		// Only what the draw's batches use: a stream buffer adds a fence each
++		// time a write crosses one of its blocks, and with glthread a fence
++		// waits for the whole queue.
++		const u32 size = config.un5_nconsts * 16;
++		const auto res = m_un5_stream_buffer->Map(m_un5_storage_alignment, size);
++		std::memcpy(res.pointer, config.un5_consts, size);
++		m_un5_stream_buffer->Unmap(size);
++		glBindBufferRange(GL_SHADER_STORAGE_BUFFER, g_vs_un5_sb_index, m_un5_stream_buffer->GetGLBufferId(), res.buffer_offset, size);
++		// The program's near plane (its clipper), as a clip distance, and
++		// depth clamped: a vertex cut at that plane takes its depth from one
++		// behind the eye, out of the depth range.
++		glEnable(GL_CLIP_DISTANCE0);
++		glEnable(GL_DEPTH_CLAMP);
++	}
+ 
+ 	ProgramSelector psel;
+ 	psel.vs = config.vs;
+@@ -3426,6 +3451,12 @@ void GSDeviceOGL::RenderHW(GSHWDrawConfig& config)
+ 			one_barrier, config.alpha_second_pass.require_full_barrier);
+ 	}
+ 
++	if (config.vs.un5)
++	{
++		glDisable(GL_CLIP_DISTANCE0);
++		glDisable(GL_DEPTH_CLAMP);
++	}
++
+ 	if (colclip_rt)
+ 	{
+ 		config.colclip_update_area = config.colclip_update_area.runion(config.drawarea);
+diff --git a/pcsx2/GS/Renderers/OpenGL/GSDeviceOGL.h b/pcsx2/GS/Renderers/OpenGL/GSDeviceOGL.h
+index 562b136..dee6b02 100644
 --- a/pcsx2/GS/Renderers/OpenGL/GSDeviceOGL.h
 +++ b/pcsx2/GS/Renderers/OpenGL/GSDeviceOGL.h
-@@ -270,6 +270,16 @@
+@@ -270,6 +270,16 @@ private:
  	GSHWDrawConfig::VSPushConstants m_vs_pc_cache;
  
  	std::string m_shader_tfx_vgs;
@@ -454,189 +659,3 @@
  	std::string m_shader_tfx_fs;
  
  	bool CheckFeatures();
---- a/pcsx2/GS/Renderers/OpenGL/GSDeviceOGL.cpp
-+++ b/pcsx2/GS/Renderers/OpenGL/GSDeviceOGL.cpp
-@@ -28,6 +28,7 @@
- static constexpr u32 g_vs_vb_index        = 2;
- static constexpr u32 g_vs_cb_index        = 1;
- static constexpr u32 g_ps_cb_index        = 0;
-+static constexpr u32 g_vs_un5_sb_index    = 6; // un5-nx: VS_UN5's batch constants (a storage buffer)
- 
- static constexpr u32 VERTEX_BUFFER_SIZE = 32 * 1024 * 1024;
- static constexpr u32 INDEX_BUFFER_SIZE = 16 * 1024 * 1024;
-@@ -417,7 +418,12 @@
- 		m_vertex_uniform_stream_buffer = GLStreamBuffer::Create(GL_UNIFORM_BUFFER, VERTEX_UNIFORM_BUFFER_SIZE);
- 		m_fragment_uniform_stream_buffer = GLStreamBuffer::Create(GL_UNIFORM_BUFFER, FRAGMENT_UNIFORM_BUFFER_SIZE);
- 		m_vertex_push_constants_stream_buffer = GLStreamBuffer::Create(GL_UNIFORM_BUFFER, VERTEX_PUSH_CONSTANT_BUFFER_SIZE);
-+		// un5-nx: its own buffer, so that its writes never land where another
-+		// buffer's cached binding still points.
-+		m_un5_stream_buffer = GLStreamBuffer::Create(GL_SHADER_STORAGE_BUFFER, 4 * 1024 * 1024);
- 		glGetIntegerv(GL_UNIFORM_BUFFER_OFFSET_ALIGNMENT, &m_uniform_buffer_alignment);
-+	if (GLAD_GL_VERSION_4_3 || GLAD_GL_ARB_shader_storage_buffer_object)
-+		glGetIntegerv(GL_SHADER_STORAGE_BUFFER_OFFSET_ALIGNMENT, &m_un5_storage_alignment);
- 		if (!m_vertex_stream_buffer || !m_index_stream_buffer || !m_expand_index_stream_buffer ||
- 			!m_vertex_uniform_stream_buffer || !m_fragment_uniform_stream_buffer || !m_vertex_push_constants_stream_buffer)
- 		{
-@@ -778,6 +784,10 @@
- 	}
- 
- 	m_shader_tfx_vgs = std::move(*vertex_shader);
-+	// un5-nx: UN5's stage batches (see tfx_un5_vgs.glsl); without it they are
-+	// not sent here (gs_front.cpp asks UN5ShaderLoaded()).
-+	if (std::optional<std::string> un5 = ReadShaderSource("shaders/opengl/tfx_un5_vgs.glsl"))
-+		m_shader_un5_vgs = std::move(*un5);
- 	m_shader_tfx_fs = std::move(*fragment_shader);
- 
- 	// warning 1 sampler by image unit. So you cannot reuse m_ps_ss...
-@@ -1164,6 +1174,7 @@
- 
- 	m_fragment_uniform_stream_buffer.reset();
- 	m_vertex_uniform_stream_buffer.reset();
-+	m_un5_stream_buffer.reset();
- 	m_vertex_push_constants_stream_buffer.reset();
- 
- 	glBindVertexArray(0);
-@@ -1862,7 +1873,7 @@
- 		+ fmt::format("#define VS_EXPAND {}\n", static_cast<int>(sel.expand));
- 
- 	std::string src = GenGlslHeader("vs_main", GL_VERTEX_SHADER, macro);
--	src += m_shader_tfx_vgs;
-+	src += sel.un5 ? m_shader_un5_vgs : m_shader_tfx_vgs;
- 	return src;
- }
- 
-@@ -3226,8 +3237,19 @@
- 
- 	if (m_vs_cb_cache.Update(config.cb_vs))
- 		VSSetUniformBuffer(m_vs_cb_cache);
--	if (m_ps_cb_cache.Update(config.cb_ps))
--		PSSetUniformBuffer(m_ps_cb_cache);
-+	if (config.vs.un5)
-+	{
-+		// Only what the draw's batches use: a stream buffer adds a fence each
-+		// time a write crosses one of its blocks, and with glthread a fence
-+		// waits for the whole queue.
-+		const u32 size = config.un5_nconsts * 16;
-+		const auto res = m_un5_stream_buffer->Map(m_un5_storage_alignment, size);
-+		std::memcpy(res.pointer, config.un5_consts, size);
-+		m_un5_stream_buffer->Unmap(size);
-+		glBindBufferRange(GL_SHADER_STORAGE_BUFFER, g_vs_un5_sb_index, m_un5_stream_buffer->GetGLBufferId(), res.buffer_offset, size);
-+		// The program's near plane (its clipper), as a clip distance.
-+		glEnable(GL_CLIP_DISTANCE0);
-+	}
- 
- 	ProgramSelector psel;
- 	psel.vs = config.vs;
-@@ -3426,6 +3448,9 @@
- 			one_barrier, config.alpha_second_pass.require_full_barrier);
- 	}
- 
-+	if (config.vs.un5)
-+		glDisable(GL_CLIP_DISTANCE0);
-+
- 	if (colclip_rt)
- 	{
- 		config.colclip_update_area = config.colclip_update_area.runion(config.drawarea);
---- /dev/null
-+++ b/bin/resources/shaders/opengl/tfx_un5_vgs.glsl
-@@ -0,0 +1,100 @@
-+// SPDX-License-Identifier: GPL-3.0+
-+// un5-nx: the vertex shader for UN5's stage batches (GSState::UN5NativeBatch),
-+// in place of tfx_vgs.glsl's vs_main, whose programs it leaves untouched. Its
-+// outputs and uniform block are tfx_vgs.glsl's.
-+
-+//#version 420 // Keep it for text editor detection
-+
-+layout(std140, binding = 1) uniform cb20
-+{
-+	vec2  VertexScale;
-+	vec2  VertexOffset;
-+
-+	vec2  TextureScale;
-+	vec2  TextureOffset;
-+
-+	vec2  PointSize;
-+
-+	uint  MaxDepth;
-+	float LineAA1Width;
-+};
-+
-+// 8 vec4 per batch: the matrix columns, the guard band (low, high), fog
-+// (min, max, base, per w) and (near, alpha scale, uv z, 0).
-+layout(std430, binding = 6) readonly buffer cb_un5
-+{
-+	vec4 un5_consts[];
-+};
-+
-+out SHADER
-+{
-+	vec4 t_float;
-+	vec4 t_int;
-+	#if VS_IIP != 0
-+		vec4 c;
-+	#else
-+		flat vec4 c;
-+	#endif
-+	float inv_cov;
-+	flat uint interior;
-+} VSout;
-+
-+const float exp_min32 = exp2(-32.0f);
-+
-+// A vertex: x, y, z / 4096 in ST and Q, int16 u, v in XY, its RGBA, and its
-+// batch in Z.
-+layout(location = 0) in vec2  i_st;
-+layout(location = 2) in uvec4 i_c;
-+layout(location = 3) in float i_q;
-+layout(location = 4) in uvec2 i_p;
-+layout(location = 5) in uint  i_z;
-+
-+void vs_main()
-+{
-+	uint slot = i_z * 8u;
-+	vec4 clip = un5_consts[slot] * i_st.x + un5_consts[slot + 1u] * i_st.y + un5_consts[slot + 2u] * i_q + un5_consts[slot + 3u];
-+	vec4 fog = un5_consts[slot + 6u];
-+	vec4 misc = un5_consts[slot + 7u];
-+
-+	// The GPU clips at the program's near plane, where it ran its clipper.
-+	// The clipper only takes triangles that reach past the guard band
-+	// (VF13..VF14 on x / w, y / w and w); one inside it is drawn whole, even
-+	// behind the near plane, so a vertex inside the guard band never clips.
-+	vec3 seen = vec3(clip.xy / clip.w, clip.w);
-+	bool inside = clip.w > 0.0f && all(greaterThan(seen, un5_consts[slot + 4u].xyw)) && all(lessThan(seen, un5_consts[slot + 5u].xyw));
-+	gl_ClipDistance[0] = inside ? max(clip.w - misc.x, 0.0f) : clip.w - misc.x;
-+
-+	// The GS position is 16 xyz / w, truncated as the program's FTOI4 does:
-+	// the other passes over this geometry come from the program's own
-+	// output, and pass their z tests only on the same depth. Z goes a little
-+	// further (GS z grows towards the eye) to stay below theirs where float
-+	// rounding differs from the VU's, and stays inside the depth range.
-+	// Behind the eye the position stays homogeneous, for the clipping.
-+	vec3 gs;
-+	if (clip.w > 0.0f)
-+	{
-+		gs = trunc(16.0f * clip.xyz / clip.w);
-+		gs.z = clamp(gs.z - 8.0f - gs.z * exp2(-20.0f), 0.0f, 4294967040.0f);
-+		gs *= clip.w;
-+	}
-+	else
-+	{
-+		gs = 16.0f * clip.xyz;
-+	}
-+	gl_Position.xy = (gs.xy - 0.05f * clip.w) * VertexScale - VertexOffset * clip.w;
-+	#if HAS_CLIP_CONTROL
-+		gl_Position.z = gs.z * exp_min32;
-+	#else
-+		gl_Position.z = 2.0f * gs.z * exp_min32 - clip.w;
-+	#endif
-+	gl_Position.w = clip.w;
-+
-+	// ST / Q is uv / uv z; interpolated with w, so Q stays 1.
-+	ivec2 uv = (ivec2(i_p) << 16) >> 16;
-+	vec2 st = vec2(uv) / (4096.0f * misc.z) - TextureOffset;
-+	VSout.t_float = vec4(st, floor(clamp(fog.z + clip.w * fog.w, fog.x, fog.y)) / 255.0f, 1.0f);
-+	VSout.t_int = vec4(0.0f, 0.0f, st / TextureScale);
-+	VSout.c = vec4(vec3(i_c.rgb), floor(float(i_c.a) * misc.y));
-+	VSout.inv_cov = 0.0f;
-+	VSout.interior = 1u;
-+}

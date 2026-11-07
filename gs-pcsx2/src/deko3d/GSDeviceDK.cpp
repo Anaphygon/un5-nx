@@ -964,12 +964,23 @@ void GSDeviceDK::FlushState()
 		rs.cullMode = DkFace_None;
 		rs.provokingVertex = DkProvokingVertex_Last;
 		dkCmdBufBindRasterizerState(cmd, &rs);
+		m_depth_clamp = false;
 		DkMultisampleState ms;
 		dkMultisampleStateDefaults(&ms);
 		dkCmdBufBindMultisampleState(cmd, &ms);
 		// glStencilFunc(func, 1, 1) and glStencilMask(0xFF).
 		dkCmdBufSetStencil(cmd, DkFace_FrontAndBack, 0xFF, 1, 1);
 		dkCmdBufSetPrimitiveRestart(cmd, false, 0);
+	}
+	if (m_depth_clamp != m_want_depth_clamp)
+	{
+		DkRasterizerState rs;
+		dkRasterizerStateDefaults(&rs);
+		rs.cullMode = DkFace_None;
+		rs.provokingVertex = DkProvokingVertex_Last;
+		rs.depthClampEnable = m_want_depth_clamp;
+		dkCmdBufBindRasterizerState(cmd, &rs);
+		m_depth_clamp = m_want_depth_clamp;
 	}
 
 	if (m_ctx.TakeDescriptorsDirty())
@@ -2032,6 +2043,11 @@ void GSDeviceDK::RenderHW(GSHWDrawConfig& config)
 		m_ps_cb = DkBufExtents{alloc.gpu, sizeof(m_ps_cb_cache)};
 		m_ubos_dirty = true;
 	}
+	// un5-nx: a stage batch triangle cut at the program's near plane gets its
+	// new vertex's depth from one inside the depth range and one behind the
+	// eye, where the shader cannot keep z in range; depth clipping then
+	// dropped the floor next to the camera on the Switch (not in Astris).
+	m_want_depth_clamp = config.vs.un5;
 	if (config.vs.un5)
 	{
 		// un5-nx: the batches' constants, 8 vec4 each, for VS_UN5. deko3d has

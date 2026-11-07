@@ -292,6 +292,8 @@ private:
 		 m_scissor_dirty = true, m_color_mask_dirty = true, m_blend_dirty = true, m_depth_dirty = true,
 		 m_layout_dirty = true, m_line_width_dirty = true, m_ubos_dirty = true;
 	dk::BatchId m_state_batch = 0;
+	// un5-nx: depth clamping, on for UN5's stage batches (see RenderHW).
+	bool m_depth_clamp = false, m_want_depth_clamp = false;
 
 	// Hazards: the barrier epoch, and copies since the last barrier.
 	u64 m_epoch = 1;

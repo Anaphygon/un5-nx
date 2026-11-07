@@ -1,0 +1,164 @@
+From d74a5852a8e90e952bf2abbb8f4806b7ee24a0be Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 7 Nov 2026 22:24:53 +0700
+Subject: [PATCH] feat: the stall line says how long threads waited on each
+ other
+
+The [stall] line now adds the time the emulation thread waited for room in
+the VU thread's queue, the time posting threads waited for room in the
+renderer's, and the time presents waited for the renderer to catch up, per
+5 s window. Together with the GS and VU busy figures this tells which
+thread holds a frame back.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ host/window.cpp                | 7 +++++--
+ runtime/include/ps2/system.hpp | 5 +++++
+ runtime/src/gs/gs.cpp          | 9 +++++++++
+ runtime/src/gs/gs.hpp          | 2 ++
+ runtime/src/gs/queue.cpp       | 8 +++++++-
+ runtime/src/gs/queue.hpp       | 3 +++
+ runtime/src/system.cpp         | 5 +++++
+ 7 files changed, 36 insertions(+), 3 deletions(-)
+
+diff --git a/host/window.cpp b/host/window.cpp
+index ed56890..1692ea3 100644
+--- a/host/window.cpp
++++ b/host/window.cpp
+@@ -426,8 +426,11 @@ void queue_audio(const std::int16_t *samples, std::size_t frames) {
+                      g_pace_slept_ms, g_pace_sleeps);
+         g_pace_slept_ms = g_pace_sleeps = 0;
+         const ps2::disc::ReadStats d = ps2::disc::take_read_stats();
+-        std::fprintf(stderr, "[stall] longest frame %.0f ms, %u frames over 40 ms; disc %u reads, %.1f MB in %.0f ms (longest %.0f ms)\n",
+-                     g_frame_longest_ms, g_frames_over_40, d.reads, static_cast<double>(d.bytes) / 1048576.0, d.ms, d.longest_ms);
++        const ps2::ThreadWaits t = ps2::take_thread_waits();
++        std::fprintf(stderr, "[stall] longest frame %.0f ms, %u frames over 40 ms; disc %u reads, %.1f MB in %.0f ms (longest %.0f ms); "
++                     "waits: VU queue full %.0f ms, renderer queue full %.0f ms, presents %.0f ms\n",
++                     g_frame_longest_ms, g_frames_over_40, d.reads, static_cast<double>(d.bytes) / 1048576.0, d.ms, d.longest_ms,
++                     t.vu_queue_ms, t.render_queue_ms, t.present_ms);
+         g_frame_longest_ms = 0;
+         g_frames_over_40 = 0;
+         a = AudioStats{};
+diff --git a/runtime/include/ps2/system.hpp b/runtime/include/ps2/system.hpp
+index 60778dd..ac2dd69 100644
+--- a/runtime/include/ps2/system.hpp
++++ b/runtime/include/ps2/system.hpp
+@@ -122,6 +122,11 @@ void stop_vu_thread();
+ double vu_thread_idle_ms();
+ std::uint64_t vu1_interpreted_calls();
+ void post_present();
++// Milliseconds since the last call that the emulation thread waited for room
++// in the VU thread's queue, posting threads for room in the renderer's, and
++// presents for the renderer to catch up.
++struct ThreadWaits { double vu_queue_ms, render_queue_ms, present_ms; };
++ThreadWaits take_thread_waits();
+ enum class Rendered { idle, presented, busy };
+ Rendered render_pending(bool surface, const std::function<void(const std::uint32_t *rgba, std::uint32_t width, std::uint32_t height)> &copy,
+                         const std::function<void()> &before_present, double budget_ms);
+diff --git a/runtime/src/gs/gs.cpp b/runtime/src/gs/gs.cpp
+index 41db117..6b03194 100644
+--- a/runtime/src/gs/gs.cpp
++++ b/runtime/src/gs/gs.cpp
+@@ -1022,14 +1022,23 @@ void flush_and_wait() {
+ 
+ void start_thread() { queue::render().start(32u << 20); }
+ 
++std::atomic<std::uint64_t> g_present_wait_us{0};
++
+ void post_present() {
+     gif::flush_merged();
+     const DisplayRegs regs = display_regs();
+     queue::post(queue::kPresent, g_odd_field ? 1u : 0u, 0, &regs, sizeof regs);
+     ++g_posted_presents;
++    if (g_posted_presents - g_presented.load() <= 2) return;
++    // Two frames ahead of the renderer: wait for it, and count the time.
++    const auto start = std::chrono::steady_clock::now();
+     for (std::uint32_t done = g_presented.load(); g_posted_presents - done > 2; done = g_presented.load()) queue::wait(g_presented, done);
++    g_present_wait_us += static_cast<std::uint64_t>(
++        std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count());
+ }
+ 
++std::uint64_t take_present_wait_us() { return g_present_wait_us.exchange(0); }
++
+ Rendered render_pending(const std::function<void(const DisplayRegs &)> &on_present, double budget_ms) {
+     queue::role() = queue::Role::Render;
+     queue::Header h;
+diff --git a/runtime/src/gs/gs.hpp b/runtime/src/gs/gs.hpp
+index 76e248d..e16f2ec 100644
+--- a/runtime/src/gs/gs.hpp
++++ b/runtime/src/gs/gs.hpp
+@@ -85,6 +85,8 @@ bool present(const DisplayRegs &regs);
+ void start_thread();
+ void flush_and_wait();
+ void post_present();
++// Microseconds post_present() waited for the renderer since the last call.
++std::uint64_t take_present_wait_us();
+ Rendered render_pending(const std::function<void(const DisplayRegs &)> &on_present, double budget_ms);
+ double gpu_busy_ms();
+ std::uint64_t primitives_drawn();
+diff --git a/runtime/src/gs/queue.cpp b/runtime/src/gs/queue.cpp
+index d78eb0d..47d4e44 100644
+--- a/runtime/src/gs/queue.cpp
++++ b/runtime/src/gs/queue.cpp
+@@ -1,6 +1,7 @@
+ #include "queue.hpp"
+ 
+ #include <algorithm>
++#include <chrono>
+ #include <climits>
+ #include <cmath>
+ #include <cstring>
+@@ -115,7 +116,12 @@ void Ring::post(Type type, std::uint32_t arg0, std::uint32_t arg1, const void *d
+             break;
+         }
+         producer_waiting_.store(1);
+-        if (head + pad + need - tail_.load() > capacity_) wait(freed_, seen);
++        if (head + pad + need - tail_.load() > capacity_) {
++            const auto start = std::chrono::steady_clock::now();
++            wait(freed_, seen);
++            blocked_us_ += static_cast<std::uint64_t>(
++                std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count());
++        }
+     }
+     std::uint8_t *at = buffer_.get() + head % capacity_;
+     const Header h{type, bytes, arg0, arg1};
+diff --git a/runtime/src/gs/queue.hpp b/runtime/src/gs/queue.hpp
+index dbc1a1a..3f420c3 100644
+--- a/runtime/src/gs/queue.hpp
++++ b/runtime/src/gs/queue.hpp
+@@ -24,6 +24,8 @@ public:
+     void pop(const Header &header);
+     void wait_for_work(int timeout_ms);
+     void wake();
++    // Microseconds producers spent waiting for room since the last call.
++    std::uint64_t take_blocked_us() { return blocked_us_.exchange(0); }
+ 
+ private:
+     std::unique_ptr<std::uint8_t[]> buffer_;
+@@ -33,6 +35,7 @@ private:
+     alignas(64) std::atomic<std::uint32_t> posted_{0};
+     alignas(64) std::atomic<std::uint32_t> freed_{0};
+     std::atomic<std::uint32_t> consumer_waiting_{0}, producer_waiting_{0};
++    std::atomic<std::uint64_t> blocked_us_{0};
+ };
+ 
+ Ring &render();
+diff --git a/runtime/src/system.cpp b/runtime/src/system.cpp
+index d221051..b294c61 100644
+--- a/runtime/src/system.cpp
++++ b/runtime/src/system.cpp
+@@ -571,6 +571,11 @@ void run_vu_thread() {
+ }
+ void post_present() { gs::post_present(); }
+ 
++ThreadWaits take_thread_waits() {
++    return {gs::queue::vu().take_blocked_us() / 1000.0, gs::queue::render().take_blocked_us() / 1000.0,
++            gs::take_present_wait_us() / 1000.0};
++}
++
+ Rendered render_pending(bool surface, const std::function<void(const std::uint32_t *, std::uint32_t, std::uint32_t)> &copy,
+                         const std::function<void()> &before_present, double budget_ms) {
+     static std::vector<std::uint32_t> frame;
+-- 
+2.54.0 (Apple Git-157)
+
