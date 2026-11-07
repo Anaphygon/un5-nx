@@ -1,0 +1,816 @@
+From 9a11487b6cc0ca20010b81e286da18a0fcd42bde Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 8 Nov 2026 00:39:49 +0700
+Subject: [PATCH] perf: IOP code a run recorded runs as translated blocks
+
+The IOP interpreter took about 13% of the EE thread in a UN5 battle on the
+Switch, nearly all of it in the sound modules (CRI ADX decoding about half,
+Sony's modhsyn about a third), some 100k instructions a frame.
+
+PS2_IOP_RECORD=<dir> writes, at the end of a run, the IOP's RAM, the words
+it executed and the ones it entered other than by stepping on. The new
+tool ioprecomp turns one or more such records into C++ blocks: from each
+entry, the branch targets and the continuations of branches, straight on
+over executed instructions to a branch and its delay slot (or up to 64
+instructions), leaving system calls, COP0 and the runtime's HLE stubs to
+the interpreter. Each block does what the interpreter does, one cycle per
+instruction; an access outside RAM sets pc as the interpreter has it and
+checks for a requested thread switch, as the interpreter does after every
+instruction (nothing else can ask for one), and ends the block there.
+
+The interpreter takes a block at its first instruction, outside a delay
+slot, with budget for all of it, and once RAM has been found to hold the
+words it was made from in the current code generation (a new one at each
+module load, state load and IOP vblank). PS2_IOP_INTERPRET=1 turns them off.
+The CPU struct and the block API moved to ps2/iop_cpu.hpp for the
+generated code.
+
+UN5 on the Mac, records of the four regression runs: 6470 blocks, 57615
+instructions; 95% of IOP instructions run in blocks and the IOP's share of
+CPU samples falls from 11.4% to 1.8%. Frames are identical and a state
+saved at the end of the battle replay matches the interpreter's (apart
+from the bytes that differ between two interpreter runs as well).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ CMakeLists.txt                  |   2 +
+ host/main.cpp                   |   2 +
+ host/web.cpp                    |   2 +
+ recomp/ioprecomp.cpp            | 411 ++++++++++++++++++++++++++++++++
+ runtime/include/ps2/iop_cpu.hpp |  55 +++++
+ runtime/src/iop/cpu.cpp         |  91 ++++++-
+ runtime/src/iop/iop.hpp         |  28 +--
+ runtime/src/iop/kernel.cpp      |   2 +
+ runtime/src/iop/libs.cpp        |   2 +
+ runtime/src/system.cpp          |   5 +-
+ 10 files changed, 577 insertions(+), 23 deletions(-)
+ create mode 100644 recomp/ioprecomp.cpp
+ create mode 100644 runtime/include/ps2/iop_cpu.hpp
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 6a0f530..28262f6 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -23,6 +23,8 @@ if(NOT EMSCRIPTEN)
+ 
+     add_executable(vujit_dump recomp/vujit_dump.cpp runtime/src/vu_jit.cpp)
+     target_include_directories(vujit_dump PRIVATE runtime/include runtime/src)
++    add_executable(ioprecomp recomp/ioprecomp.cpp)
++    target_compile_options(ioprecomp PRIVATE -Wall -Wextra)
+     add_executable(vurecomp recomp/vurecomp.cpp)
+     target_include_directories(vurecomp PRIVATE runtime/include)
+     target_compile_options(vurecomp PRIVATE -Wall -Wextra)
+diff --git a/host/main.cpp b/host/main.cpp
+index 45577a0..1eaa911 100644
+--- a/host/main.cpp
++++ b/host/main.cpp
+@@ -20,6 +20,7 @@
+ 
+ void register_generated_code();
+ void register_generated_vu();
++void register_generated_iop();
+ 
+ namespace {
+ 
+@@ -145,6 +146,7 @@ int main(int argc, char **argv) {
+ #endif
+     register_generated_code();
+     register_generated_vu();
++    register_generated_iop();
+     const auto emulate = [&]() -> int {
+         std::uint32_t entry = 0;
+         if (!ps2::load_elf(argv[1], entry)) {
+diff --git a/host/web.cpp b/host/web.cpp
+index 2417224..c065d5a 100644
+--- a/host/web.cpp
++++ b/host/web.cpp
+@@ -19,6 +19,7 @@
+ 
+ void register_generated_code();
+ void register_generated_vu();
++void register_generated_iop();
+ 
+ EM_JS_DEPS(ps2web, "$stringToNewUTF8,$UTF8ToString");
+ 
+@@ -414,6 +415,7 @@ int main(int argc, char **argv) {
+     ps2::set_audio_sink(push_audio);
+     register_generated_code();
+     register_generated_vu();
++    register_generated_iop();
+ 
+     ps2::init_graphics();
+     const bool no_surface = EM_ASM_INT({ return Module.noSurface ? 1 : 0; });
+diff --git a/recomp/ioprecomp.cpp b/recomp/ioprecomp.cpp
+new file mode 100644
+index 0000000..3607c88
+--- /dev/null
++++ b/recomp/ioprecomp.cpp
+@@ -0,0 +1,411 @@
++// ioprecomp: translates the IOP code a run recorded (PS2_IOP_RECORD=<dir>)
++// into C++ blocks the IOP interpreter runs in place of the instructions
++// (runtime/src/iop/cpu.cpp, ps2/iop_cpu.hpp).
++//
++// A block starts where the run entered code other than by stepping on from
++// the previous instruction, at a branch target or after a branch's delay
++// slot, and goes on over instructions the run executed until a branch or
++// jump and its delay slot, an instruction left to the interpreter (system
++// calls, COP0, the runtime's HLE stubs) or kMaxBlock instructions. Each
++// instruction does what the interpreter's does, one cycle each, so a run
++// with the blocks is the run without them: an access outside RAM checks for
++// a requested thread switch after it, as the interpreter does after every
++// instruction (nothing else can ask for one), and stops the block there.
++//
++//   ioprecomp <record dir>... <out dir>
++//
++// Words that differ between records (code loaded at the same place) are
++// left to the interpreter.
++#include <algorithm>
++#include <cstdint>
++#include <cstdio>
++#include <cstring>
++#include <filesystem>
++#include <format>
++#include <fstream>
++#include <set>
++#include <string>
++#include <vector>
++
++namespace fs = std::filesystem;
++
++namespace {
++
++constexpr std::uint32_t kRamSize = 2u << 20;
++constexpr std::uint32_t kWords = kRamSize / 4;
++constexpr std::uint32_t kMaxBlock = 64;
++
++struct Image {
++    std::vector<std::uint32_t> words;
++    std::vector<bool> ran, entered;
++    std::vector<bool> conflict;
++};
++
++std::vector<std::uint8_t> read_file(const fs::path &path, std::size_t size) {
++    std::vector<std::uint8_t> data(size);
++    std::ifstream in(path, std::ios::binary);
++    if (!in.read(reinterpret_cast<char *>(data.data()), static_cast<std::streamsize>(size))) {
++        std::fprintf(stderr, "cannot read %s\n", path.c_str());
++        std::exit(1);
++    }
++    return data;
++}
++
++void merge(Image &img, const fs::path &dir) {
++    const auto ram = read_file(dir / "ram.bin", kRamSize);
++    const auto ran = read_file(dir / "ran.bin", kWords / 8);
++    const auto entered = read_file(dir / "entered.bin", kWords / 8);
++    for (std::uint32_t w = 0; w < kWords; ++w) {
++        if (!((ran[w >> 3] >> (w & 7u)) & 1u)) continue;
++        std::uint32_t v;
++        std::memcpy(&v, ram.data() + w * 4u, 4);
++        if (img.ran[w] && img.words[w] != v) img.conflict[w] = true;
++        img.words[w] = v;
++        img.ran[w] = true;
++        if ((entered[w >> 3] >> (w & 7u)) & 1u) img.entered[w] = true;
++    }
++}
++
++std::int32_t simm(std::uint32_t w) { return static_cast<std::int16_t>(w & 0xFFFFu); }
++
++enum class Kind { Plain, Branch, Jump, Stop };
++
++// How the interpreter treats an instruction: a branch or jump (with a delay
++// slot after it), one the blocks leave to it, or anything else.
++Kind kind_of(std::uint32_t w) {
++    const std::uint32_t op = w >> 26, rt = (w >> 16) & 31u;
++    switch (op) {
++    case 0x00:
++        switch (w & 63u) {
++        case 0x00: case 0x02: case 0x03: case 0x04: case 0x06: case 0x07:
++        case 0x0F: case 0x10: case 0x11: case 0x12: case 0x13:
++        case 0x18: case 0x19: case 0x1A: case 0x1B:
++        case 0x20: case 0x21: case 0x22: case 0x23: case 0x24: case 0x25: case 0x26: case 0x27: case 0x2A: case 0x2B:
++            return Kind::Plain;
++        case 0x08: case 0x09: return Kind::Jump;
++        default: return Kind::Stop;
++        }
++    case 0x01: return (rt & 0x0Eu) == 0 ? Kind::Branch : Kind::Stop;
++    case 0x02: case 0x03: return Kind::Jump;
++    case 0x04: case 0x05: case 0x06: case 0x07: return Kind::Branch;
++    case 0x08: case 0x09: case 0x0A: case 0x0B: case 0x0C: case 0x0D: case 0x0E: case 0x0F:
++    case 0x20: case 0x21: case 0x22: case 0x23: case 0x24: case 0x25: case 0x26:
++    case 0x28: case 0x29: case 0x2A: case 0x2B: case 0x2E: case 0x2F:
++        return Kind::Plain;
++    default: return Kind::Stop;
++    }
++}
++
++// Where a branch at pc goes when taken; a jump's target when it has one in
++// the instruction.
++std::int64_t static_target(std::uint32_t w, std::uint32_t pc) {
++    const std::uint32_t op = w >> 26;
++    if (op == 0x02 || op == 0x03) return (pc & 0xF0000000u) | ((w & 0x03FFFFFFu) << 2);
++    if (kind_of(w) == Kind::Branch) return pc + 4u + (static_cast<std::uint32_t>(simm(w)) << 2);
++    return -1;
++}
++
++std::string reg(std::uint32_t i) { return i ? std::format("r[{}]", i) : "0u"; }
++
++// The code of a plain instruction. `next` is what pc holds while it runs
++// (the interpreter has moved on), `ran` how many instructions the block has
++// run with this one.
++std::string plain(std::uint32_t w, const std::string &next, std::uint32_t ran) {
++    const std::uint32_t op = w >> 26, rs = (w >> 16 >> 5) & 31u, rt = (w >> 16) & 31u, rd = (w >> 11) & 31u, sa = (w >> 6) & 31u;
++    const std::string s = reg(rs), t = reg(rt);
++    const std::string imm = std::format("{}u", static_cast<std::uint32_t>(simm(w)));
++    const std::string uimm = std::format("{}u", w & 0xFFFFu);
++    const std::string addr = std::format("{} + {}", s, imm);
++    auto set = [](std::uint32_t d, const std::string &v) { return d ? std::format("r[{}] = {};", d, v) : std::string(); };
++    // An access that left RAM may have asked for a thread switch.
++    const std::string check = std::format(" if (sw) {{ c.pc = {0}; c.npc = {0} + 4u; return {1}u; }}", next, ran);
++    auto load = [&](const char *fn, const std::string &cast) {
++        const std::string v = std::format("{}(c, {}, sw, {})", fn, addr, next);
++        return (rt ? std::format("r[{}] = {};", rt, cast.empty() ? v : std::format("{}({})", cast, v)) : std::format("(void){};", v)) + check;
++    };
++    switch (op) {
++    case 0x00:
++        switch (w & 63u) {
++        case 0x00: return set(rd, std::format("{} << {}u", t, sa));
++        case 0x02: return set(rd, std::format("{} >> {}u", t, sa));
++        case 0x03: return set(rd, std::format("static_cast<std::uint32_t>(static_cast<std::int32_t>({}) >> {})", t, sa));
++        case 0x04: return set(rd, std::format("{} << ({} & 31u)", t, s));
++        case 0x06: return set(rd, std::format("{} >> ({} & 31u)", t, s));
++        case 0x07: return set(rd, std::format("static_cast<std::uint32_t>(static_cast<std::int32_t>({}) >> ({} & 31u))", t, s));
++        case 0x0F: return "";
++        case 0x10: return set(rd, "c.hi");
++        case 0x11: return std::format("c.hi = {};", s);
++        case 0x12: return set(rd, "c.lo");
++        case 0x13: return std::format("c.lo = {};", s);
++        case 0x18: return std::format("mult(c, {}, {});", s, t);
++        case 0x19: return std::format("multu(c, {}, {});", s, t);
++        case 0x1A: return std::format("div(c, {}, {});", s, t);
++        case 0x1B: return std::format("divu(c, {}, {});", s, t);
++        case 0x20: case 0x21: return set(rd, std::format("{} + {}", s, t));
++        case 0x22: case 0x23: return set(rd, std::format("{} - {}", s, t));
++        case 0x24: return set(rd, std::format("{} & {}", s, t));
++        case 0x25: return set(rd, std::format("{} | {}", s, t));
++        case 0x26: return set(rd, std::format("{} ^ {}", s, t));
++        case 0x27: return set(rd, std::format("~({} | {})", s, t));
++        case 0x2A: return set(rd, std::format("static_cast<std::uint32_t>(static_cast<std::int32_t>({}) < static_cast<std::int32_t>({}))", s, t));
++        case 0x2B: return set(rd, std::format("static_cast<std::uint32_t>({} < {})", s, t));
++        }
++        break;
++    case 0x08: case 0x09: return set(rt, std::format("{} + {}", s, imm));
++    case 0x0A: return set(rt, std::format("static_cast<std::uint32_t>(static_cast<std::int32_t>({}) < {})", s, simm(w)));
++    case 0x0B: return set(rt, std::format("static_cast<std::uint32_t>({} < {})", s, imm));
++    case 0x0C: return set(rt, std::format("{} & {}", s, uimm));
++    case 0x0D: return set(rt, std::format("{} | {}", s, uimm));
++    case 0x0E: return set(rt, std::format("{} ^ {}", s, uimm));
++    case 0x0F: return set(rt, std::format("{}u", w << 16));
++    case 0x20: return load("ld8", "sx8");
++    case 0x21: return load("ld16", "sx16");
++    case 0x23: return load("ld32", "");
++    case 0x24: return load("ld8", "");
++    case 0x25: return load("ld16", "");
++    case 0x22: case 0x26: {
++        const std::string v = std::format("{}({}, {}(c, a & ~3u, sw, {}), a)", op == 0x22 ? "lwl" : "lwr", t, "ld32", next);
++        return std::format("{{ const std::uint32_t a = {}; {} }}", addr, rt ? std::format("r[{}] = {};", rt, v) : std::format("(void){};", v)) + check;
++    }
++    case 0x28: return std::format("st8(c, {}, static_cast<std::uint8_t>({}), sw, {});", addr, t, next) + check;
++    case 0x29: return std::format("st16(c, {}, static_cast<std::uint16_t>({}), sw, {});", addr, t, next) + check;
++    case 0x2B: return std::format("st32(c, {}, {}, sw, {});", addr, t, next) + check;
++    case 0x2A: case 0x2E:
++        return std::format("{{ const std::uint32_t a = {}; const std::uint32_t m = ld32(c, a & ~3u, sw, {}); st32(c, a & ~3u, {}(m, {}, a), sw, {}); }}", addr, next,
++                           op == 0x2A ? "swl" : "swr", t, next) + check;
++    case 0x2F: return "";
++    }
++    std::fprintf(stderr, "unexpected instruction %08X\n", w);
++    std::exit(1);
++}
++
++// The branch's condition and target, into `taken` and `target`, and its link.
++std::string branch(std::uint32_t w, std::uint32_t pc) {
++    const std::uint32_t op = w >> 26, rs = (w >> 21) & 31u, rt = (w >> 16) & 31u, rd = (w >> 11) & 31u;
++    const std::string s = reg(rs), t = reg(rt);
++    const std::string to = std::format("{}u", static_cast<std::uint32_t>(static_cast<std::uint32_t>(pc) + 4u + (static_cast<std::uint32_t>(simm(w)) << 2)));
++    auto cond = [&](const std::string &c) { return std::format("const bool taken = {}; const std::uint32_t target = {};", c, to); };
++    switch (op) {
++    case 0x00: {
++        const std::string link = (w & 63u) == 0x09 && rd ? std::format(" r[{}] = {}u;", rd, pc + 8u) : "";
++        return std::format("const bool taken = true; const std::uint32_t target = {};{}", s, link);
++    }
++    case 0x01: {
++        const bool link = (rt & 0x1Eu) == 0x10u;
++        const std::string c = (rt & 1u) ? std::format("static_cast<std::int32_t>({}) >= 0", s) : std::format("static_cast<std::int32_t>({}) < 0", s);
++        return cond(c) + (link ? std::format(" r[31] = {}u;", pc + 8u) : "");
++    }
++    case 0x02: return std::format("const bool taken = true; const std::uint32_t target = {}u;", static_target(w, pc));
++    case 0x03: return std::format("const bool taken = true; const std::uint32_t target = {}u; r[31] = {}u;", static_target(w, pc), pc + 8u);
++    case 0x04: return cond(std::format("{} == {}", s, t));
++    case 0x05: return cond(std::format("{} != {}", s, t));
++    case 0x06: return cond(std::format("static_cast<std::int32_t>({}) <= 0", s));
++    case 0x07: return cond(std::format("static_cast<std::int32_t>({}) > 0", s));
++    }
++    std::fprintf(stderr, "unexpected branch %08X\n", w);
++    std::exit(1);
++}
++
++const char *const kPrelude = R"(#include "ps2/iop_cpu.hpp"
++
++namespace {
++
++using ps2::iop::Cpu;
++
++// Loads and stores as the interpreter's read/write functions do them; outside
++// RAM they set pc and npc as the interpreter has them (the access may look)
++// and say whether a thread switch is asked for.
++inline std::uint8_t *ram(std::uint32_t p) { return ps2::iop::g_ram + (p & (ps2::iop::kRamSize - 1)); }
++inline void at(Cpu &c, std::uint32_t next) { c.pc = next; c.npc = next + 4u; }
++inline std::uint32_t ld8(Cpu &c, std::uint32_t a, bool &sw, std::uint32_t next) {
++    const std::uint32_t p = ps2::iop::phys(a);
++    if (p < 0x00800000u) return *ram(p);
++    at(c, next);
++    const std::uint32_t v = ps2::iop::read8(a);
++    sw = ps2::iop::kernel::switch_pending();
++    return v;
++}
++inline std::uint32_t ld16(Cpu &c, std::uint32_t a, bool &sw, std::uint32_t next) {
++    const std::uint32_t p = ps2::iop::phys(a);
++    if (p < 0x00800000u) { std::uint16_t v; std::memcpy(&v, ram(p), 2); return v; }
++    at(c, next);
++    const std::uint32_t v = ps2::iop::read16(a);
++    sw = ps2::iop::kernel::switch_pending();
++    return v;
++}
++inline std::uint32_t ld32(Cpu &c, std::uint32_t a, bool &sw, std::uint32_t next) {
++    const std::uint32_t p = ps2::iop::phys(a);
++    if (p < 0x00800000u) { std::uint32_t v; std::memcpy(&v, ram(p), 4); return v; }
++    at(c, next);
++    const std::uint32_t v = ps2::iop::read32(a);
++    sw = ps2::iop::kernel::switch_pending();
++    return v;
++}
++inline void st8(Cpu &c, std::uint32_t a, std::uint8_t v, bool &sw, std::uint32_t next) {
++    const std::uint32_t p = ps2::iop::phys(a);
++    if (p < 0x00800000u) { *ram(p) = v; return; }
++    at(c, next);
++    ps2::iop::write8(a, v);
++    sw = ps2::iop::kernel::switch_pending();
++}
++inline void st16(Cpu &c, std::uint32_t a, std::uint16_t v, bool &sw, std::uint32_t next) {
++    const std::uint32_t p = ps2::iop::phys(a);
++    if (p < 0x00800000u) { std::memcpy(ram(p), &v, 2); return; }
++    at(c, next);
++    ps2::iop::write16(a, v);
++    sw = ps2::iop::kernel::switch_pending();
++}
++inline void st32(Cpu &c, std::uint32_t a, std::uint32_t v, bool &sw, std::uint32_t next) {
++    const std::uint32_t p = ps2::iop::phys(a);
++    if (p < 0x00800000u) { std::memcpy(ram(p), &v, 4); return; }
++    at(c, next);
++    ps2::iop::write32(a, v);
++    sw = ps2::iop::kernel::switch_pending();
++}
++inline std::uint32_t sx8(std::uint32_t v) { return static_cast<std::uint32_t>(static_cast<std::int8_t>(v)); }
++inline std::uint32_t sx16(std::uint32_t v) { return static_cast<std::uint32_t>(static_cast<std::int16_t>(v)); }
++inline std::uint32_t lwl(std::uint32_t old, std::uint32_t mem, std::uint32_t a) {
++    const std::uint32_t shift = (3u - (a & 3u)) * 8u;
++    return (mem << shift) | (shift ? (old & ((1u << shift) - 1u)) : 0u);
++}
++inline std::uint32_t lwr(std::uint32_t old, std::uint32_t mem, std::uint32_t a) {
++    const std::uint32_t shift = (a & 3u) * 8u;
++    return (mem >> shift) | (shift ? (old & ~(0xFFFFFFFFu >> shift)) : 0u);
++}
++inline std::uint32_t swl(std::uint32_t mem, std::uint32_t v, std::uint32_t a) {
++    const std::uint32_t shift = (3u - (a & 3u)) * 8u;
++    return (v >> shift) | (shift ? (mem & ~(0xFFFFFFFFu >> shift)) : 0u);
++}
++inline std::uint32_t swr(std::uint32_t mem, std::uint32_t v, std::uint32_t a) {
++    const std::uint32_t shift = (a & 3u) * 8u;
++    return (v << shift) | (shift ? (mem & ((1u << shift) - 1u)) : 0u);
++}
++inline void mult(Cpu &c, std::uint32_t s, std::uint32_t t) {
++    const std::int64_t p = static_cast<std::int64_t>(static_cast<std::int32_t>(s)) * static_cast<std::int32_t>(t);
++    c.lo = static_cast<std::uint32_t>(p);
++    c.hi = static_cast<std::uint32_t>(static_cast<std::uint64_t>(p) >> 32);
++}
++inline void multu(Cpu &c, std::uint32_t s, std::uint32_t t) {
++    const std::uint64_t p = static_cast<std::uint64_t>(s) * t;
++    c.lo = static_cast<std::uint32_t>(p);
++    c.hi = static_cast<std::uint32_t>(p >> 32);
++}
++inline void div(Cpu &c, std::uint32_t s, std::uint32_t t) {
++    const auto n = static_cast<std::int32_t>(s), d = static_cast<std::int32_t>(t);
++    if (d == 0) { c.lo = n < 0 ? 1u : 0xFFFFFFFFu; c.hi = static_cast<std::uint32_t>(n); }
++    else if (n == INT32_MIN && d == -1) { c.lo = static_cast<std::uint32_t>(INT32_MIN); c.hi = 0; }
++    else { c.lo = static_cast<std::uint32_t>(n / d); c.hi = static_cast<std::uint32_t>(n % d); }
++}
++inline void divu(Cpu &c, std::uint32_t s, std::uint32_t t) {
++    if (t == 0) { c.lo = 0xFFFFFFFFu; c.hi = s; }
++    else { c.lo = s / t; c.hi = s % t; }
++}
++
++}
++
++namespace gen {
++
++)";
++
++struct Out {
++    std::uint32_t pc, count;
++    std::string name;
++};
++
++}  // namespace
++
++int main(int argc, char **argv) {
++    if (argc < 3) {
++        std::fprintf(stderr, "usage: ioprecomp <record dir>... <out dir>\n");
++        return 1;
++    }
++    Image img{std::vector<std::uint32_t>(kWords), std::vector<bool>(kWords), std::vector<bool>(kWords), std::vector<bool>(kWords)};
++    for (int i = 1; i < argc - 1; ++i) merge(img, argv[i]);
++    const fs::path out_dir = argv[argc - 1];
++    auto usable = [&](std::uint32_t w) { return w < kWords && img.ran[w] && !img.conflict[w]; };
++
++    // Where blocks start: entries the runs saw, and the targets and
++    // continuations of the branches they ran.
++    std::set<std::uint32_t> starts;
++    for (std::uint32_t w = 0; w < kWords; ++w) {
++        if (!usable(w)) continue;
++        if (img.entered[w]) starts.insert(w);
++        const Kind k = kind_of(img.words[w]);
++        if (k == Kind::Branch || k == Kind::Jump) {
++            const std::int64_t t = static_target(img.words[w], w * 4u);
++            if (t >= 0 && usable(static_cast<std::uint32_t>((t & (kRamSize - 1)) >> 2))) starts.insert(static_cast<std::uint32_t>((t & (kRamSize - 1)) >> 2));
++            if (usable(w + 2)) starts.insert(w + 2);
++        }
++    }
++
++    std::vector<Out> blocks;
++    std::vector<std::string> files;
++    std::string text = kPrelude;
++    std::size_t in_file = 0, instructions = 0;
++    for (std::uint32_t first : starts) {
++        if (kind_of(img.words[first]) == Kind::Stop) continue;
++        std::vector<std::string> lines;
++        std::uint32_t w = first, n = 0;
++        std::string tail;
++        bool ended = false;
++        while (n < kMaxBlock && usable(w)) {
++            const std::uint32_t word = img.words[w], pc = w * 4u;
++            const Kind k = kind_of(word);
++            if (k == Kind::Stop) break;
++            if (k == Kind::Plain) {
++                ++n;
++                lines.push_back(plain(word, std::format("{}u", pc + 4u), n));
++                ++w;
++                continue;
++            }
++            // A branch takes its delay slot with it, if that is a plain
++            // instruction the run executed.
++            if (!usable(w + 1) || kind_of(img.words[w + 1]) != Kind::Plain || n + 2 > kMaxBlock) break;
++            n += 2;
++            lines.push_back("{ " + branch(word, pc));
++            lines.push_back(plain(img.words[w + 1], "(taken ? target : " + std::format("{}u)", pc + 8u), n));
++            tail = std::format("c.pc = taken ? target : {}u; c.npc = c.pc + 4u; return {}u; }}", pc + 8u, n);
++            ended = true;
++            break;
++        }
++        if (!n) continue;
++        // Plain instructions only: pc moves on to the next one.
++        if (!ended) tail = std::format("c.pc = {0}u; c.npc = {0}u + 4u; return {1}u;", (first + n) * 4u, n);
++        const std::string name = std::format("iop_{:06X}", first * 4u);
++        std::string body = std::format("std::uint32_t {}(Cpu &c) {{\n    std::uint32_t *r = c.r;\n    bool sw = false;\n    (void)r;\n    (void)sw;\n", name);
++        for (const std::string &l : lines)
++            if (!l.empty()) body += "    " + l + "\n";
++        body += "    " + tail + "\n}\n\n";
++        text += body;
++        blocks.push_back({first * 4u, n, name});
++        instructions += n;
++        if (++in_file == 400) {
++            files.push_back(text + "}\n");
++            text = kPrelude;
++            in_file = 0;
++        }
++    }
++    if (in_file) files.push_back(text + "}\n");
++
++    fs::create_directories(out_dir);
++    for (const auto &e : fs::directory_iterator(out_dir))
++        if (e.path().filename().string().rfind("iop_", 0) == 0) fs::remove(e.path());
++    for (std::size_t i = 0; i < files.size(); ++i) std::ofstream(out_dir / std::format("iop_{:03}.cpp", i)) << files[i];
++
++    std::string table = "#include \"ps2/iop_cpu.hpp\"\n\nnamespace gen {\n\n";
++    for (const Out &b : blocks) table += std::format("std::uint32_t {}(ps2::iop::Cpu &c);\n", b.name);
++    table += "\nnamespace {\n\n";
++    // The words each block was made from, which RAM must still hold.
++    for (const Out &b : blocks) {
++        table += std::format("const std::uint32_t k_{}[] = {{", b.name);
++        for (std::uint32_t i = 0; i < b.count; ++i) table += std::format("{}0x{:08X}u", i ? ", " : "", img.words[b.pc / 4 + i]);
++        table += "};\n";
++    }
++    table += "\nconst ps2::iop::Block kBlocks[] = {\n";
++    for (const Out &b : blocks) table += std::format("    {{0x{:08X}u, {}u, k_{}, {}}},\n", b.pc, b.count, b.name, b.name);
++    if (blocks.empty()) table += "    {0, 0, nullptr, nullptr},\n";
++    table += std::format("}};\n\n}}\n\n}}\n\nvoid register_generated_iop() {{ ps2::iop::register_blocks(gen::kBlocks, {}u); }}\n", blocks.size());
++    std::ofstream(out_dir / "iop_table.cpp") << table;
++    std::printf("%zu IOP blocks, %zu instructions\n", blocks.size(), instructions);
++    return 0;
++}
+diff --git a/runtime/include/ps2/iop_cpu.hpp b/runtime/include/ps2/iop_cpu.hpp
+new file mode 100644
+index 0000000..a22d0ee
+--- /dev/null
++++ b/runtime/include/ps2/iop_cpu.hpp
+@@ -0,0 +1,55 @@
++#pragma once
++
++// The IOP's registers and memory, for the runtime's interpreter and for code
++// translated ahead of time (recomp/ioprecomp.cpp, generated iop_*.cpp).
++
++#include <cstddef>
++#include <cstdint>
++#include <cstring>
++
++namespace ps2::iop {
++
++inline constexpr std::uint32_t kRamSize = 2u << 20;
++
++extern std::uint8_t g_ram[];
++
++struct Cpu {
++    std::uint32_t r[32];
++    std::uint32_t hi, lo;
++    std::uint32_t pc, npc;
++    std::uint32_t status, cause, epc;
++};
++
++extern Cpu g_cpu;
++
++inline std::uint32_t phys(std::uint32_t a) { return a & 0x1FFFFFFFu; }
++
++std::uint8_t read8(std::uint32_t a);
++std::uint16_t read16(std::uint32_t a);
++std::uint32_t read32(std::uint32_t a);
++void write8(std::uint32_t a, std::uint8_t v);
++void write16(std::uint32_t a, std::uint16_t v);
++void write32(std::uint32_t a, std::uint32_t v);
++
++namespace kernel {
++bool switch_pending();
++}
++
++// A run of instructions translated ahead of time. Its function runs them as
++// the interpreter would, one cycle each, and returns how many it ran: all of
++// them, or fewer when an access outside RAM asked for a thread switch. It
++// leaves pc and npc where the interpreter would. The interpreter takes a
++// block only at its first instruction, outside a delay slot, with budget for
++// all of it, and only while RAM still holds the words it was made from.
++using BlockFn = std::uint32_t (*)(Cpu &c);
++struct Block {
++    std::uint32_t pc, count;
++    const std::uint32_t *words;
++    BlockFn fn;
++};
++void register_blocks(const Block *blocks, std::size_t count);
++
++}
++
++// Defined by a game's generated code when it has translated IOP blocks.
++void register_generated_iop();
+diff --git a/runtime/src/iop/cpu.cpp b/runtime/src/iop/cpu.cpp
+index da4b3e4..5afac21 100644
+--- a/runtime/src/iop/cpu.cpp
++++ b/runtime/src/iop/cpu.cpp
+@@ -4,6 +4,8 @@
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
++#include <filesystem>
++#include <fstream>
+ #include <vector>
+ 
+ namespace ps2::iop {
+@@ -45,6 +47,49 @@ void probe(const Cpu &c, std::uint32_t pc) {
+     }
+ }
+ 
++// Blocks translated ahead of time, by the word index of their first
++// instruction in RAM (index + 1; 0 = none). PS2_IOP_INTERPRET=1 ignores them.
++std::vector<Block> g_blocks;
++std::vector<std::uint32_t> g_block_at;
++// A block runs once RAM was found to hold its words in this generation of
++// the code (code_may_have_changed starts a new one).
++std::vector<std::uint32_t> g_checked;
++std::uint32_t g_code_generation = 1;
++
++const Block *block_at(const Cpu &c, std::uint32_t pc, std::int64_t budget) {
++    if (c.npc != pc + 4u) return nullptr;
++    const std::uint32_t p = phys(pc);
++    if (p >= kRamSize) return nullptr;
++    const std::uint32_t i = g_block_at[p >> 2];
++    if (!i) return nullptr;
++    const Block &b = g_blocks[i - 1];
++    if (b.pc != pc || budget < static_cast<std::int64_t>(b.count)) return nullptr;
++    if (g_checked[i - 1] != g_code_generation) {
++        if (std::memcmp(g_ram + p, b.words, b.count * 4u) != 0) return nullptr;
++        g_checked[i - 1] = g_code_generation;
++    }
++    return &b;
++}
++
++// PS2_IOP_RECORD=<dir>: at the end of the run, the IOP's RAM, the words it ran
++// and the ones it reached other than by stepping on from the one before, for
++// recomp/ioprecomp.cpp to translate.
++struct Record {
++    std::vector<std::uint8_t> ran, entered;
++    std::uint32_t last = 0xFFFFFFFFu;
++};
++Record *g_record = nullptr;
++
++void record(std::uint32_t pc) {
++    const std::uint32_t p = phys(pc);
++    if (p < kRamSize) {
++        const std::uint32_t w = p >> 2;
++        g_record->ran[w >> 3] |= static_cast<std::uint8_t>(1u << (w & 7u));
++        if (pc != g_record->last + 4u) g_record->entered[w >> 3] |= static_cast<std::uint8_t>(1u << (w & 7u));
++    }
++    g_record->last = pc;
++}
++
+ void bad(Cpu &c, std::uint32_t pc, std::uint32_t w) {
+     std::fprintf(stderr, "[iop] unknown instruction %08X at 0x%08X (ra 0x%08X)\n", w, pc, c.r[31]);
+     kernel::fault("unknown instruction");
+@@ -60,8 +105,27 @@ std::uint32_t fetch(std::uint32_t pc) {
+ 
+ void execute(Cpu &c, std::int64_t &budget) {
+     static const bool probing = load_probes();
+-    while (budget-- > 0) {
++    static const bool recording = [] {
++        if (std::getenv("PS2_IOP_RECORD")) g_record = new Record{std::vector<std::uint8_t>(kRamSize / 32), std::vector<std::uint8_t>(kRamSize / 32)};
++        return g_record != nullptr;
++    }();
++    static const bool use_blocks = !probing && !recording && !std::getenv("PS2_IOP_INTERPRET");
++    // Only an access outside RAM can ask for a thread switch, and both the
++    // interpreter and a block return after one that does. One asked for
++    // already (interrupts held off) lets the interpreter run one instruction.
++    const bool blocks = use_blocks && !g_block_at.empty() && !kernel::switch_pending();
++    while (budget > 0) {
+         const std::uint32_t pc = c.pc;
++        if (blocks) {
++            if (const Block *b = block_at(c, pc, budget)) {
++                const std::uint32_t ran = b->fn(c);
++                budget -= ran;
++                if (ran < b->count) return;
++                continue;
++            }
++        }
++        --budget;
++        if (recording) record(pc);
+         if (probing) {
+             const std::uint32_t a = pc & (kRamSize - 1);
+             if (g_probes[a >> 5] & (1u << ((a >> 2) & 7u))) probe(c, pc);
+@@ -207,4 +271,29 @@ void execute(Cpu &c, std::int64_t &budget) {
+     }
+ }
+ 
++void register_blocks(const Block *blocks, std::size_t count) {
++    g_blocks.assign(blocks, blocks + count);
++    g_checked.assign(count, 0);
++    g_block_at.assign(kRamSize / 4, 0);
++    for (std::size_t i = 0; i < g_blocks.size(); ++i) {
++        const std::uint32_t p = phys(g_blocks[i].pc);
++        if (p < kRamSize && p + g_blocks[i].count * 4u <= kRamSize) g_block_at[p >> 2] = static_cast<std::uint32_t>(i + 1);
++    }
+ }
++
++void code_may_have_changed() { ++g_code_generation; }
++
++void write_record() {
++    const char *dir = std::getenv("PS2_IOP_RECORD");
++    if (!g_record || !dir) return;
++    std::filesystem::create_directories(dir);
++    const std::filesystem::path d(dir);
++    std::ofstream(d / "ram.bin", std::ios::binary).write(reinterpret_cast<const char *>(g_ram), kRamSize);
++    std::ofstream(d / "ran.bin", std::ios::binary).write(reinterpret_cast<const char *>(g_record->ran.data()), static_cast<std::streamsize>(g_record->ran.size()));
++    std::ofstream(d / "entered.bin", std::ios::binary).write(reinterpret_cast<const char *>(g_record->entered.data()), static_cast<std::streamsize>(g_record->entered.size()));
++    std::fprintf(stderr, "[iop] recorded the code run into %s\n", dir);
++}
++
++}
++
++__attribute__((weak)) void register_generated_iop() {}
+diff --git a/runtime/src/iop/iop.hpp b/runtime/src/iop/iop.hpp
+index bbcc121..4e64776 100644
+--- a/runtime/src/iop/iop.hpp
++++ b/runtime/src/iop/iop.hpp
+@@ -1,5 +1,7 @@
+ #pragma once
+ 
++#include "ps2/iop_cpu.hpp"
++
+ #include <cstdint>
+ #include <cstring>
+ #include <functional>
+@@ -14,23 +16,9 @@ namespace ps2::iop {
+ 
+ void state(ps2::state::Stream &s);
+ 
+-inline constexpr std::uint32_t kRamSize = 2u << 20;
+ inline constexpr std::uint32_t kClockDivider = 8;
+ inline constexpr std::uint32_t kHleOpcode = 0x3Fu;
+ 
+-extern std::uint8_t g_ram[];
+-
+-struct Cpu {
+-    std::uint32_t r[32];
+-    std::uint32_t hi, lo;
+-    std::uint32_t pc, npc;
+-    std::uint32_t status, cause, epc;
+-};
+-
+-extern Cpu g_cpu;
+-
+-inline std::uint32_t phys(std::uint32_t a) { return a & 0x1FFFFFFFu; }
+-
+ inline std::uint8_t *ram_ptr(std::uint32_t a) { return g_ram + (phys(a) & (kRamSize - 1)); }
+ 
+ inline std::uint32_t ram32(std::uint32_t a) {
+@@ -51,13 +39,6 @@ inline std::string ram_string(std::uint32_t a, std::size_t limit = 256) {
+     return s;
+ }
+ 
+-std::uint8_t read8(std::uint32_t a);
+-std::uint16_t read16(std::uint32_t a);
+-std::uint32_t read32(std::uint32_t a);
+-void write8(std::uint32_t a, std::uint8_t v);
+-void write16(std::uint32_t a, std::uint16_t v);
+-void write32(std::uint32_t a, std::uint32_t v);
+-
+ using HleFunction = std::function<void(Cpu &)>;
+ std::uint32_t register_hle(const std::string &library, std::uint32_t index, HleFunction function);
+ void call_hle(Cpu &c, std::uint32_t id);
+@@ -69,6 +50,11 @@ void raise_interrupt(unsigned line);
+ void vblank(bool start);
+ bool idle();
+ void dump();
++// RAM may hold other code now (a module loaded, a state, a new frame): the
++// translated blocks check their words again before they next run.
++void code_may_have_changed();
++// PS2_IOP_RECORD: writes what the run recorded (cpu.cpp).
++void write_record();
+ 
+ std::int32_t load_module(const std::string &path, const std::string &args, std::function<void(int, int)> done = {});
+ std::int32_t load_module_buffer(const std::vector<std::uint8_t> &data, const std::string &path, const std::string &args,
+diff --git a/runtime/src/iop/kernel.cpp b/runtime/src/iop/kernel.cpp
+index 25a3d79..b102b53 100644
+--- a/runtime/src/iop/kernel.cpp
++++ b/runtime/src/iop/kernel.cpp
+@@ -647,6 +647,7 @@ std::int32_t load_module_buffer(const std::vector<std::uint8_t> &data, const std
+                                 std::function<void(int, int)> done) {
+     using namespace kernel;
+     const std::string name = module_name_of(path);
++    code_may_have_changed();
+     auto hle = g_hle_modules.find(name);
+     if (hle != g_hle_modules.end()) {
+         if (g_trace_modules) std::fprintf(stderr, "[iop] %s handled natively\n", name.c_str());
+@@ -817,6 +818,7 @@ void state(ps2::state::Stream &s) {
+     s.tag("iop");
+     s.pod(g_cpu);
+     s.bytes(g_ram, kRamSize);
++    code_may_have_changed();
+     kernel::state(s);
+     kernel::libs_state(s);
+     kernel::cdvd_state(s);
+diff --git a/runtime/src/iop/libs.cpp b/runtime/src/iop/libs.cpp
+index a1d7569..3d9c98b 100644
+--- a/runtime/src/iop/libs.cpp
++++ b/runtime/src/iop/libs.cpp
+@@ -1284,6 +1284,8 @@ void libs_state(ps2::state::Stream &s) {
+ namespace ps2::iop {
+ 
+ void vblank(bool start) {
++    // Once a frame, in case code reached RAM some other way.
++    if (start) code_may_have_changed();
+     hw::raise_interrupt(start ? 0u : 11u);
+     kernel::vblank_edge(start);
+ }
+diff --git a/runtime/src/system.cpp b/runtime/src/system.cpp
+index b294c61..c47ad2d 100644
+--- a/runtime/src/system.cpp
++++ b/runtime/src/system.cpp
+@@ -255,7 +255,10 @@ bool preempt(Cpu &c) {
+ }
+ 
+ void halt(const std::string &reason) {
+-    if (!g_halted) std::fprintf(stderr, "[ee] halted: %s\n", reason.c_str());
++    if (!g_halted) {
++        std::fprintf(stderr, "[ee] halted: %s\n", reason.c_str());
++        iop::write_record();
++    }
+     g_halted = true;
+     g_halt_reason = reason;
+ }
+-- 
+2.54.0 (Apple Git-157)
+

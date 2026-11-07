@@ -62,6 +62,14 @@ python3 -I "$here/un5_vu1.py" "$G/disc/SLES_556.05" "$work/vu1"
 # longer upload left in VU memory is out of the executable's reach.
 if [ -d "$G/vu1" ]; then cp "$G"/vu1/*.bin "$work/vu1/" 2>/dev/null || true; fi
 (cd "$web" && build/tools/vurecomp --rz --snapshots "$work/vu1" generated/un5 | tail -1)
+# The IOP's sound modules (CRI ADX, modhsyn, libsd) take an eighth of the EE
+# thread in the interpreter. Code a run recorded (PS2_IOP_RECORD=<dir>, one
+# folder per run in $G/iop) becomes blocks the interpreter runs natively;
+# without records the IOP stays interpreted.
+if compgen -G "$G/iop/*/ran.bin" >/dev/null; then
+	echo "Translating the recorded IOP code..."
+	(cd "$web" && build/tools/ioprecomp "$G"/iop/*/ generated/un5 | tail -1)
+fi
 # Hand-written stand-ins for the hottest VU1 programs, linked into the player.
 ln -sf "$here/../ports/un5/vu1_native.cpp" "$web/generated/un5/native_vu1.cpp"
 echo "Done: $web/generated/un5"
