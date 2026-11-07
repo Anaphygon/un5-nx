@@ -1,0 +1,41 @@
+From dab9532c7a225ada60c798ce1658163b95e5be70 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 8 Nov 2026 00:24:54 +0700
+Subject: [PATCH] perf: VU0 micro programs through the decoding interpreter
+
+VCALLMS ran VU0 programs in the exact loop, which decodes each
+instruction on every step and does soft-float arithmetic: about 9% of
+the EE thread in a UN5 battle on the Switch. They now take the
+interpreter VU1 falls back to (decoded once per code change, native
+single precision with denormals flushed and overflow clamped).
+PS2_VU0_EXACT=1 keeps the exact loop (PS2_VU_EXACT still covers both).
+
+UN5 on the Mac: battle replay 8 s -> 6 s headless, its frames identical
+to the exact loop's; the regression suite (battle, movie, shop, adv)
+unchanged.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ runtime/src/vu_micro.cpp | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/runtime/src/vu_micro.cpp b/runtime/src/vu_micro.cpp
+index a109546..860f0ae 100644
+--- a/runtime/src/vu_micro.cpp
++++ b/runtime/src/vu_micro.cpp
+@@ -1309,7 +1309,11 @@ void run_fast(int n, std::uint32_t address) {
+ 
+ void run(int n, std::uint32_t address) {
+     static const bool exact = std::getenv("PS2_VU_EXACT") != nullptr;
+-    if (n == 1 && !exact) {
++    // VU0 micro programs (VCALLMS) took the exact loop too, which decodes
++    // every instruction each time and does soft-float arithmetic: about 9% of
++    // the EE thread in a UN5 battle on the Switch. PS2_VU0_EXACT keeps it.
++    static const bool exact0 = exact || std::getenv("PS2_VU0_EXACT") != nullptr;
++    if (n == 1 ? !exact : !exact0) {
+         interpret(n, address);
+         return;
+     }
+-- 
+2.54.0 (Apple Git-157)
+
