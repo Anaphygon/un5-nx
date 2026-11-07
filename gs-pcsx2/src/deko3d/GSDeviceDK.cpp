@@ -31,6 +31,12 @@ u32 nwindowSetSwapInterval(NWindow* nw, u32 swap_interval);
 // with Mesa's own copy of the same GLSL compiler).
 // Runs it on a thread with a large stack (uam_thread.cpp).
 bool un5_uam_compile_big_stack(int stage, const char* glsl, const char* out_path);
+#ifdef __SWITCH__
+// deko3d/uam_thread.cpp: the background compiler.
+void un5_uam_compile_async(u64 hash, int stage, std::string glsl, std::string out_path);
+bool un5_uam_take_done(u64& hash, bool& ok);
+void un5_uam_stop();
+#endif
 
 // Counters for the port's speed log (defined next to the OpenGL device).
 extern double g_un5_render_ms, g_un5_swap_ms, g_un5_program_ms;
@@ -250,6 +256,9 @@ bool GSDeviceDK::Create(GSVSyncMode vsync_mode, bool allow_present_throttle)
 
 void GSDeviceDK::Destroy()
 {
+#ifdef __SWITCH__
+	un5_uam_stop();
+#endif
 	GSDevice::Destroy();
 	if (!m_ctx.Device())
 		return;
@@ -415,7 +424,37 @@ std::string GSDeviceDK::GetShaderSource(std::string_view entry, DkStage stage, s
 	return src;
 }
 
-const DkShader* GSDeviceDK::GetShader(DkStage stage, const std::string& source)
+void GSDeviceDK::TakeCompiledShaders()
+{
+#ifdef __SWITCH__
+	u64 hash;
+	bool ok;
+	while (un5_uam_take_done(hash, ok))
+	{
+		const auto it = m_compiling.find(hash);
+		if (it == m_compiling.end())
+			continue;
+		if (ok && LoadPackedShader(hash))
+		{
+			Console.WriteLn("deko3d: compiled shader %016llx in the background", static_cast<unsigned long long>(hash));
+		}
+		else
+		{
+			m_missing_shaders.emplace(hash, true);
+			const std::string missing = fmt::format("{}/{:016x}.{}", kMissingDir, hash, it->second.first == DkStage_Vertex ? "vert" : "frag");
+			if (std::FILE* f = std::fopen(missing.c_str(), "wb"))
+			{
+				std::fwrite(it->second.second.data(), 1, it->second.second.size(), f);
+				std::fclose(f);
+			}
+			Console.Warning("deko3d: compiling shader %016llx in the background failed", static_cast<unsigned long long>(hash));
+		}
+		m_compiling.erase(it);
+	}
+#endif
+}
+
+const DkShader* GSDeviceDK::GetShader(DkStage stage, const std::string& source, bool may_wait)
 {
 	const u64 hash = un5_shader_hash(source);
 	if (const auto it = m_shaders.find(hash); it != m_shaders.end())
@@ -425,6 +464,23 @@ const DkShader* GSDeviceDK::GetShader(DkStage stage, const std::string& source)
 
 	if (const DkShader* shader = LoadPackedShader(hash))
 		return shader;
+
+#ifdef __SWITCH__
+	// Not in the pack, for a draw: compiled on the background thread; the draw
+	// is skipped until it is in (a frame or two), instead of the GS thread
+	// stopping for uam (60-80 ms a shader, up to seconds for an effect's set).
+	if (!may_wait && !HasLooseUniforms(source))
+	{
+		if (!m_compiling.count(hash))
+		{
+			m_compiling.emplace(hash, std::make_pair(stage, source));
+			un5_uam_compile_async(hash, static_cast<int>(stage), source, fmt::format("{}/{:016x}.dksh", kPackDir, hash));
+		}
+		return nullptr;
+	}
+#else
+	(void)may_wait;
+#endif
 
 	// Not in the pack: compile it here, once, into the pack. Sources with
 	// uniforms outside a block (only the fixed shaders, which the pack built on
@@ -2177,8 +2233,22 @@ const DkShader* GSDeviceDK::GetTfxVS(VSSelector sel)
 {
 	if (const auto it = m_vs_cache.find(sel.key); it != m_vs_cache.end())
 		return it->second;
-	const DkShader* shader = GetShader(DkStage_Vertex, GetVSSource(sel));
-	m_vs_cache.emplace(sel.key, shader);
+	TakeCompiledShaders();
+	if (const auto it = m_vs_waiting.find(sel.key); it != m_vs_waiting.end())
+	{
+		const auto done = m_shaders.find(it->second);
+		if (done == m_shaders.end())
+			return nullptr;
+		m_vs_cache.emplace(sel.key, &done->second);
+		m_vs_waiting.erase(it);
+		return &done->second;
+	}
+	const std::string source = GetVSSource(sel);
+	const DkShader* shader = GetShader(DkStage_Vertex, source, false);
+	if (shader)
+		m_vs_cache.emplace(sel.key, shader);
+	else // on the background compiler, or missing
+		m_vs_waiting.emplace(sel.key, un5_shader_hash(source));
 	return shader;
 }
 
@@ -2186,8 +2256,22 @@ const DkShader* GSDeviceDK::GetTfxPS(const PSSelector& sel)
 {
 	if (const auto it = m_ps_cache.find(sel); it != m_ps_cache.end())
 		return it->second;
-	const DkShader* shader = GetShader(DkStage_Fragment, GetPSSource(sel));
-	m_ps_cache.emplace(sel, shader);
+	TakeCompiledShaders();
+	if (const auto it = m_ps_waiting.find(sel); it != m_ps_waiting.end())
+	{
+		const auto done = m_shaders.find(it->second);
+		if (done == m_shaders.end())
+			return nullptr;
+		m_ps_cache.emplace(sel, &done->second);
+		m_ps_waiting.erase(it);
+		return &done->second;
+	}
+	const std::string source = GetPSSource(sel);
+	const DkShader* shader = GetShader(DkStage_Fragment, source, false);
+	if (shader)
+		m_ps_cache.emplace(sel, shader);
+	else
+		m_ps_waiting.emplace(sel, un5_shader_hash(source));
 	return shader;
 }
 

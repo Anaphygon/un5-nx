@@ -126,7 +126,12 @@ private:
 	// Shaders.
 	std::string GenGlslHeader(std::string_view entry, DkStage stage, std::string_view macro) const;
 	std::string GetShaderSource(std::string_view entry, DkStage stage, std::string_view code, std::string_view macro = {}) const;
-	const DkShader* GetShader(DkStage stage, const std::string& source);
+	// may_wait: a shader the pack lacks is compiled before this returns; else
+	// (draws' shaders, on the Switch) it is compiled on a thread of its own and
+	// this returns null until it is ready, so the draw is skipped meanwhile.
+	const DkShader* GetShader(DkStage stage, const std::string& source, bool may_wait = true);
+	// Takes in the shaders the background compiler has finished.
+	void TakeCompiledShaders();
 	const DkShader* LoadPackedShader(u64 hash);
 	static bool HasLooseUniforms(const std::string& source);
 	void PreloadPack();
@@ -230,6 +235,9 @@ private:
 	// Shaders.
 	std::unordered_map<u64, DkShader> m_shaders;
 	std::unordered_map<u64, bool> m_missing_shaders;
+	// Shaders on the background compiler, with their stage and source (kept
+	// for the Mac, tools/dk_sync.sh, if uam fails on them).
+	std::unordered_map<u64, std::pair<DkStage, std::string>> m_compiling;
 	std::string m_tfx_vgs, m_tfx_fs;
 	std::string m_tfx_un5_vgs; // un5-nx: the vertex shader of UN5's stage batches (tfx_un5_vgs.glsl)
 	std::unordered_map<u8, const DkShader*> m_vs_cache;
@@ -242,6 +250,10 @@ private:
 		bool operator()(const PSSelector& a, const PSSelector& b) const noexcept { return a.key_lo == b.key_lo && a.key_hi == b.key_hi; }
 	};
 	std::unordered_map<PSSelector, const DkShader*, PSKeyHash, PSKeyEq> m_ps_cache;
+	// Selectors whose shader is not there yet (compiling, or missing): its
+	// hash, so a draw asks again without building the source again.
+	std::unordered_map<u8, u64> m_vs_waiting;
+	std::unordered_map<PSSelector, u64, PSKeyHash, PSKeyEq> m_ps_waiting;
 
 	const DkShader* m_convert_vs = nullptr;
 	std::vector<Program> m_convert;
