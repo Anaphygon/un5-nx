@@ -134,11 +134,13 @@ namespace
 		if (!f)
 			return false;
 		std::fprintf(f, "# written by the launcher's Benchmark\nUN5GS_BENCH=1\nUN5GS_NATIVE=1\nPS2_VU_NATIVE=1\nPS2_VU_PROFILE=1\n"
+						// The sampler waits for the benchmark's go (bench.cpp).
+						"PS2_SAMPLE=100000\n"
 						"--window\n--fullscreen\n--disc\n$DIR/disc.iso\n--memcard\n$DIR/bench.ps2\n--load-state\n$DIR/battle.state\n"
 						"--press\n6900:cross:4\n");
 		for (int t = 7500; t <= 8940; t += 60)
 			std::fprintf(f, "--press\n%d:triangle:4\n--press\n%d:circle:4\n", t, t + 12);
-		std::fprintf(f, "--frames\n12000\n");
+		std::fprintf(f, "--frames\n14500\n");
 		std::fclose(f);
 		return true;
 	}
@@ -168,7 +170,7 @@ namespace
 			screen.value = exists(g_dir + "battle.state") ? "Run it" : "battle.state is missing";
 			const std::string last = bench_summary();
 			// The settings on the left apply, with deko3d; the run quits by itself.
-			screen.note = "A two-minute battle replay; it quits at the end.\n" +
+			screen.note = "A three-minute battle replay; it quits at the end.\n" +
 						  (last.empty() ? std::string("No run yet.") : last);
 		}
 		else if (selected == kStart)

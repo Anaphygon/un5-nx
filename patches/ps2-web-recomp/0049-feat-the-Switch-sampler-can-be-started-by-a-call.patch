@@ -1,0 +1,58 @@
+From d8784ca0975cd213a4f08bfaeadd9a0075003504 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 8 Nov 2026 00:04:10 +0700
+Subject: [PATCH] feat: the Switch sampler can be started by a call
+
+ps2_sampler_go() ends PS2_SAMPLE's wait early, so a port can start
+sampling at a moment of its own (un5-nx's Benchmark, once its comparison
+is done) instead of a guessed number of seconds.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ host/switch_sampler.cpp | 9 +++++++--
+ 1 file changed, 7 insertions(+), 2 deletions(-)
+
+diff --git a/host/switch_sampler.cpp b/host/switch_sampler.cpp
+index ee5a602..15a227f 100644
+--- a/host/switch_sampler.cpp
++++ b/host/switch_sampler.cpp
+@@ -5,7 +5,9 @@
+ // addresses (subtract the NRO's load address, from a known symbol, for
+ // addr2line against ps2run.elf) and each thread's core.
+ //
+-// PS2_SAMPLE=<seconds> in args.txt starts it that many seconds in.
++// PS2_SAMPLE=<seconds> in args.txt starts it that many seconds in, or
++// earlier when ps2_sampler_go() is called (the un5-nx launcher's Benchmark
++// calls it once its comparison is done).
+ #ifdef __SWITCH__
+ #include "switch_sampler.hpp"
+ 
+@@ -56,6 +58,7 @@ std::uint64_t g_dropped = 0;
+ Thread g_sampler;
+ bool g_running = false;
+ std::atomic<bool> g_stop{false};
++std::atomic<bool> g_go{false};
+ 
+ void add_thread(Handle h, std::uintptr_t entry) {
+     if (!std::getenv("PS2_SAMPLE")) return;
+@@ -139,7 +142,7 @@ void sample(int index, Known &t) {
+ 
+ void run(void *arg) {
+     const auto delay_ms = reinterpret_cast<std::uintptr_t>(arg);
+-    for (std::uintptr_t waited = 0; waited < delay_ms && !g_stop.load(); waited += 100) svcSleepThread(100'000'000);
++    for (std::uintptr_t waited = 0; waited < delay_ms && !g_stop.load() && !g_go.load(); waited += 100) svcSleepThread(100'000'000);
+     std::fprintf(stderr, "[sampler] started\n");
+     const Handle self = threadGetCurHandle();
+     while (!g_stop.load()) {
+@@ -219,6 +222,8 @@ void report() {
+ 
+ void switch_sampler_add_thread(Handle handle, std::uintptr_t entry) { add_thread(handle, entry); }
+ 
++extern "C" void ps2_sampler_go() { g_go.store(true); }
++
+ void start_switch_sampler() {
+     const char *delay = std::getenv("PS2_SAMPLE");
+     if (!delay || g_running) return;
+-- 
+2.54.0 (Apple Git-157)
+
