@@ -378,6 +378,23 @@ bool un5_launcher(const char* dir)
 		setenv("UN5_BENCH_RESULT", (g_dir + "bench-result.txt").c_str(), 1);
 	}
 	setenv("UN5GS_FIX", std::to_string(s.upscale_fix).c_str(), 1);
+	// env.txt next to the NRO: KEY=VALUE lines for a diagnostic run (the
+	// sampler, a frame timer) on top of the settings, which args.txt would skip.
+	if (std::FILE* f = std::fopen((g_dir + "env.txt").c_str(), "r"))
+	{
+		char line[512];
+		while (std::fgets(line, sizeof line, f))
+		{
+			line[std::strcspn(line, "\r\n")] = 0;
+			if (char* eq = std::strchr(line, '='); eq && line[0] != '#')
+			{
+				*eq = 0;
+				setenv(line, eq + 1, 1);
+				std::fprintf(stderr, "[launcher] env.txt: %s=%s\n", line, eq + 1);
+			}
+		}
+		std::fclose(f);
+	}
 	// VU1 programs with no translation run in the interpreter, about ten times
 	// slower (a battle with new characters fell to 42 fps with the VU thread at
 	// 99%). The runner keeps each new one here; tools/vu_sync.sh translates

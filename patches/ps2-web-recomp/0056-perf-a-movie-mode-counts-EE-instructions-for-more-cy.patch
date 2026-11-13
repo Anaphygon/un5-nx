@@ -1,0 +1,144 @@
+From ae6a7f4dfca89653c9f28e52986df0b23476c118 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 8 Nov 2026 06:54:09 +0700
+Subject: [PATCH] perf: a movie mode counts EE instructions for more cycles
+ while a slow host decodes
+
+UN5's movie player (CRI) polls the IOP between short slices of work: some
+1 300 times a frame it creates a semaphore, sends a 64-byte SIF command,
+waits for the DMA, deletes the semaphore and yields. Cheap on a PS2; here
+five syscalls, an interrupt, an IOP command and two thread switches each,
+and a Switch played the opening movie at 15 fps, the EE thread alone busy.
+How often it polls follows the EE's clock: with each instruction counted
+as 3 cycles the Mac decoded 4% fewer macroblocks in 45% less time.
+
+So while the IPU decodes (64 qwords a frame or more over 25 frames) and
+the host takes longer than a field per frame, the EE clock goes faster per
+instruction, halfway each 25 frames towards the scale that would have kept
+up, at most 4 (the Mac lost 13% of its macroblocks there, 27% at 5). It is
+back to one when the IPU stops, and a host that keeps up never leaves one,
+so the Mac's runs and its regression suite are unchanged.
+PS2_MOVIE_SCALE=0 turns it off, PS2_EE_SCALE=<quarters> fixes the scale,
+PS2_MOVIE_TARGET_MS=<ms> stands in for the field time to try it on a fast
+host (the Mac at 1 ms: 4 through the movie, 1 at the title screen).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ runtime/src/ipu/ipu.cpp |  2 ++
+ runtime/src/ipu/ipu.hpp |  2 ++
+ runtime/src/system.cpp  | 51 +++++++++++++++++++++++++++++++++++++++--
+ 3 files changed, 53 insertions(+), 2 deletions(-)
+
+diff --git a/runtime/src/ipu/ipu.cpp b/runtime/src/ipu/ipu.cpp
+index d5bd9bd..88a65ca 100644
+--- a/runtime/src/ipu/ipu.cpp
++++ b/runtime/src/ipu/ipu.cpp
+@@ -714,6 +714,8 @@ void read_fifo(std::uint8_t *qword) {
+ 
+ void dma_started(int) { step(); }
+ 
++std::uint64_t output_qwords() { return g_out_qwords; }
++
+ void stats() {
+     std::fprintf(stderr, "[ipu] commands:");
+     for (int i = 0; i < 16; ++i)
+diff --git a/runtime/src/ipu/ipu.hpp b/runtime/src/ipu/ipu.hpp
+index 5dc3f1e..fa8cf00 100644
+--- a/runtime/src/ipu/ipu.hpp
++++ b/runtime/src/ipu/ipu.hpp
+@@ -17,5 +17,7 @@ void write_fifo(const std::uint8_t *qword);
+ void read_fifo(std::uint8_t *qword);
+ void dma_started(int channel);
+ void stats();
++// Qwords decoded so far (the movie mode watches it, system.cpp).
++std::uint64_t output_qwords();
+ 
+ }
+diff --git a/runtime/src/system.cpp b/runtime/src/system.cpp
+index fd9f369..cd1f1b7 100644
+--- a/runtime/src/system.cpp
++++ b/runtime/src/system.cpp
+@@ -40,6 +40,11 @@ namespace ps2 {
+ Cpu g_cpu;
+ Options g_options;
+ 
++// EE cycles per instruction, in quarters (4: one); the movie mode raises it
++// (see movie_mode below).
++std::uint64_t g_ee_scale = 4;
++std::uint64_t ee_scale() { return g_ee_scale; }
++
+ namespace {
+ 
+ constexpr std::int64_t kMaxSlice = 20000;
+@@ -93,7 +98,7 @@ void run_due_events() {
+ void refill(Cpu &c) {
+     const std::uint64_t t = now(), next = next_event_time();
+     std::int64_t slice = kMaxSlice;
+-    if (next != UINT64_MAX) slice = std::clamp<std::int64_t>(static_cast<std::int64_t>(next - std::min(next, t)), 1, kMaxSlice);
++    if (next != UINT64_MAX) slice = std::clamp<std::int64_t>(static_cast<std::int64_t>((next - std::min(next, t)) * 4 / ee_scale()), 1, kMaxSlice);
+     set_budget(c, slice);
+ }
+ 
+@@ -179,8 +184,50 @@ void apply_patches(bool boot) {
+     }
+ }
+ 
++// The movie mode. UN5's movie player (CRI) polls the IOP with tiny SIF
++// commands between short slices of work, some 1 300 times a frame: on a
++// PS2 cheap, here five syscalls, an interrupt, an IOP command and two
++// thread switches each, and a Switch then played the opening movie at 15
++// fps. While the IPU decodes and the host falls behind, each EE instruction
++// counts for more cycles (up to 4): the player polls less often in the same
++// time and keeps its pictures (at 3 the Mac's decoding lost 4%, at 4 13%, at
++// 5 27%: the cap). Back to one as soon as the IPU stops. A host that keeps
++// up never leaves one. PS2_MOVIE_SCALE=0 turns it off; PS2_EE_SCALE=<quarters>
++// fixes the scale.
++void movie_mode() {
++    static const char *fixed = std::getenv("PS2_EE_SCALE");
++    static const bool off = fixed || (std::getenv("PS2_MOVIE_SCALE") && !std::atoi(std::getenv("PS2_MOVIE_SCALE")));
++    constexpr std::uint64_t kWindow = 25, kMax = 16;
++    static std::uint64_t window_start = 0, qwords = 0;
++    static std::chrono::steady_clock::time_point since = std::chrono::steady_clock::now();
++    std::uint64_t scale = g_ee_scale;
++    if (fixed) scale = std::clamp<std::uint64_t>(std::strtoull(fixed, nullptr, 10), 1, 64);
++    else if (!off && g_frames >= window_start + kWindow) {
++        const auto now_t = std::chrono::steady_clock::now();
++        const double ms = std::chrono::duration<double, std::milli>(now_t - since).count() / static_cast<double>(g_frames - window_start);
++        const std::uint64_t q = ipu::output_qwords();
++        const bool decoding = q - qwords > kWindow * 64;
++        // PS2_MOVIE_TARGET_MS stands in for the field time, to try the mode
++        // on a host that keeps up.
++        static const double target = std::getenv("PS2_MOVIE_TARGET_MS") ? std::atof(std::getenv("PS2_MOVIE_TARGET_MS")) : 0.0;
++        const double field_ms = target > 0 ? target : g_options.pal ? 20.0 : 1000.0 / 60.0;
++        // The scale that would have kept up, halfway there, while decoding.
++        scale = decoding ? std::clamp<std::uint64_t>(static_cast<std::uint64_t>((g_ee_scale + g_ee_scale * ms / field_ms) / 2 + 0.5), 4, kMax) : 4;
++        window_start = g_frames;
++        qwords = q;
++        since = now_t;
++    }
++    if (scale != g_ee_scale) {
++        set_budget(g_cpu, g_cpu.budget);  // the clock so far at the old scale
++        if ((scale > 4) != (g_ee_scale > 4) || std::getenv("PS2_MOVIE_TARGET_MS"))
++            std::fprintf(stderr, "[movie] frame %llu: EE cycle scale %.2f\n", static_cast<unsigned long long>(g_frames), static_cast<double>(scale) / 4.0);
++        g_ee_scale = scale;
++    }
++}
++
+ void vblank() {
+     ++g_frames;
++    movie_mode();
+     if (g_options.round_frames) {
+         // The run's clock starts at the first state's frame, so presses for
+         // the first round read as they would without rounds.
+@@ -245,7 +292,7 @@ void load_context(Cpu &c, const ThreadContext &t) {
+     c.fcr31 = t.fcr31;
+ }
+ 
+-std::uint64_t now() { return g_base + static_cast<std::uint64_t>(g_given - g_cpu.budget); }
++std::uint64_t now() { return g_base + static_cast<std::uint64_t>(g_given - g_cpu.budget) * ee_scale() / 4; }
+ 
+ std::uint64_t hblank_cycles() { return frame_cycles() * 2u / (g_options.pal ? 625u : 525u); }
+ 
+-- 
+2.54.0 (Apple Git-157)
+

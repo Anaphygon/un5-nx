@@ -1,0 +1,35 @@
+From 31b07ba85b288333bc6b36c4b2269cdad7f3a2e3 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 13 Nov 2026 20:10:15 +0700
+Subject: [PATCH] feat: PS2_MOVIE_LOG prints what the movie mode saw each
+ window
+
+The Switch played the opening movie at 15 fps and the mode never engaged,
+while the Mac's runs engage it. One line per 25 frames (host ms a frame,
+the field, qwords decoded, the scale chosen) says which test held it back.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ runtime/src/system.cpp | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/runtime/src/system.cpp b/runtime/src/system.cpp
+index cd1f1b7..626851f 100644
+--- a/runtime/src/system.cpp
++++ b/runtime/src/system.cpp
+@@ -213,6 +213,12 @@ void movie_mode() {
+         const double field_ms = target > 0 ? target : g_options.pal ? 20.0 : 1000.0 / 60.0;
+         // The scale that would have kept up, halfway there, while decoding.
+         scale = decoding ? std::clamp<std::uint64_t>(static_cast<std::uint64_t>((g_ee_scale + g_ee_scale * ms / field_ms) / 2 + 0.5), 4, kMax) : 4;
++        // PS2_MOVIE_LOG: what each window saw, to tell why the mode did or did not engage.
++        static const bool log = std::getenv("PS2_MOVIE_LOG") != nullptr;
++        if (log)
++            std::fprintf(stderr, "[movie] window to frame %llu: %.1f ms a frame (field %.1f), %llu qwords decoded, scale %.2f\n",
++                         static_cast<unsigned long long>(g_frames), ms, field_ms,
++                         static_cast<unsigned long long>(q - qwords), static_cast<double>(scale) / 4.0);
+         window_start = g_frames;
+         qwords = q;
+         since = now_t;
+-- 
+2.54.0 (Apple Git-157)
+

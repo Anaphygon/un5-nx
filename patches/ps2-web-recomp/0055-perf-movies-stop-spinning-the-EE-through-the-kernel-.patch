@@ -1,0 +1,234 @@
+From b2afc8e84cdf02eee19387a16d8da33b1489f433 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 8 Nov 2026 06:37:01 +0700
+Subject: [PATCH] perf: movies stop spinning the EE through the kernel and the
+ IOP
+
+UN5's opening movie ran at 13-15 fps on the Switch with the GS 6% busy:
+the EE never went idle (0% of its time skipped, against 83% in battle).
+Its movie player (CRI) yields at priority 125 from two threads, one of
+them doing nothing else: some 24 000 syscalls a frame, 13 000 of them
+RotateThreadReadyQueue, and every one an event check that ran the IOP
+for about 270 EE cycles, 22 000 times a frame.
+
+- A RotateThreadReadyQueue that leaves the caller running (no other
+  thread at its priority is ready) moves the clock on to the next event,
+  at most 0.5 ms, as when every thread waits: the caller only spins until
+  an event changes something. PS2_YIELD_EXACT=1 keeps the spin.
+- The IOP is caught up on EE events only once 2048 EE cycles (7 us) have
+  passed, unless something asks for it (SifSetDma, an HLE RPC call):
+  the two processors run apart on a PS2 anyway.
+- The IOP kernel keeps its threads in a list beside the map and the
+  running one cached, instead of walking the map at every switch.
+
+Mac, the movie: syscalls 24 000 -> 15 000 a frame, yields 13 400 -> 4 700;
+with PCSX2's GS and no GPU, 4.7 -> 4.25 ms a frame. The regression
+suite's frames are unchanged.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ runtime/include/ps2/system.hpp |  2 ++
+ runtime/src/iop/kernel.cpp     | 41 +++++++++++++++++++++++++++++-----
+ runtime/src/iop/sif.cpp        |  1 +
+ runtime/src/kernel.cpp         | 11 +++++++--
+ runtime/src/system.cpp         | 27 +++++++++++++++++++++-
+ 5 files changed, 74 insertions(+), 8 deletions(-)
+
+diff --git a/runtime/include/ps2/system.hpp b/runtime/include/ps2/system.hpp
+index 2230630..8cc17ff 100644
+--- a/runtime/include/ps2/system.hpp
++++ b/runtime/include/ps2/system.hpp
+@@ -85,6 +85,8 @@ void set_budget(Cpu &c, std::int64_t cycles);
+ void schedule(int event, std::uint64_t at, std::function<void()> action);
+ std::uint64_t scheduled_at(int event);
+ bool preempt(Cpu &c);
++// The clock on to the next event (or 0.5 ms), for a thread spinning on yields.
++void skip_to_next_event(Cpu &c);
+ 
+ bool has_code(std::uint32_t pc);
+ void raise_intc(unsigned cause);
+diff --git a/runtime/src/iop/kernel.cpp b/runtime/src/iop/kernel.cpp
+index b102b53..c78fb77 100644
+--- a/runtime/src/iop/kernel.cpp
++++ b/runtime/src/iop/kernel.cpp
+@@ -63,6 +63,29 @@ std::map<int, Module> g_modules;
+ int g_next_module = 1;
+ 
+ std::map<int, Thread> g_threads;
++// The threads in id order beside the map, and the running one: the scheduler
++// asks for them at every switch (thousands a frame in UN5's movies, where the
++// map walk showed in the Switch's profile). Rebuilt when a thread comes or
++// goes (threads_changed).
++std::vector<Thread *> g_thread_list;
++bool g_thread_list_stale = true;
++Thread *g_current_thread = nullptr;
++int g_current_cached = -1;
++
++void threads_changed() {
++    g_thread_list_stale = true;
++    g_current_cached = -1;
++}
++
++const std::vector<Thread *> &thread_list() {
++    if (g_thread_list_stale) {
++        g_thread_list.clear();
++        for (auto &[id, t] : g_threads) g_thread_list.push_back(&t);
++        g_thread_list_stale = false;
++    }
++    return g_thread_list;
++}
++
+ int g_current = 0;
+ int g_next_thread = 1;
+ std::uint64_t g_order = 0;
+@@ -87,9 +110,9 @@ std::set<std::pair<std::string, std::uint32_t>> g_missing_reported;
+ 
+ Thread *best_ready() {
+     Thread *best = nullptr;
+-    for (auto &[id, t] : g_threads) {
+-        if (t.status != kReady && t.status != kRun) continue;
+-        if (!best || t.priority < best->priority || (t.priority == best->priority && t.order < best->order)) best = &t;
++    for (Thread *t : thread_list()) {
++        if (t->status != kReady && t->status != kRun) continue;
++        if (!best || t->priority < best->priority || (t->priority == best->priority && t->order < best->order)) best = t;
+     }
+     return best;
+ }
+@@ -283,8 +306,12 @@ void schedule(std::uint64_t at, const Job &job) {
+ }
+ 
+ Thread *current() {
+-    auto it = g_threads.find(g_current);
+-    return it == g_threads.end() ? nullptr : &it->second;
++    if (g_current != g_current_cached) {
++        auto it = g_threads.find(g_current);
++        g_current_thread = it == g_threads.end() ? nullptr : &it->second;
++        g_current_cached = g_current;
++    }
++    return g_current_thread;
+ }
+ 
+ Thread *thread(int id) {
+@@ -304,6 +331,7 @@ int create_thread(std::uint32_t entry, std::uint32_t stack_size, int priority, s
+     t.attr = attr;
+     t.option = option;
+     g_threads[t.id] = t;
++    threads_changed();
+     if (g_trace_modules) std::fprintf(stderr, "[iop] thread %d entry 0x%08X prio %d\n", t.id, entry, priority);
+     return t.id;
+ }
+@@ -313,6 +341,7 @@ bool delete_thread(int id) {
+     if (it == g_threads.end() || it->second.status != kDormant || id == g_current) return false;
+     if (it->second.stack) free(it->second.stack);
+     g_threads.erase(it);
++    threads_changed();
+     return true;
+ }
+ 
+@@ -525,6 +554,7 @@ void boot() {
+     g_hle_modules.clear();
+     g_modules.clear();
+     g_threads.clear();
++    threads_changed();
+     g_used.clear();
+     while (!g_events.empty()) g_events.pop();
+     g_current = 0;
+@@ -740,6 +770,7 @@ namespace ps2::iop::kernel {
+ void state(ps2::state::Stream &s) {
+     s.tag("iopkern");
+     if (s.saving() && g_nesting) throw std::runtime_error("the IOP is inside a guest call");
++    threads_changed();
+     s.map(g_threads, [&s](Thread &t) {
+         if (s.saving() && t.on_exit) throw std::runtime_error("an IOP module is still starting");
+         s.pod(t.id);
+diff --git a/runtime/src/iop/sif.cpp b/runtime/src/iop/sif.cpp
+index e3245a1..318cd4c 100644
+--- a/runtime/src/iop/sif.cpp
++++ b/runtime/src/iop/sif.cpp
+@@ -174,6 +174,7 @@ void call(const std::uint8_t *packet) {
+     if (it->second.hle) {
+         // The IOP runs behind the EE by up to a slice; catch it up so the reply
+         // latency counts from the moment of the call.
++        request_iop_sync();
+         sync_iop();
+         g_held_calls[server] = c;
+         if (it->second.invoke(c.rpc_number, g_data_addr, c.send_size, c.recv & (kRamSize - 1), c.recv_size)) {
+diff --git a/runtime/src/kernel.cpp b/runtime/src/kernel.cpp
+index 7e34e74..64b8265 100644
+--- a/runtime/src/kernel.cpp
++++ b/runtime/src/kernel.cpp
+@@ -580,8 +580,15 @@ void handle_syscall(Cpu &c, std::uint32_t pc) {
+                 if (x.status == kReady && x.priority == prio && (!first || x.order < first->order)) first = &x;
+             if (first) first->order = ++g_order;
+         }
+-        if (n == 0x2B) reschedule(c);
+-        else g_reschedule = true;
++        if (n == 0x2B) {
++            reschedule(c);
++            // Nobody took over: the caller spins until an event changes
++            // something. PS2_YIELD_EXACT=1 lets it spin.
++            static const bool exact = std::getenv("PS2_YIELD_EXACT") != nullptr;
++            if (!exact && t && current() == t) skip_to_next_event(c);
++        } else {
++            g_reschedule = true;
++        }
+         break;
+     }
+     case 0x2D: case 0x2E: {
+diff --git a/runtime/src/system.cpp b/runtime/src/system.cpp
+index 88a43f6..fd9f369 100644
+--- a/runtime/src/system.cpp
++++ b/runtime/src/system.cpp
+@@ -272,6 +272,20 @@ bool preempt(Cpu &c) {
+     return g_halted || g_state_request || g_state_operation.load(std::memory_order_relaxed) || kernel::must_unwind();
+ }
+ 
++// A thread that yields with no other thread to yield to only spins until an
++// event (an interrupt, a DMA, the IOP) changes something, as UN5's movie
++// player does at priority 125 (some 14 000 RotateThreadReadyQueue calls a
++// frame, the EE never idle): the clock goes on to that event at once, as when
++// every thread waits.
++void skip_to_next_event(Cpu &c) {
++    const std::uint64_t t = now();
++    const std::uint64_t next = std::min(next_event_time(), t + kEeClock / 2000);
++    if (next <= t) return;
++    g_base = next;
++    g_given = 0;
++    c.budget = 0;
++}
++
+ void halt(const std::string &reason) {
+     if (!g_halted) {
+         std::fprintf(stderr, "[ee] halted: %s\n", reason.c_str());
+@@ -417,9 +431,19 @@ bool load_elf(const std::string &path, std::uint32_t &entry) {
+     return true;
+ }
+ 
++// The IOP is caught up on the EE's events, but at least kIopSyncCycles of EE
++// time at a time unless something asked for it (request_iop_sync): UN5's
++// movie player makes some 15 000 syscalls a frame, each one an event check,
++// and the IOP was run 22 000 times a frame for about 270 EE cycles each, its
++// loop costing far more than its code. The PS2's two processors run apart
++// anyway; 7 us of lag is far below what a game can tell.
++constexpr std::uint64_t kIopSyncCycles = 2048;
++bool g_iop_sync_asked = false;
++
+ void sync_iop() {
+     const std::uint64_t t = now();
+-    if (t > g_iop_synced) {
++    if (t > g_iop_synced && (g_iop_sync_asked || t - g_iop_synced >= kIopSyncCycles)) {
++        g_iop_sync_asked = false;
+         iop::run(t - g_iop_synced);
+         g_iop_synced = t;
+     }
+@@ -427,6 +451,7 @@ void sync_iop() {
+ }
+ 
+ void request_iop_sync() {
++    g_iop_sync_asked = true;
+     if (g_cpu.budget > 64) set_budget(g_cpu, 64);
+ }
+ 
+-- 
+2.54.0 (Apple Git-157)
+
