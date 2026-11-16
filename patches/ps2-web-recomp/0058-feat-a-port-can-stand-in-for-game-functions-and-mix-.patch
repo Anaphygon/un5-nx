@@ -1,0 +1,301 @@
+From d35dd1db7d73b00a5d9bbe69a50783e730870dae Mon Sep 17 00:00:00 2001
+From: Anaphygon <349679039+Anaphygon@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 14:43:18 +0700
+Subject: [PATCH] feat: a port can stand in for game functions and mix its own
+ sound
+
+UN5's movies are to be decoded on the host (un5-nx ports/un5/movie.cpp):
+the game's player stays, and only its leaves that touch the IPU, the CD
+stream and the SPU2 are replaced. That needs:
+
+- eerecomp --hooks <file>: the listed functions ask ps2::hook() at their
+  entry, and a stand-in registered with ps2::register_hook() may do the
+  work and return (or tail-call elsewhere). The declarations are in
+  ps2/hook.hpp, which only the units holding a hooked entry include, so a
+  new hook rebuilds those alone.
+- ps2::set_audio_mix(): a port's sound added to the SPU2's output before
+  the sink and the recording take it.
+- disc::read under a mutex: the movie decoder reads the image from its own
+  thread, and the reader seeks a shared handle.
+- CMake builds native_*.c as well, for a port's C sources (libmpeg2).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ CMakeLists.txt                 |  4 ++--
+ recomp/codegen.cpp             |  7 ++++++-
+ recomp/codegen.hpp             |  4 ++++
+ recomp/main.cpp                |  7 +++++--
+ runtime/include/ps2/hook.hpp   | 18 ++++++++++++++++++
+ runtime/include/ps2/system.hpp |  4 ++++
+ runtime/src/disc.cpp           |  6 ++++++
+ runtime/src/dispatch.cpp       | 17 +++++++++++++++++
+ runtime/src/iop/spu2.cpp       |  3 +++
+ runtime/src/iop/spu2.hpp       |  1 +
+ runtime/src/system.cpp         |  1 +
+ 11 files changed, 67 insertions(+), 5 deletions(-)
+ create mode 100644 runtime/include/ps2/hook.hpp
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 28262f6..fff265c 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -1,5 +1,5 @@
+ cmake_minimum_required(VERSION 3.20)
+-project(ps2-web-recomp CXX)
++project(ps2-web-recomp C CXX)
+ 
+ set(CMAKE_CXX_STANDARD 20)
+ set(CMAKE_CXX_STANDARD_REQUIRED ON)
+@@ -109,7 +109,7 @@ endif()
+ 
+ if(PS2_GENERATED)
+     file(GLOB PS2_UNITS CONFIGURE_DEPENDS "${PS2_GENERATED}/*.cpp")
+-    file(GLOB PS2_NATIVES CONFIGURE_DEPENDS "${PS2_GENERATED}/native_*.cpp")
++    file(GLOB PS2_NATIVES CONFIGURE_DEPENDS "${PS2_GENERATED}/native_*.cpp" "${PS2_GENERATED}/native_*.c")
+     if(PS2_NATIVES)
+         list(REMOVE_ITEM PS2_UNITS ${PS2_NATIVES})
+     endif()
+diff --git a/recomp/codegen.cpp b/recomp/codegen.cpp
+index 47079a1..dc8bd9e 100644
+--- a/recomp/codegen.cpp
++++ b/recomp/codegen.cpp
+@@ -1,5 +1,6 @@
+ #include "codegen.hpp"
+ 
++#include <algorithm>
+ #include <bit>
+ #include <filesystem>
+ #include <format>
+@@ -183,7 +184,10 @@ private:
+         }
+ 
+         out_.str({});
+-        out_ << "#include \"units.hpp\"\n\nnamespace gen {\n\nusing namespace ps2;\n\n";
++        out_ << "#include \"units.hpp\"\n";
++        if (std::any_of(options_.hooks.begin(), options_.hooks.end(), [&](std::uint32_t h) { return in_unit(h) && p_.is_code(h); }))
++            out_ << "#include \"ps2/hook.hpp\"\n";
++        out_ << "\nnamespace gen {\n\nusing namespace ps2;\n\n";
+         out_ << "const std::uint16_t " << table_name(u) << "[" << (layout_.size() / 4) << "] = {";
+         std::vector<std::uint16_t> dense(layout_.size() / 4, 0);
+         for (const auto &[a, id] : ids_[u]) dense[(a - base_) >> 2] = id;
+@@ -214,6 +218,7 @@ private:
+                 out_ << label(a) << ":\n";
+             }
+             if (options_.probes.count(a)) line(std::format("probe(c, {});", pc(a)));
++            if (options_.hooks.count(a)) line(std::format("if (hook(c, {})) [[unlikely]] return;", pc(a)));
+             const Insn i = at(a);
+             const Flow fl = flow(i.op);
+             if (fl == Flow::None) {
+diff --git a/recomp/codegen.hpp b/recomp/codegen.hpp
+index e54ee19..c1f861a 100644
+--- a/recomp/codegen.hpp
++++ b/recomp/codegen.hpp
+@@ -16,6 +16,10 @@ struct CodegenOptions {
+     std::string output;
+     std::uint32_t unit_bits = 14;
+     std::set<std::uint32_t> probes;
++    // Functions a port may take over (register_hook): their entry asks the
++    // runtime first, and the translated body runs only when no host stand-in
++    // is registered or it declines.
++    std::set<std::uint32_t> hooks;
+ };
+ 
+ struct Translation {
+diff --git a/recomp/main.cpp b/recomp/main.cpp
+index 76deea6..62e094d 100644
+--- a/recomp/main.cpp
++++ b/recomp/main.cpp
+@@ -150,7 +150,7 @@ std::vector<std::pair<std::uint32_t, std::uint32_t>> checks_for_window(const Snr
+ }
+ 
+ int usage() {
+-    std::fprintf(stderr, "usage: eerecomp <elf> [--entries file] [--modules dir] [--overlays dir] [--probes file] [--out dir] [--stats]\n");
++    std::fprintf(stderr, "usage: eerecomp <elf> [--entries file] [--modules dir] [--overlays dir] [--probes file] [--hooks file] [--out dir] [--stats]\n");
+     return 2;
+ }
+ 
+@@ -158,7 +158,7 @@ int usage() {
+ 
+ int main(int argc, char **argv) {
+     if (argc < 2) return usage();
+-    std::string elf_path = argv[1], entries_path, out, probes_path, modules_dir, overlays_dir;
++    std::string elf_path = argv[1], entries_path, out, probes_path, hooks_path, modules_dir, overlays_dir;
+     bool stats = false;
+     for (int i = 2; i < argc; ++i) {
+         const std::string arg = argv[i];
+@@ -166,6 +166,7 @@ int main(int argc, char **argv) {
+         else if (arg == "--stats") stats = true;
+         else if (arg == "--out" && i + 1 < argc) out = argv[++i];
+         else if (arg == "--probes" && i + 1 < argc) probes_path = argv[++i];
++        else if (arg == "--hooks" && i + 1 < argc) hooks_path = argv[++i];
+         else if (arg == "--modules" && i + 1 < argc) modules_dir = argv[++i];
+         else if (arg == "--overlays" && i + 1 < argc) overlays_dir = argv[++i];
+         else return usage();
+@@ -285,6 +286,8 @@ int main(int argc, char **argv) {
+             options.output = out;
+             if (!probes_path.empty())
+                 for (std::uint32_t a : read_entries(probes_path).main) options.probes.insert(a);
++            if (!hooks_path.empty())
++                for (std::uint32_t a : read_entries(hooks_path).main) options.hooks.insert(a);
+             generate(translations, options);
+         }
+     } catch (const std::exception &error) {
+diff --git a/runtime/include/ps2/hook.hpp b/runtime/include/ps2/hook.hpp
+new file mode 100644
+index 0000000..8fd434b
+--- /dev/null
++++ b/runtime/include/ps2/hook.hpp
+@@ -0,0 +1,18 @@
++#pragma once
++
++#include "cpu.hpp"
++
++#include <cstdint>
++
++namespace ps2 {
++
++// A host stand-in for a game function. eerecomp --hooks puts the call at the
++// function's entry (only the units that have one include this header, so
++// adding a hook rebuilds those alone). A stand-in returns true when it did
++// the function's work and set c.pc to where the function returns (normally
++// ra, with v0 set); false lets the translated body run.
++using HookFn = bool (*)(Cpu &c);
++void register_hook(std::uint32_t pc, HookFn fn);
++bool hook(Cpu &c, std::uint32_t pc);
++
++}
+diff --git a/runtime/include/ps2/system.hpp b/runtime/include/ps2/system.hpp
+index 8cc17ff..7d935a5 100644
+--- a/runtime/include/ps2/system.hpp
++++ b/runtime/include/ps2/system.hpp
+@@ -166,6 +166,10 @@ void set_audio_stretch(bool on);
+ void set_port_launcher(PortLauncher launcher);
+ PortLauncher port_launcher();
+ 
++// A port's own sound (a movie it plays natively) mixed into the SPU2's
++// output, 48 kHz stereo, before the sink and any recording take it.
++using AudioMix = void (*)(std::int16_t *stereo, std::size_t frames);
++void set_audio_mix(AudioMix mix);
+ void set_audio_sink(std::function<void(const std::int16_t *samples, std::size_t frames)> sink);
+ 
+ }
+diff --git a/runtime/src/disc.cpp b/runtime/src/disc.cpp
+index b25e357..768de5e 100644
+--- a/runtime/src/disc.cpp
++++ b/runtime/src/disc.cpp
+@@ -6,6 +6,7 @@
+ #include <cstdio>
+ #include <cstring>
+ #include <map>
++#include <mutex>
+ 
+ namespace ps2::disc {
+ 
+@@ -116,8 +117,13 @@ ReadStats take_read_stats() {
+     return s;
+ }
+ 
++// A port may read from its own thread (UN5's movies decode on one), and the
++// reader seeks a shared handle.
++std::mutex g_read_lock;
++
+ bool read(std::uint32_t sector, std::uint32_t count, void *out) {
+     if (!g_reader) return false;
++    const std::lock_guard<std::mutex> hold(g_read_lock);
+     const std::size_t want = static_cast<std::size_t>(count) * kSector;
+     const auto start = std::chrono::steady_clock::now();
+     const std::size_t got = g_reader(static_cast<std::uint64_t>(sector) * kSector, out, want);
+diff --git a/runtime/src/dispatch.cpp b/runtime/src/dispatch.cpp
+index 5fd695d..f242630 100644
+--- a/runtime/src/dispatch.cpp
++++ b/runtime/src/dispatch.cpp
+@@ -1,4 +1,5 @@
+ #include "ps2/generated.hpp"
++#include "ps2/hook.hpp"
+ #include "ps2/system.hpp"
+ 
+ #include <algorithm>
+@@ -7,6 +8,7 @@
+ #include <fstream>
+ #include <set>
+ #include <string>
++#include <unordered_map>
+ #include <vector>
+ 
+ namespace ps2 {
+@@ -247,6 +249,21 @@ void probe(Cpu &c, std::uint32_t pc) {
+                  c.r[7].w[0], c.r[31].w[0], c.r[2].w[0]);
+ }
+ 
++namespace {
++// Filled by ports' static initialisers, so it lives in a function.
++std::unordered_map<std::uint32_t, HookFn> &hooks() {
++    static std::unordered_map<std::uint32_t, HookFn> map;
++    return map;
++}
++}
++
++void register_hook(std::uint32_t pc, HookFn fn) { hooks()[pc] = fn; }
++
++bool hook(Cpu &c, std::uint32_t pc) {
++    const auto it = hooks().find(pc);
++    return it != hooks().end() && it->second(c);
++}
++
+ void breakpoint(Cpu &c, std::uint32_t pc) {
+     std::fprintf(stderr, "[ee] break at 0x%08X (ra 0x%08X)\n", pc, c.r[31].w[0]);
+ }
+diff --git a/runtime/src/iop/spu2.cpp b/runtime/src/iop/spu2.cpp
+index 67ab023..14cb782 100644
+--- a/runtime/src/iop/spu2.cpp
++++ b/runtime/src/iop/spu2.cpp
+@@ -86,6 +86,7 @@ std::uint16_t g_spdif_out = 0, g_spdif_mode = 0, g_spdif_media = 0;
+ std::vector<std::int16_t> g_audio;
+ bool g_record = false;
+ std::function<void(const std::int16_t *, std::size_t)> g_sink;
++void (*g_mix)(std::int16_t *, std::size_t) = nullptr;
+ std::uint64_t g_next_tick = 0;
+ bool g_tick_pending = false;
+ 
+@@ -303,6 +304,7 @@ void tick() {
+     if (count && ++ticks % 15000 == 0)
+         std::fprintf(stderr, "[spu2] %.1f voices per batch (attack %.1f decay %.1f sustain %.1f release %.1f)\n", static_cast<double>(active) / ticks,
+                      static_cast<double>(phases[1]) / ticks, static_cast<double>(phases[2]) / ticks, static_cast<double>(phases[3]) / ticks, static_cast<double>(phases[4]) / ticks);
++    if (g_mix) g_mix(out, kBatch);
+     if (g_record) g_audio.insert(g_audio.end(), out, out + kBatch * 2);
+     if (g_sink) g_sink(out, kBatch);
+     feed_input(0);
+@@ -550,6 +552,7 @@ void dma(int core, std::uint32_t madr, std::uint32_t words, bool to_spu, int cha
+ }
+ 
+ void set_sink(std::function<void(const std::int16_t *, std::size_t)> sink) { g_sink = std::move(sink); }
++void set_mix(void (*mix)(std::int16_t *, std::size_t)) { g_mix = mix; }
+ 
+ void dump_voices() {
+     for (int c = 0; c < 2; ++c)
+diff --git a/runtime/src/iop/spu2.hpp b/runtime/src/iop/spu2.hpp
+index ce03c9e..4d04005 100644
+--- a/runtime/src/iop/spu2.hpp
++++ b/runtime/src/iop/spu2.hpp
+@@ -19,5 +19,6 @@ void dma(int core, std::uint32_t madr, std::uint32_t words, bool to_spu, int cha
+ void dump_audio(const char *path);
+ void dump_voices();
+ void set_sink(std::function<void(const std::int16_t *samples, std::size_t frames)> sink);
++void set_mix(void (*mix)(std::int16_t *stereo, std::size_t frames));
+ 
+ }
+diff --git a/runtime/src/system.cpp b/runtime/src/system.cpp
+index 626851f..8658dc8 100644
+--- a/runtime/src/system.cpp
++++ b/runtime/src/system.cpp
+@@ -807,6 +807,7 @@ void set_audio_stretch(bool on) { g_audio_stretch.store(on ? 1 : 0); }
+ void set_port_launcher(PortLauncher launcher) { g_port_launcher = launcher; }
+ PortLauncher port_launcher() { return g_port_launcher; }
+ 
++void set_audio_mix(AudioMix mix) { iop::spu2::set_mix(mix); }
+ void set_audio_sink(std::function<void(const std::int16_t *, std::size_t)> sink) { iop::spu2::set_sink(std::move(sink)); }
+ 
+ }
+-- 
+2.54.0 (Apple Git-157)
+

@@ -1,8 +1,10 @@
 # un5-nx contributors
 
-Lisvindanu <https://github.com/Lisvindanu>
+Anaphygon <https://github.com/Anaphygon>
     Project manager and product owner: direction, priorities, and the
-    go/no-go decision at every phase gate.
+    go/no-go decision at every phase gate. Authors the commits since
+    2026-11-16 (earlier ones were authored by Claude, committed as
+    Lisvindanu, the same person's previous account).
 
 Claude (Anthropic) <https://github.com/claude>
     Executor: research, reverse engineering, tooling, builds and

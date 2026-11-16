@@ -1,0 +1,23 @@
+libmpeg2 0.5.1 (MPEG-1/MPEG-2 video decoder), its portable C core, used by
+ports/un5/movie.cpp to decode the video of UN5's movies (PSS/*.PSS on the
+player's disc) on the host instead of the emulated IPU.
+
+Taken from Downhill Revived (https://github.com/skuza-oss/downhill-revived,
+port/third_party/libmpeg2), whose port notes follow; un5-nx uses the files
+as they are there, compiled as one unit (ports/un5/mpeg2_all.c).
+
+Source:  mpeg2dec_0.5.1.orig.tar.gz from Debian
+         (https://deb.debian.org/debian/pool/main/m/mpeg2dec/), the libmpeg2 0.5.1 release,
+         sha256 dee22e893cb5fc2b2b6ebd60b88478ab8556cb3b93f9a0d7ce8f3b61851871d4 (as listed in
+         Debian's mpeg2dec_0.5.1-11.dsc). Upstream: https://libmpeg2.sourceforge.io/
+Authors: Michel Lespinasse, Aaron Holtzman and the contributors in AUTHORS.
+Licence: GNU GPL version 2 or (at your option) any later version (COPYING; each file's header).
+         un5-nx is GPL-3, which that option allows.
+
+Files: libmpeg2/{alloc,cpu_accel,cpu_state,decode,header,idct,motion_comp,slice}.c,
+mpeg2_internal.h, vlc.h and include/{mpeg2,attributes}.h, copied and flattened into this
+folder, unchanged but for two lines (Downhill Revived's): alloc.c's alignment mask is uintptr_t
+(not long, which is 32 bits on Windows x64), and header.c's default_intra_quantizer_matrix is
+uint16_t, not uint8_t (same values). config.h is Downhill Revived's (portable C, no
+CPU-specific code). The MMX/AltiVec/VIS/Alpha/ARM files, libmpeg2convert, libvo and the
+mpeg2dec program are not used.

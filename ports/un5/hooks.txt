@@ -1,0 +1,18 @@
+# Functions eerecomp gives a host stand-in check (ps2::register_hook), one
+# hex address per line. Each is replaced only while its port code says so.
+#
+# movie.cpp: the movie player's leaves that touch the hardware
+103ad0  # open the CD stream (starts the host decoder)
+103a20  # read the stream into the ring
+103a90  # close the stream
+103cf0  # wait for the stream to pause (the disc is wanted elsewhere)
+103d30  # wait for the stream to run again
+1007d0  # the player threads' yield (waits a field instead)
+15d820  # sceMpegDemuxPss
+100c20  # pump PCM to the SPU2
+104430  # enough sound buffered to start
+1011f0  # sound on
+101290  # sound paused
+101150  # sound stopped
+159628  # sceMpegGetPicture
+159748  # sceMpegIsEnd

@@ -54,7 +54,8 @@ grep -v '^#' "$root/ports/un5/entries.txt" >>"$G/entries-static.txt"
 python3 -I "$here/un5_seed.py" "$G/disc/SLES_556.05" "$G/entries-static.txt" "$G/overlays-iso"
 
 echo "Translating the EE code..."
-(cd "$web" && build/tools/eerecomp "$G/disc/SLES_556.05" --entries "$G/entries-static.txt" --overlays "$G/overlays-iso" --out generated/un5 | tail -2)
+(cd "$web" && build/tools/eerecomp "$G/disc/SLES_556.05" --entries "$G/entries-static.txt" --overlays "$G/overlays-iso" \
+	--hooks "$root/ports/un5/hooks.txt" --out generated/un5 | tail -2)
 
 echo "Translating the VU1 programs..."
 python3 -I "$here/un5_vu1.py" "$G/disc/SLES_556.05" "$work/vu1"
@@ -79,4 +80,8 @@ if compgen -G "$G/iop/*/ran.bin" >/dev/null; then
 fi
 # Hand-written stand-ins for the hottest VU1 programs, linked into the player.
 ln -sf "$here/../ports/un5/vu1_native.cpp" "$web/generated/un5/native_vu1.cpp"
+# The movies, decoded on the host (ports/un5/movie.cpp) with libmpeg2.
+ln -sf "$here/../ports/un5/movie.cpp" "$web/generated/un5/native_movie.cpp"
+ln -sf "$here/../ports/un5/mpeg2_all.c" "$web/generated/un5/native_mpeg2.c"
+ln -sfn "$here/../third_party/libmpeg2" "$web/generated/un5/libmpeg2"
 echo "Done: $web/generated/un5"

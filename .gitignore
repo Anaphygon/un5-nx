@@ -3,7 +3,8 @@ build/
 build-*/
 out/
 generated/
-third_party/
+third_party/*
+!third_party/libmpeg2/
 *.iso
 *.elf
 *.BIN

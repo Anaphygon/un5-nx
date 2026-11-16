@@ -272,6 +272,14 @@ This project stands on other people's work:
   renderer draws the game on the Switch (`gs-pcsx2/`, with local patches only;
   nothing is sent upstream by an agent), and it is the reference for how the
   PS2 behaves.
+- **[Downhill Revived](https://github.com/skuza-oss/downhill-revived)** by
+  **skuza** (GPL-3.0-or-later): its native movie player (`port/hle/movie.c`,
+  finding 055) is the model for `ports/un5/movie.cpp`: the PSS layout, the
+  demuxer and the sound's timing follow it, and `third_party/libmpeg2` is
+  its copy.
+- **[libmpeg2](https://libmpeg2.sourceforge.io/)** 0.5.1 by **Michel
+  Lespinasse, Aaron Holtzman** and contributors (GPL-2.0-or-later): decodes
+  the movies' MPEG-2 video on the host (`third_party/libmpeg2`).
 - **[deko3d](https://github.com/devkitPro/deko3d)** and
   **[uam](https://github.com/devkitPro/uam)** by **fincs** (devkitPro): the
   Switch GPU API the GS draws through, and the shader compiler behind its
